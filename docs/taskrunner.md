@@ -80,7 +80,7 @@
 - **重试判定**：5xx / 超时 → 按 Asynq 退避策略重试；4xx → 不重试，直接判失败；HTTP 2xx = 受理成功，业务级失败用响应体状态字段表达（避免"200 但失败"无法归因，字段定义落地时定）；
 - **超时**：默认值落地时定（建议 30s），可按 action 覆盖；
 - **L1 边界**：回调执行产生的业务事件（如 SLA 违约）仍由 zhuzhao 侧 handler 落 L1 `ticket_events`；taskrunner 只触发回调、**不写业务事实**；
-- **安全边界**：独立部署下需明确内网可达性（如同 VPC）与回调鉴权（token/签名，防伪造回调），具体机制随首个预置动作落地细化。
+- **安全边界**：独立部署下需明确内网可达性（如同 VPC）。~~回调鉴权（token/签名，防伪造回调）~~ ✅ **拍板定案（2026-09-03）：不做独立回调鉴权机制**——信任边界 = 内网网络隔离（与 API 暴露边界同级）+ 回调目标 `callback_url` 由 zhuzhao 提交时自行指定（taskrunner 只透传，不感知）；如需增强，zhuzhao 可在 `callback_url` 内携带密钥路径段（capability URL，taskrunner 零改动）。
 
 ## 5. HTTP API（内部，v1 范围定稿）
 
@@ -169,6 +169,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 ⚠️ 随 M2/M3 落地细化（M2 已定案部分随实现入档）：
 - ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；
 - ~~credential 具体形式~~ ✅ M2 定案：**静态 Bearer token**（`TASKRUNNER_API_TOKEN`）；多调用方时代再升级签名 / mTLS；
+- ~~回调鉴权机制（taskrunner → zhuzhao `/internal`）~~ ✅ 拍板定案（2026-09-03）：**不做独立机制**（见 §4 安全边界）——信任边界 = 内网隔离 + `callback_url` 由 zhuzhao 提交时指定；zhuzhao 侧可选 URL 密钥段增强（taskrunner 零感知）；
 - ~~`GET /v1/tasks/{id}` 状态数据源~~ ✅ M2 定案：**job_runs 为主 + Asynq Inspector 补充 in-flight 实时态**（pending/active/retry/scheduled 只在 Redis，以 `live_state` 字段并返回）；
 - ~~action 校验方式~~ ✅ M2 定案：**不做前置校验**——不存在 / 未注册的 action 经回调 4xx 快速失败（non-retryable，failed 可见）；zhuzhao 清单端点方案保留为可选增强；
 - 回调超时默认值：实现取 30s（env `TASKRUNNER_CALLBACK_TIMEOUT` 可改，载荷可按任务覆盖）——随 M3 验证后转正式口径；
@@ -204,3 +205,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-03 | 环境决策与配套拆分：确认无日志平台（过程日志先落文件，§6 入档 ES 演进路径——slog JSON Lines，shipper 采集零改应用，字段稳定命名自 M1 约束）；部署形态定 **Docker**（单容器单进程、卷挂载 SQLite/日志、SQLite 单写者 → 单副本约束入档）；zhuzhao 侧配套需求拆出独立文档 [zhuzhao-integration.md](./zhuzhao-integration.md)，§11 改为链接；M4 补 `asynq.Retention` 留观口径 |
 | 2026-09-03 | M1 完成（feat/m1-runtime）：核心运行时落地——Asynq worker + 回调客户端（2xx/4xx/5xx·超时判定）+ job_runs SQLite（WAL）+ healthz + enqueue CLI + Dockerfile；端到端冒烟通过（成功 / 4xx 死信 / 幂等重提）；实现中修正：store 自动建目录、先入队后落库防孤儿行 |
 | 2026-09-03 | M2 完成（feat/m2-api）：HTTP API v1 全量落地——gin + utils `errcode`/`response` 统一响应；静态 Bearer 鉴权（未设 token 拒绝启动）；提交 / 查询（runs 条件分页 + live_state）/ jobs CRUD（dept 过滤、cron 校验）/ trigger / cancel / retry / 死信列表；`cronloop` 分钟级 tick 触发 cron 定义（§10 定案入档）；job_runs 增 `job_id` 列关联任务定义；API 层选型：token 取消用 asynq Scheduler 改自研 tick（静态 payload 限制）；单测 19 个 + 真 Redis 端到端冒烟（含 cron 到点自动触发、停用即不触发）|
+| 2026-09-03 | 拍板定案（所有者）：**回调鉴权不做独立机制**（§4 安全边界 + §10 ⚠️ 关闭该项）——信任边界 = 内网网络隔离（与 API 暴露边界同级）+ `callback_url` 由 zhuzhao 提交时自行指定；zhuzhao 侧可选 URL 密钥路径段增强（capability URL，taskrunner 零感知）。zhuzhao 侧 16 号 P5 撤销、P6 随 M2 定案同步（不做前置校验） |

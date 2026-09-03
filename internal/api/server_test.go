@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -271,6 +272,41 @@ func TestCancelAndRetry(t *testing.T) {
 	}
 	if run, _ := f.st.GetByTaskID(ctx, "d1"); run.Status != store.StatusPending {
 		t.Fatalf("d1 after retry: %s", run.Status)
+	}
+}
+
+// A2：DB 还是 pending，但 worker 刚取走任务（Redis active）→ 409，不误报「已取消」。
+func TestCancelActiveRace(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.st.InsertPending(ctx, store.Run{TaskID: "ra", Action: "a", EnqueuedAt: time.Now()})
+	f.insp.live["ra"] = &asynq.TaskInfo{ID: "ra", State: asynq.TaskStateActive}
+
+	w := f.do(t, http.MethodPost, "/v1/tasks/ra/cancel", nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("active cancel want 409, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(f.insp.deleted) != 0 {
+		t.Fatalf("should not delete active task: %v", f.insp.deleted)
+	}
+	if run, _ := f.st.GetByTaskID(ctx, "ra"); run.Status != store.StatusPending {
+		t.Fatalf("status must stay pending, got %s", run.Status)
+	}
+}
+
+// A2 兜底：GetTaskInfo 检查后任务才被取走，DeleteTask 报 active 错误 → 409。
+func TestCancelDeleteActiveFallback(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.st.InsertPending(ctx, store.Run{TaskID: "rb", Action: "a", EnqueuedAt: time.Now()})
+	f.insp.delErr = errors.New("asynq: INTERNAL_ERROR: cannot delete task in active state. use CancelProcessing instead.")
+
+	w := f.do(t, http.MethodPost, "/v1/tasks/rb/cancel", nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("delete-active fallback want 409, got %d: %s", w.Code, w.Body.String())
+	}
+	if run, _ := f.st.GetByTaskID(ctx, "rb"); run.Status != store.StatusPending {
+		t.Fatalf("status must stay pending, got %s", run.Status)
 	}
 }
 

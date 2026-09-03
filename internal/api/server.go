@@ -219,7 +219,10 @@ func (d *Deps) listDeadLetters(c *gin.Context) {
 
 // ---- 干预 ----
 
-// cancelTask 取消未开始的任务（pending/scheduled）；执行中 → 409。
+// cancelTask 取消未开始的任务（pending/scheduled/retry）；执行中 → 409。
+// 竞态防护（A2）：DB 状态检查与队列删除之间任务可能恰好被 worker 取走，故
+// ① 删队列前用 GetTaskInfo 确认非 active；② DeleteTask 报 active 错误映射 409（①之后被取走的兜底）；
+// ③ MarkCanceledIfPending 条件更新，状态已变即返回冲突——三道关卡保证不出现「回了已取消、实际跑完了」。
 func (d *Deps) cancelTask(c *gin.Context) {
 	id := c.Param("id")
 	run, err := d.Store.GetByTaskID(c.Request.Context(), id)
@@ -235,13 +238,33 @@ func (d *Deps) cancelTask(c *gin.Context) {
 		response.Fail(c, http.StatusConflict, errcode.ErrConflict.Code, "仅未开始的任务可取消，当前状态: "+run.Status)
 		return
 	}
+	if info, err := d.Inspector.GetTaskInfo(d.Queue, id); err == nil {
+		if info.State == asynq.TaskStateActive {
+			response.Fail(c, http.StatusConflict, errcode.ErrConflict.Code, "任务正在执行，无法取消")
+			return
+		}
+	} else if !errors.Is(err, asynq.ErrTaskNotFound) {
+		d.Logger.Error("api: cancel get info failed", slog.String("task_id", id), slog.Any("err", err))
+		response.InternalError(c, "取消失败")
+		return
+	}
+	// ErrTaskNotFound：DB 为 pending 但队列已无此任务（如提交后入队失败的残留），直接标 canceled 即可
 	if err := d.Inspector.DeleteTask(d.Queue, id); err != nil && !errors.Is(err, asynq.ErrTaskNotFound) {
+		if strings.Contains(err.Error(), "active state") { // 检查后瞬间被 worker 取走
+			response.Fail(c, http.StatusConflict, errcode.ErrConflict.Code, "任务正在执行，无法取消")
+			return
+		}
 		d.Logger.Error("api: cancel delete failed", slog.String("task_id", id), slog.Any("err", err))
 		response.InternalError(c, "取消失败")
 		return
 	}
-	if err := d.Store.MarkCanceled(c.Request.Context(), id, "canceled via API", time.Now()); err != nil {
+	ok, err := d.Store.MarkCanceledIfPending(c.Request.Context(), id, "canceled via API", time.Now())
+	if err != nil {
 		response.InternalError(c, "取消失败")
+		return
+	}
+	if !ok {
+		response.Fail(c, http.StatusConflict, errcode.ErrConflict.Code, "任务状态已变化（可能刚开始执行），请刷新后重试")
 		return
 	}
 	d.logOp(c, "cancel", id)

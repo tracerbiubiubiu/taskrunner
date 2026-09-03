@@ -141,15 +141,20 @@ UPDATE job_runs SET status = ?, error = '', started_at = NULL, finished_at = NUL
 	return nil
 }
 
-// MarkCanceled 取消未开始的任务。
-func (s *Store) MarkCanceled(ctx context.Context, taskID, errMsg string, finishedAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE job_runs SET status = ?, error = ?, finished_at = ? WHERE task_id = ?`,
-		StatusCanceled, errMsg, finishedAt, taskID)
+// MarkCanceledIfPending 取消未开始的任务。条件更新（WHERE status=pending）：
+// 影响行数为 0 说明检查后状态已被并发改变（如 worker 刚取走），返回 false 由调用方按冲突处理。
+func (s *Store) MarkCanceledIfPending(ctx context.Context, taskID, errMsg string, finishedAt time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE job_runs SET status = ?, error = ?, finished_at = ? WHERE task_id = ? AND status = ?`,
+		StatusCanceled, errMsg, finishedAt, taskID, StatusPending)
 	if err != nil {
-		return fmt.Errorf("store: mark canceled: %w", err)
+		return false, fmt.Errorf("store: mark canceled: %w", err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: mark canceled rows: %w", err)
+	}
+	return n > 0, nil
 }
 
 // RunFilter 执行记录查询条件（§5 GET /v1/runs，全部可选）。

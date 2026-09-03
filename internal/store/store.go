@@ -21,6 +21,7 @@ const (
 	StatusSucceeded = "succeeded"
 	StatusFailed    = "failed"
 	StatusDead      = "dead"
+	StatusCanceled  = "canceled" // API 取消（仅未开始的任务）
 )
 
 var ErrNotFound = errors.New("store: job_run not found")
@@ -34,6 +35,7 @@ type Run struct {
 	TaskID      string
 	RequestID   string
 	Action      string
+	JobID       string // 经由哪个任务定义触发（一次性提交为空）
 	CallbackURL string
 	Status      string
 	Attempts    int
@@ -46,12 +48,15 @@ type Run struct {
 	FinishedAt  sql.NullTime
 }
 
+var extraSchemas []string // 其他文件（如 jobs.go）注册自己的建表语句
+
 const schema = `
 CREATE TABLE IF NOT EXISTS job_runs (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
 	task_id       TEXT NOT NULL UNIQUE,
 	request_id    TEXT NOT NULL DEFAULT '',
 	action        TEXT NOT NULL,
+	job_id        TEXT NOT NULL DEFAULT '',
 	callback_url  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT 'pending',
 	attempts      INTEGER NOT NULL DEFAULT 0,
@@ -65,6 +70,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_job_runs_request_id ON job_runs(request_id);
 CREATE INDEX IF NOT EXISTS idx_job_runs_action_status ON job_runs(action, status);
+CREATE INDEX IF NOT EXISTS idx_job_runs_job_id ON job_runs(job_id);
 CREATE INDEX IF NOT EXISTS idx_job_runs_enqueued_at ON job_runs(enqueued_at);
 `
 
@@ -84,6 +90,12 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate: %w", err)
 	}
+	for _, extra := range extraSchemas {
+		if _, err := db.Exec(extra); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: migrate extra: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
@@ -92,9 +104,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // InsertPending 入队时写入 pending 行；task_id 重复（幂等重提）返回已存在错误。
 func (s *Store) InsertPending(ctx context.Context, r Run) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO job_runs (task_id, request_id, action, callback_url, status, submitted_by, source_ip, enqueued_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.TaskID, r.RequestID, r.Action, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
+INSERT INTO job_runs (task_id, request_id, action, job_id, callback_url, status, submitted_by, source_ip, enqueued_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.TaskID, r.RequestID, r.Action, r.JobID, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
 	if err != nil {
 		return fmt.Errorf("store: insert job_run: %w", err)
 	}
@@ -103,11 +115,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 
 func (s *Store) GetByTaskID(ctx context.Context, taskID string) (*Run, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT task_id, request_id, action, callback_url, status, attempts, error, duration_ms,
+SELECT task_id, request_id, action, job_id, callback_url, status, attempts, error, duration_ms,
        submitted_by, source_ip, enqueued_at, started_at, finished_at
 FROM job_runs WHERE task_id = ?`, taskID)
 	var r Run
-	err := row.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.CallbackURL, &r.Status, &r.Attempts,
+	err := row.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.CallbackURL, &r.Status, &r.Attempts,
 		&r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP, &r.EnqueuedAt, &r.StartedAt, &r.FinishedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -116,6 +128,96 @@ FROM job_runs WHERE task_id = ?`, taskID)
 		return nil, fmt.Errorf("store: get job_run: %w", err)
 	}
 	return &r, nil
+}
+
+// ResetPending 死信/终败任务经 API 重试时，回到 pending（Asynq RunTask 同步重置其重试计数）。
+func (s *Store) ResetPending(ctx context.Context, taskID string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE job_runs SET status = ?, error = '', started_at = NULL, finished_at = NULL WHERE task_id = ?`,
+		StatusPending, taskID)
+	if err != nil {
+		return fmt.Errorf("store: reset pending: %w", err)
+	}
+	return nil
+}
+
+// MarkCanceled 取消未开始的任务。
+func (s *Store) MarkCanceled(ctx context.Context, taskID, errMsg string, finishedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE job_runs SET status = ?, error = ?, finished_at = ? WHERE task_id = ?`,
+		StatusCanceled, errMsg, finishedAt, taskID)
+	if err != nil {
+		return fmt.Errorf("store: mark canceled: %w", err)
+	}
+	return nil
+}
+
+// RunFilter 执行记录查询条件（§5 GET /v1/runs，全部可选）。
+type RunFilter struct {
+	RequestID string
+	Action    string
+	Status    string
+	JobID     string
+	From      *time.Time
+	To        *time.Time
+	Page      int // 1 起
+	PageSize  int
+}
+
+// ListRuns 按条件分页查询执行记录，返回行列表与总数。
+func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error) {
+	where, args := " WHERE 1=1", []any{}
+	if f.RequestID != "" {
+		where, args = where+" AND request_id = ?", append(args, f.RequestID)
+	}
+	if f.Action != "" {
+		where, args = where+" AND action = ?", append(args, f.Action)
+	}
+	if f.Status != "" {
+		where, args = where+" AND status = ?", append(args, f.Status)
+	}
+	if f.JobID != "" {
+		where, args = where+" AND job_id = ?", append(args, f.JobID)
+	}
+	if f.From != nil {
+		where, args = where+" AND enqueued_at >= ?", append(args, *f.From)
+	}
+	if f.To != nil {
+		where, args = where+" AND enqueued_at <= ?", append(args, *f.To)
+	}
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_runs`+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("store: count runs: %w", err)
+	}
+
+	page, size := f.Page, f.PageSize
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 200 {
+		size = 20
+	}
+	q := `SELECT task_id, request_id, action, job_id, callback_url, status, attempts, error, duration_ms,
+       submitted_by, source_ip, enqueued_at, started_at, finished_at FROM job_runs` + where +
+		` ORDER BY enqueued_at DESC LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, q, append(args, size, (page-1)*size)...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: list runs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Run
+	for rows.Next() {
+		var r Run
+		if err := rows.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.CallbackURL, &r.Status,
+			&r.Attempts, &r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP,
+			&r.EnqueuedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+			return nil, 0, fmt.Errorf("store: scan run: %w", err)
+		}
+		out = append(out, &r)
+	}
+	return out, total, rows.Err()
 }
 
 // MarkRunning worker 取到任务时置 running 并记本次尝试序号与开始时间。

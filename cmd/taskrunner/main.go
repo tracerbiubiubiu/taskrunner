@@ -1,9 +1,9 @@
-// taskrunner 入口：单进程 = API server（M1 仅 /healthz）+ Asynq worker + Scheduler（空载，M2 接入 job 定义）。
+// taskrunner 入口：单进程 = HTTP API（/healthz + /v1）+ Asynq worker + cronloop（分钟级 tick 触发 cron 定义）。
 //
 // 用法：
 //
-//	taskrunner serve                     # 常驻服务
-//	taskrunner enqueue --action A ...    # M1 的任务入队入口（M2 由 HTTP API 接管）
+//	taskrunner serve                     # 常驻服务（需 TASKRUNNER_API_TOKEN）
+//	taskrunner enqueue --action A ...    # CLI 入队（调试用；正式入口是 POST /v1/tasks）
 package main
 
 import (
@@ -13,7 +13,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,8 +24,11 @@ import (
 
 	utilslogger "github.com/tracerbiubiubiu/zhuzhao-utils/logger"
 
+	"github.com/tracerbiubiubiu/taskrunner/internal/api"
 	"github.com/tracerbiubiubiu/taskrunner/internal/callback"
 	"github.com/tracerbiubiubiu/taskrunner/internal/config"
+	"github.com/tracerbiubiubiu/taskrunner/internal/cronloop"
+	"github.com/tracerbiubiubiu/taskrunner/internal/enqueue"
 	"github.com/tracerbiubiubiu/taskrunner/internal/store"
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 	"github.com/tracerbiubiubiu/taskrunner/internal/worker"
@@ -42,7 +44,7 @@ func main() {
 	case "serve":
 		serve(config.Load())
 	case "enqueue":
-		if err := enqueue(config.Load(), args[1:]); err != nil {
+		if err := enqueueCmd(config.Load(), args[1:]); err != nil {
 			log.Fatalf("enqueue: %v", err)
 		}
 	default:
@@ -56,6 +58,11 @@ func serve(cfg config.Config) {
 		Level: cfg.LogLevel,
 		Dir:   cfg.LogDir,
 	})
+	if cfg.APIToken == "" {
+		logger.Error("TASKRUNNER_API_TOKEN 未设置：/v1 面向内网但绝不能无鉴权启动，拒绝启动")
+		os.Exit(1)
+	}
+
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		logger.Error("open store failed", "err", err)
@@ -64,15 +71,18 @@ func serve(cfg config.Config) {
 	defer st.Close()
 
 	redisOpt := asynq.RedisClientOpt{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB}
+	client := asynq.NewClient(redisOpt)
+	defer client.Close()
+	submitter := &submitterAdapter{&enqueue.Service{Store: st, Client: client, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry}}
+	inspector := asynq.NewInspector(redisOpt)
+	defer inspector.Close()
 
-	// HTTP：M1 仅健康检查；M2 挂全部 v1 API，M4 挂 /monitor（asynqmon）
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+	// HTTP：/healthz + /v1 全量 API（gin + utils errcode/response）
+	engine := api.New(api.Deps{
+		Store: st, Submitter: submitter, Inspector: inspector,
+		Queue: cfg.Queue, Token: cfg.APIToken, Logger: logger,
 	})
-	httpSrv := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
+	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: engine}
 
 	// worker
 	srv := asynq.NewServer(redisOpt, asynq.Config{
@@ -84,24 +94,13 @@ func serve(cfg config.Config) {
 		}),
 	})
 
-	// scheduler：空载接线（无周期任务）；M2 由 job 定义动态注册
-	scheduler := asynq.NewScheduler(redisOpt, &asynq.SchedulerOpts{Logger: asynqLogger{logger}})
+	// cronloop：分钟级 tick 触发 cron 定义（动态 cron 定稿方案）
+	loop := &cronloop.Loop{Store: st, Submit: submitter, Logger: logger, Tick: cfg.CronTick}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go func() {
-		if err := scheduler.Run(); err != nil {
-			logger.Error("scheduler exited", "err", err)
-		}
-	}()
-	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("http server exited", "err", err)
-			stop()
-		}
-	}()
-
+	go loop.Run(ctx)
 	if err := srv.Start(worker.NewMux(worker.Deps{
 		Store:    st,
 		Callback: callback.New(cfg.CallbackTimeout),
@@ -110,6 +109,12 @@ func serve(cfg config.Config) {
 		logger.Error("worker start failed", "err", err)
 		os.Exit(1)
 	}
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("http server exited", "err", err)
+			stop()
+		}
+	}()
 	logger.Info("taskrunner serving",
 		"http_addr", cfg.HTTPAddr, "redis", cfg.RedisAddr, "db", cfg.DBPath, "queue", cfg.Queue)
 
@@ -118,12 +123,11 @@ func serve(cfg config.Config) {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	httpSrv.Shutdown(shutdownCtx)
-	scheduler.Shutdown()
+	httpServer.Shutdown(shutdownCtx)
 	srv.Shutdown() // 等在跑任务收尾
 }
 
-func enqueue(cfg config.Config, args []string) error {
+func enqueueCmd(cfg config.Config, args []string) error {
 	fs := flag.NewFlagSet("enqueue", flag.ExitOnError)
 	action := fs.String("action", "", "预置动作 id（必填）")
 	callbackURL := fs.String("callback-url", "", "回调 URL（必填，zhuzhao 内网端点）")
@@ -145,48 +149,36 @@ func enqueue(cfg config.Config, args []string) error {
 		*taskID = uuid.NewString()
 	}
 
-	p := task.Payload{
-		TaskID:      *taskID,
-		RequestID:   *requestID,
-		Action:      *action,
-		CallbackURL: *callbackURL,
-		Params:      json.RawMessage(*params),
-		SubmittedBy: *submittedBy,
-		SourceIP:    *sourceIP,
-		TimeoutSecs: *timeoutSecs,
-	}
-
-	// 先入队再落库：入队失败不留孤儿 pending 行；落库失败仅损失 job_runs（worker 侧已容忍缺行）
-	client := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB})
-	defer client.Close()
-	payload, _ := json.Marshal(p)
-	if _, err := client.Enqueue(
-		asynq.NewTask(task.TypeCallback, payload),
-		asynq.TaskID(p.TaskID),
-		asynq.MaxRetry(cfg.MaxRetry),
-		asynq.Queue(cfg.Queue),
-	); err != nil {
-		if errors.Is(err, asynq.ErrTaskIDConflict) {
-			fmt.Printf("task_id=%s 已存在（幂等受理）\n", p.TaskID)
-			return nil
-		}
-		return err
-	}
-
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if err := st.InsertPending(context.Background(), store.Run{
-		TaskID: p.TaskID, RequestID: p.RequestID, Action: p.Action, CallbackURL: p.CallbackURL,
-		SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP, EnqueuedAt: time.Now(),
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "警告: 入队成功但 job_runs 落库失败（不影响执行，仅损失记录）: %v\n", err)
+	client := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB})
+	defer client.Close()
+
+	accepted, warning, err := (&enqueue.Service{Store: st, Client: client, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry}).
+		Submit(context.Background(), task.Payload{
+			TaskID: *taskID, RequestID: *requestID, Action: *action, CallbackURL: *callbackURL,
+			Params: json.RawMessage(*params), SubmittedBy: *submittedBy, SourceIP: *sourceIP,
+			TimeoutSecs: *timeoutSecs,
+		})
+	if err != nil {
+		return err
 	}
-	fmt.Printf("task_id=%s 已受理（受理 ≠ 执行成功，结果经查询接口获取）\n", p.TaskID)
+	if warning != nil {
+		fmt.Fprintf(os.Stderr, "警告: 入队成功但 job_runs 落库失败（不影响执行，仅损失记录）: %v\n", warning)
+	}
+	if !accepted {
+		fmt.Printf("task_id=%s 已存在（幂等受理）\n", *taskID)
+		return nil
+	}
+	fmt.Printf("task_id=%s 已受理（受理 ≠ 执行成功，结果经查询接口获取）\n", *taskID)
 	return nil
 }
+
+// submitterAdapter 让 *enqueue.Service 满足 api/cronloop 的 Submitter 接口。
+type submitterAdapter struct{ *enqueue.Service }
 
 // slogTask 给 ErrorHandler 提取稳定字段的日志属性。
 func slogTask(t *asynq.Task, err error) []any {
@@ -195,16 +187,4 @@ func slogTask(t *asynq.Task, err error) []any {
 		return []any{"request_id", p.RequestID, "task_id", p.TaskID, "action", p.Action, "type", t.Type(), "err", err}
 	}
 	return []any{"type", t.Type(), "err", err}
-}
-
-// asynqLogger 把 asynq 内部日志桥接到 slog（printf 风格参数；Debug 静默防刷屏）。
-type asynqLogger struct{ l *slog.Logger }
-
-func (a asynqLogger) Debug(args ...interface{}) {}
-func (a asynqLogger) Info(args ...interface{})  { a.l.Info(fmt.Sprint(args...)) }
-func (a asynqLogger) Warn(args ...interface{})  { a.l.Warn(fmt.Sprint(args...)) }
-func (a asynqLogger) Error(args ...interface{}) { a.l.Error(fmt.Sprint(args...)) }
-func (a asynqLogger) Fatal(args ...interface{}) {
-	a.l.Error(fmt.Sprint(args...))
-	os.Exit(1)
 }

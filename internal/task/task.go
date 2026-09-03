@@ -12,6 +12,7 @@ type Payload struct {
 	TaskID      string          `json:"task_id"` // 调用方生成，全局唯一，幂等键
 	RequestID   string          `json:"request_id"`
 	Action      string          `json:"action"` // 预置动作 id（zhuzhao 注册表键）
+	JobID       string          `json:"job_id,omitempty"` // 经由哪个任务定义触发
 	CallbackURL string          `json:"callback_url"`
 	Params      json.RawMessage `json:"params,omitempty"`
 	SubmittedBy string          `json:"submitted_by,omitempty"` // 工号，审计归因（§4 透传）

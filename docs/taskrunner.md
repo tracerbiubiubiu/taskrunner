@@ -86,7 +86,7 @@
 
 taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，拆分留待需要时再议）。
 
-- 暴露边界：**仅内网 + 服务级鉴权**。分工：**用户权限（zhuzhao 三层校验）全部收敛在网关**——前端所有操作先过网关授权，通过后才代理调 taskrunner API；taskrunner 只认证「调用方服务」，不认证用户、不复刻权限模型；
+- 暴露边界：**仅内网 + 服务级鉴权**（✅ 已实现：静态 Bearer token，env `TASKRUNNER_API_TOKEN` 注入，常量时间比较；未设置时拒绝启动）。分工：**用户权限（zhuzhao 三层校验）全部收敛在网关**——前端所有操作先过网关授权，通过后才代理调 taskrunner API；taskrunner 只认证「调用方服务」，不认证用户、不复刻权限模型；
 - 调用方身份：按调用方发 credential（token 携带 caller id；当前仅 zhuzhao，设计预留多服务）；API 写操作（建/改定义、触发、取消、重试）在 slog 打点归因（caller + actor + IP + request_id）；`job` 表记 `created_by`（工号，§4 透传，审计归因）与 `owner_service`（来自 credential，当前恒为 zhuzhao）——跨服务归属约束待第二个调用方出现再启用，当前不实现；
 - 响应结构 / 错误码复用 zhuzhao-utils `errcode` + `response`，与网关风格一致。
 
@@ -161,13 +161,18 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
 | **M1 核心运行时** | Asynq worker + Scheduler；回调客户端（超时 / 5xx·4xx 判定 / 退避重试）；`job_runs` 落库（SQLite + `internal/store`）；`/healthz`；入队暂以 CLI / 测试入口触发 | 任务能从入队走到回调并正确记录，失败按策略重试，死信可查 |
-| **M2 HTTP API** | §5 全部 v1 端点（含任务定义 jobs 组、归属标签过滤）；内网 credential 鉴权；调用人上下文字段（`actor` / `source_ip`）；`errcode`/`response` 统一响应；提交幂等（task_id 去重） | zhuzhao 可走 API 建任务定义、提交任务，并按 request_id 查到执行记录 |
-| **M3 首个预置动作** | 审计归档（B11②）：创建任务定义（job）+ zhuzhao `/internal/jobs/<action>` 端点 | 「触发 → 回调执行 → 失败重试」按周期闭环跑通（对齐 zhuzhao `docs/phase3/03-audit-l2.md`） |
+| **M2 HTTP API** | §5 全部 v1 端点（含任务定义 jobs 组、归属标签过滤）；内网 credential 鉴权；调用人上下文字段（`actor` / `source_ip`）；`errcode`/`response` 统一响应；提交幂等（task_id 去重） | zhuzhao 可走 API 建任务定义、提交任务，并按 request_id 查到执行记录 || **M3 首个预置动作** | 审计归档（B11②）：创建任务定义（job）+ zhuzhao `/internal/jobs/<action>` 端点 | 「触发 → 回调执行 → 失败重试」按周期闭环跑通（对齐 zhuzhao `docs/phase3/03-audit-l2.md`） |
 | **M4 运维完善** | 指标（队列深度/成功率/回调延迟）；死信告警；asynqmon **以库嵌入 API server**（挂 `/monitor`，置于内网 token 之后，read-only 起步，前端随包内嵌；入队配 `asynq.Retention` 短期留观——Redis 里那份只作近期观察，长期事实以 `job_runs` 为准）；`job_runs` 保留清理 | 异常可感知、死信有出口、存储有界；运维看板可用且不裸暴露 |
 
 模块内顺序 **M1 → M2 → M3**，M4 可与 M3 并行。
 
-⚠️ 随 M2/M3 落地细化：动态 cron 实现方式（定义变更热重注册 Scheduler vs 分钟级 tick 扫描 DB 到期任务）；credential 具体形式（静态 token / 签名 / mTLS）；回调超时默认值（建议 30s）；action 校验方式（zhuzhao 清单端点 vs 提交时探活）；`GET /v1/tasks/{id}` 状态的数据源（Asynq 实时态 vs `job_runs` 推导）；`job_runs` 保留期。
+⚠️ 随 M2/M3 落地细化（M2 已定案部分随实现入档）：
+- ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；
+- ~~credential 具体形式~~ ✅ M2 定案：**静态 Bearer token**（`TASKRUNNER_API_TOKEN`）；多调用方时代再升级签名 / mTLS；
+- ~~`GET /v1/tasks/{id}` 状态数据源~~ ✅ M2 定案：**job_runs 为主 + Asynq Inspector 补充 in-flight 实时态**（pending/active/retry/scheduled 只在 Redis，以 `live_state` 字段并返回）；
+- ~~action 校验方式~~ ✅ M2 定案：**不做前置校验**——不存在 / 未注册的 action 经回调 4xx 快速失败（non-retryable，failed 可见）；zhuzhao 清单端点方案保留为可选增强；
+- 回调超时默认值：实现取 30s（env `TASKRUNNER_CALLBACK_TIMEOUT` 可改，载荷可按任务覆盖）——随 M3 验证后转正式口径；
+- `job_runs` 保留期：仍待定（M4 随清理任务落地）。
 
 ## 11. 关联文档
 
@@ -197,3 +202,5 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-03 | 补充 §11 zhuzhao 侧配套清单（动作注册表与内网端点、动作清单校验端点、任务管理功能、部门可见性策略及其在 zhuzhao DB 的存储、任务提交日志、后置的通知接收端点），防跨仓库工作项遗漏 |
 | 2026-09-03 | 全文整理：修正 ADR-002 注记章节引用（§6→§8）；统一 `created_by` / `owner_service` 字段口径；对齐「结果归属」与「结果获取模型」表述；M3 去除 `job_config` 旧术语；M1/M2 补触发方式与透传字段；待细化项集中至 §10 ⚠️；变更记录按主题合并 |
 | 2026-09-03 | 环境决策与配套拆分：确认无日志平台（过程日志先落文件，§6 入档 ES 演进路径——slog JSON Lines，shipper 采集零改应用，字段稳定命名自 M1 约束）；部署形态定 **Docker**（单容器单进程、卷挂载 SQLite/日志、SQLite 单写者 → 单副本约束入档）；zhuzhao 侧配套需求拆出独立文档 [zhuzhao-integration.md](./zhuzhao-integration.md)，§11 改为链接；M4 补 `asynq.Retention` 留观口径 |
+| 2026-09-03 | M1 完成（feat/m1-runtime）：核心运行时落地——Asynq worker + 回调客户端（2xx/4xx/5xx·超时判定）+ job_runs SQLite（WAL）+ healthz + enqueue CLI + Dockerfile；端到端冒烟通过（成功 / 4xx 死信 / 幂等重提）；实现中修正：store 自动建目录、先入队后落库防孤儿行 |
+| 2026-09-03 | M2 完成（feat/m2-api）：HTTP API v1 全量落地——gin + utils `errcode`/`response` 统一响应；静态 Bearer 鉴权（未设 token 拒绝启动）；提交 / 查询（runs 条件分页 + live_state）/ jobs CRUD（dept 过滤、cron 校验）/ trigger / cancel / retry / 死信列表；`cronloop` 分钟级 tick 触发 cron 定义（§10 定案入档）；job_runs 增 `job_id` 列关联任务定义；API 层选型：token 取消用 asynq Scheduler 改自研 tick（静态 payload 限制）；单测 19 个 + 真 Redis 端到端冒烟（含 cron 到点自动触发、停用即不触发）|

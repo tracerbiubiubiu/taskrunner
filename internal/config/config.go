@@ -20,6 +20,8 @@ type Config struct {
 	Concurrency     int           // worker 并发
 	MaxRetry        int           // 回调失败默认重试上限
 	Queue           string        // Asynq 队列名
+	APIToken        string        // 内网 credential（静态 Bearer；serve 必填）
+	CronTick        time.Duration // cronloop 轮询间隔（默认 30s）
 }
 
 func Load() Config {
@@ -35,6 +37,8 @@ func Load() Config {
 		Concurrency:     envInt("TASKRUNNER_CONCURRENCY", 10),
 		MaxRetry:        envInt("TASKRUNNER_MAX_RETRY", 5),
 		Queue:           envStr("TASKRUNNER_QUEUE", "jobs"),
+		APIToken:        envStr("TASKRUNNER_API_TOKEN", ""),
+		CronTick:        envDur("TASKRUNNER_CRON_TICK", 30*time.Second),
 	}
 }
 

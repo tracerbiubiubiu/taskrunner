@@ -12,3 +12,4 @@ logs/
 # 编辑器
 .idea/
 .vscode/
+bin/

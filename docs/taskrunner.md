@@ -130,7 +130,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 - 存储：**独立 DB**。~~SQLite 起步~~ ✅ **拍板统一 PG（2026-09-03）**：迁独立 PG 数据库（utils `postgres` + pgx，schema 不变，随 M3/M4 C7 落地）；SQLite 保留为 M1/M2 已交付实现（`database/sql` 接口无感切换）；
 - 最小 schema：`task_id`、`request_id`、`action`、`status`（pending / running / succeeded / failed / dead）、`attempts`、`callback_url`、`error`、`duration_ms`、`submitted_by` / `source_ip`（zhuzhao 透传的原始调用人，cron 触发为空，仅审计归因）、`enqueued_at` / `started_at` / `finished_at`；
-- 存储层代码放**本仓库 `internal/store`**：job_runs 是 taskrunner 领域 schema，**不放 zhuzhao-utils**（utils 只收通用件；出现第二个同类消费者再考虑下沉）；
+- 存储层代码放**本仓库 `internal/repository`**（2026-09-04 结构重构，原 `internal/store`）：job_runs 是 taskrunner 领域 schema，**不放 zhuzhao-utils**（utils 只收通用件；出现第二个同类消费者再考虑下沉）；
 - 保留策略 ⚠️ 落地时定（建议：保留期可配置 + 定时清理，思路同审计归档；`submitted_by` / `source_ip` 属个人信息，同受保留期约束）。
 
 **两路日志分工**（"日志"是两件事）：
@@ -177,7 +177,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
-| **M1 核心运行时** | Asynq worker + Scheduler；回调客户端（超时 / 5xx·4xx 判定 / 退避重试）；`job_runs` 落库（SQLite + `internal/store`）；`/healthz`；入队暂以 CLI / 测试入口触发 | 任务能从入队走到回调并正确记录，失败按策略重试，死信可查 |
+| **M1 核心运行时** | Asynq worker + Scheduler；回调客户端（超时 / 5xx·4xx 判定 / 退避重试）；`job_runs` 落库（SQLite + `internal/repository`）；`/healthz`；入队暂以 CLI / 测试入口触发 | 任务能从入队走到回调并正确记录，失败按策略重试，死信可查 |
 | **M2 HTTP API** | §5 全部 v1 端点（含任务定义 jobs 组、归属标签过滤）；内网 credential 鉴权；调用人上下文字段（`actor` / `source_ip`）；`errcode`/`response` 统一响应；提交幂等（task_id 去重） | zhuzhao 可走 API 建任务定义、提交任务，并按 request_id 查到执行记录 || **M3 首个预置动作** | 审计归档（B11②）：创建任务定义（job）+ zhuzhao `/internal/jobs/<action>` 端点 | 「触发 → 回调执行 → 失败重试」按周期闭环跑通（对齐 zhuzhao `docs/phase3/03-audit-l2.md`） |
 | **M4 运维完善** | 指标（队列深度/成功率/回调延迟）；死信告警；asynqmon **以库嵌入 API server**（挂 `/monitor`，置于内网 token 之后，read-only 起步，前端随包内嵌；入队配 `asynq.Retention` 短期留观——Redis 里那份只作近期观察，长期事实以 `job_runs` 为准）；`job_runs` 保留清理 | 异常可感知、死信有出口、存储有界；运维看板可用且不裸暴露 |
 
@@ -186,7 +186,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 ⚠️ 随 M2/M3 落地细化（M2 已定案部分随实现入档）：
 - ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；
 - ~~credential 具体形式~~ ✅ M2 定案：静态 Bearer token（`TASKRUNNER_API_TOKEN`）——**2026-09-03 被 AK/SK 基线修订覆盖：Bearer → AK/SK HMAC 验签**（utils `aksk`，C2/C8）；
-- **公共能力对齐清单（2026-09-03 基线统一，zhuzhao 16 号 §9 C1–C6）**：C1 统一访问日志中间件（X-Request-ID 读头/回显 + X-Operator 兜底 `system`，M3 随手）；C2 API 鉴权换 **AK/SK 验签**（Bearer → HMAC，前置 C8 utils `aksk` 包；不再依赖 C3 时序）；C3 compose 双 network（端口仅挂 zhuzhao 专用网络，M3 联调/M4 部署）；C4 `/readyz` 检 Redis+SQLite（M4）；C5 Dockerfile `TZ=Asia/Shanghai`（下次提交）；C6 配置迁 yaml+`${VAR}` 展开（低优可选）；
+- **公共能力对齐清单（zhuzhao 16 号 §9 C1–C9；2026-09-04 结构重构批量收口）**：~~C1~~ ✅ 统一访问日志中间件（rid 读头/回显 + X-Operator 兜底 `system`）；~~C2~~ ✅ API 验签 AK/SK HMAC（Bearer 已移除，密钥环空拒绝启动）；~~C4~~ ✅ `/readyz`（Redis ping + SQLite 探针）；~~C5~~ ✅ Dockerfile `TZ=Asia/Shanghai`；~~C6~~ ✅ viper yaml+env（TASKRUNNER_* 全兼容）；~~C9~~ ✅ 回调以自身 SK 签名 + rid 透传；**C3**（compose 双 network）与 **C7**（SQLite→PG）随部署批次；
 - ~~回调鉴权机制（taskrunner → zhuzhao `/internal`）~~ ✅ 拍板定案（2026-09-03）：不做独立机制——信任边界 = 内网隔离 + `callback_url` 由 zhuzhao 提交时指定；**2026-09-03 被 AK/SK 基线修订覆盖**：回调请求带 HMAC 签名（§4 安全边界，C9，zhuzhao `/internal` 验签），capability URL 增强作废，专用 network 降为第二道防线；
 - ~~`GET /v1/tasks/{id}` 状态数据源~~ ✅ M2 定案：**job_runs 为主 + Asynq Inspector 补充 in-flight 实时态**（pending/active/retry/scheduled 只在 Redis，以 `live_state` 字段并返回）；
 - ~~action 校验方式~~ ✅ M2 定案：**不做前置校验**——不存在 / 未注册的 action 经回调 4xx 快速失败（non-retryable，failed 可见）；zhuzhao 清单端点方案保留为可选增强；

@@ -27,7 +27,8 @@
 - 2026-09-03：建仓 + 设计建档（独立仓库/部署/Redis，回调模型，日志边界定稿）；
 - 2026-09-03：设计增补定稿（提交走 API；任务三层模型与定义管理 API；结果以查询接口为唯一出口；job_runs 落库 SQLite；审计透传与部门归属过滤；回调契约；asynqmon 库嵌入；实施计划 M1–M4；zhuzhao 侧配套清单）；
 - 2026-09-03：环境决策（无日志平台——过程日志落文件、ES 演进路径入档；部署形态 Docker 单容器）；zhuzhao 侧配套需求拆出 [独立文档](./docs/zhuzhao-integration.md)；
-- 2026-09-03：M1 核心运行时完成（worker/回调/job_runs 落库/healthz/CLI/Dockerfile，feat/m1-runtime）；M2 HTTP API 完成（v1 全量端点 + 静态 Bearer 鉴权 + cronloop 定时触发，feat/m2-api；鉴权随 M3 迁 AK/SK 验签）；下一步 M3 首个预置动作（审计归档 B11②，zhuzhao 侧 handler 待就绪）；
+- 2026-09-03：M1 核心运行时完成（worker/回调/job_runs 落库/healthz/CLI/Dockerfile）；M2 HTTP API 完成（v1 全量端点 + cronloop 定时触发；鉴权后随结构重构迁 AK/SK）；
+- 2026-09-04：**微服务结构重构**（Wire DI / handler→service→repository 分层 / yaml+env 配置 / 统一 Makefile 门禁；C1/C2/C4/C5/C6/C9 收口——API 验签 AK/SK、/readyz、TZ、回调签名）。zhuzhao 侧预置动作体系已就绪（jobs Registry + audit_archive + /internal 回调端点 + 任务管理代理端点）；**下一步 M3 部署联调**（建 cron 定义 + 两侧对拉 + C3 网络拓扑/C7 迁 PG）；
 - 2026-09-04：代码评审修复（提交幂等扩为终身；cancel 竞态三道防护，fix/idempotency-and-cancel-race）；§1 补「什么算一个任务」判定标准；
 - 首个预置动作：审计归档（B11②，定时回调 zhuzhao 导出 audit_logs JSONL）；
 - 状态：M1/M2 已完成，M3 待做；已初始 commit，当前改动未提交。

@@ -10,7 +10,7 @@
 用户 → zhuzhao（三层校验 + 业务审计）
      │ 发起：提交任务 / 建·改定义 / 手动执行 / 查结果
      ▼
-   taskrunner API（内网 credential；写接口显式带 actor 工号 + source_ip）
+   taskrunner API（AK/SK HMAC 签名；写接口显式带 actor 工号 + source_ip）
      │ cron 到点 / 出队
      ▼
    taskrunner 回调 zhuzhao：POST /internal/jobs/<action_id>（task_id + request_id + params）

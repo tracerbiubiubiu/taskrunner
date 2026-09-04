@@ -40,15 +40,19 @@ func provideRedisOpt(cfg *config.Config) asynq.RedisClientOpt {
 	return asynq.RedisClientOpt{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB}
 }
 
-// provideSubmitter 统一受理路径（submit.go：A1 终身幂等）。
-func provideSubmitter(cfg *config.Config, st *repository.Store, opt asynq.RedisClientOpt) *service.Service {
+// provideSubmitter 统一受理路径（submit.go：A1 终身幂等）。cleanup 关闭底层 asynq client。
+func provideSubmitter(cfg *config.Config, st *repository.Store, opt asynq.RedisClientOpt) (*service.Service, func(), error) {
+	cli := asynq.NewClient(opt)
 	return &service.Service{
-		Store: st, Client: asynq.NewClient(opt), Queue: cfg.Queue, MaxRetry: cfg.MaxRetry,
-	}
+		Store: st, Client: cli, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry,
+	}, func() { cli.Close() }, nil
 }
 
-// provideInspector Asynq 检视（实时态/取消/重试/死信）。
-func provideInspector(opt asynq.RedisClientOpt) *asynq.Inspector { return asynq.NewInspector(opt) }
+// provideInspector Asynq 检视（实时态/取消/重试/死信）。cleanup 关闭连接。
+func provideInspector(opt asynq.RedisClientOpt) (*asynq.Inspector, func(), error) {
+	ins := asynq.NewInspector(opt)
+	return ins, func() { ins.Close() }, nil
+}
 
 // provideTaskService 任务域服务。
 func provideTaskService(cfg *config.Config, st *repository.Store,
@@ -96,11 +100,11 @@ func provideKeys(cfg *config.Config) map[string][]byte {
 }
 
 // provideReadyz 依赖就绪探针（C4：检 Redis ping + SQLite 可查询）。
-func provideReadyz(cfg *config.Config, st *repository.Store) func() error {
+func provideReadyz(cfg *config.Config, st *repository.Store) (func() error, func(), error) {
 	rdb := goredis.NewClient(&goredis.Options{
 		Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB,
 	})
-	return func() error {
+	ready := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if err := rdb.Ping(ctx).Err(); err != nil {
@@ -108,6 +112,7 @@ func provideReadyz(cfg *config.Config, st *repository.Store) func() error {
 		}
 		return st.Ping()
 	}
+	return ready, func() { rdb.Close() }, nil
 }
 
 // provideEngine HTTP 路由引擎。

@@ -51,7 +51,7 @@
 
 **做**：
 - 可靠任务队列（Asynq，Redis AOF 持久化，重启不丢）；
-- 定时调度（Scheduler / PeriodicTask，cron）；
+- 定时调度（**cron 循环**：分钟级 tick 扫 DB 到期定义，§10 定案——未用 asynq Scheduler，静态 payload 撑不起每次触发的新 task_id + 审计字段）；
 - 触发 → HTTP 回调 zhuzhao 内网端点执行预置动作；
 - 重试 / 超时 / 阻塞策略 / 死信；
 - 自维护 `job_runs`（独立 DB：执行细节、重试次数、耗时、结果、回调目标，见 §6）；
@@ -87,7 +87,8 @@
 - **调用人上下文透传（2026-09-03 补充）**：zhuzhao 调写接口（提交 / 建改定义 / 触发）时显式携带 `actor`（工号）与 `source_ip` 等原始信息，taskrunner **原样存档**（job 定义记 `created_by`；执行记录记 `submitted_by` / `source_ip`，cron 触发为空）并随 slog 打点（caller + actor + IP + request_id）——仅作审计归因，taskrunner 不校验、不据其做权限判断（信任边界在网关）；
 - **归属过滤（2026-09-03 补充）**：job 定义的归属标签（如 `dept`）对 taskrunner 是不透明字符串，`GET /v1/jobs?dept=…` 按值过滤，实现「不同部门看到不同预置任务」；部门语义与「能看 / 能管哪些」的权限全归 zhuzhao（策略存 zhuzhao 自有 DB，见 §11 配套清单），taskrunner 不建组织模型；跨部门**写保护**随多调用方时代再启用（同 §5 `created_by` 口径）；
 - **新增一个可调度动作**：① zhuzhao 新增 handler 并注册进注册表（发版一次）；② 调 `POST /v1/jobs` 建任务定义（运行时，无需再动 taskrunner）；
-- 内置例外（后置，按需再启）：与业务无关的通用动作（如 ping URL、清理自身数据）可在 taskrunner 内实现同款「接口 + id 注册表」，进程内直接执行、不回调 zhuzhao。
+- 内置例外（后置，按需再启）：与业务无关的通用动作（如 ping URL、清理自身数据）可在 taskrunner 内实现同款「接口 + id 注册表」，进程内直接执行、不回调 zhuzhao；
+- **能力服务（后置，2026-09-04 记录）**：动作按数据归属放——当前业务数据集中在 zhuzhao，所有动作集中在其 `internal/jobs` 包（加动作 = 加一个文件 + 注册一行，能力并不分散）。若出现以下信号，可新建专门的能力服务承接动作，**模型完全兼容、taskrunner 零改动**（它只认 `action_id + callback_url`，端点在哪不感知）：① 通用动作（不属于任何业务域的 ping / 搬运 / 报表类）批量涌现；② 多个服务都需要注册动作、分散管理成为负担。触发前不预建（新服务承接业务动作要么跨服务连库、要么逻辑劈两半，均为负收益）。
 
 ### 回调契约（2026-09-03 补充）：
 - **幂等**：任务重试可能重复回调，zhuzhao handler 须按 `request_id`/`task_id` 幂等（先查重再执行）；对「导出 + 删除」类有副作用的动作尤其必要；
@@ -111,14 +112,15 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 |---|---|
 | `POST /v1/tasks` | 提交任务；**受理语义**：校验通过 + 写入队列（Redis AOF）即返回 task_id，「受理 ≠ 执行成功」；**幂等**：接受调用方生成的 `task_id`，重复提交去重 |
 | `GET /v1/tasks/{id}` | 查任务状态 |
-| `GET /v1/runs?request_id=&action=&status=&from=&to=` | 查执行记录（§7 日志边界的「request_id 跨查」即此） |
-| `GET /v1/jobs?dept=&action=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签，§4） |
+| `GET /v1/runs?request_id=&action=&status=&job_id=&from=&to=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；job_id 过滤按定义关联） |
+| `GET /v1/jobs?dept=&action_id=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签，§4） |
 | `PATCH /v1/jobs/{id}` | 修改任务定义：cron / params / 启停 |
 | `POST /v1/jobs/{id}/trigger` | 手动执行一次（按定义提交任务，前端「立即执行」按钮） |
 | `POST /v1/tasks/{id}/cancel` | 取消未开始的任务 |
 | `POST /v1/tasks/{id}/retry` | 重试失败/死信任务 |
 | `GET /v1/dead-letters` | 死信列表（配合 Asynq Inspector 重放，死信处理闭环） |
-| `GET /healthz` | 健康检查 |
+| `GET /healthz` | 健康检查（存活） |
+| `GET /readyz` | 就绪探针（检 Redis ping + SQLite；C4） |
 
 **结果获取模型（2026-09-03 定稿）**：提交响应只回答「是否受理」；执行是否成功，一律通过 `GET /v1/tasks/{id}` / `GET /v1/runs` **按需查询**——查询是执行结果的唯一出口，taskrunner 不主动推送（终败通知为后置项，§4）。
 
@@ -161,7 +163,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **独立部署**（独立进程/容器，不与 zhuzhao 布一块——zhuzhao 只作网关调用各能力、拉起各任务）；
 - **独立 Redis**（Asynq 队列归属 taskrunner，能力自包含，同 activelist 独立库原则）。口径：指 Redis 命名空间/库独立归属 taskrunner，**不必然新增一套 Redis 部署**，与 ADR-002「复用现有 Redis、不新增基础设施」不冲突，按部署环境落地；
 - **独立 DB**（`job_runs` 归 taskrunner 自有）。~~SQLite 起步~~ ✅ **拍板统一 PG（2026-09-03，基线 §8/zhuzhao 16 号 §9 C7）**：迁独立 PG 数据库（复用 utils `postgres`，schema 不变，约半天，随 M3/M4）；SQLite 保留为 M1/M2 已交付里程碑实现；
-- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + Scheduler 同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要）；`/monitor` 随容器同端口暴露，仅内网可达；
+- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + cron 循环同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要）；`/monitor` 随容器同端口暴露，仅内网可达；
 - 公共工具统一引自 [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils)：`logger`（应用日志）、`postgres`（迁 PG 时）、`errcode` + `response`（API 统一响应）；`redis` 包用不上（Asynq 走自己的 `RedisClientOpt`）。依赖 utils（独立通用工具库）**不属于**「不反向依赖」的禁止范围。
 
 ## 9. 首个预置动作（M-E 验收入口）
@@ -227,6 +229,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-04 | 代码评审修复（fix/idempotency-and-cancel-race）：**提交幂等扩为终身**——原仅靠 Asynq TaskID 冲突（succeeded 后 ID 释放，同 task_id 重提会重复执行并覆盖历史），Submit 入口先查 job_runs、行存在即幂等拒绝；**cancel 竞态三道防护**——删队列前 GetTaskInfo 查 active、DeleteTask 报 active 映射 409、MarkCanceled 改条件更新（WHERE status=pending）|
 | 2026-09-04 | §1 新增「什么算一个任务」判定标准（任务 = 必须发生/失败重试/执行留痕的动作单位；含消息通知示例——ADR-002 场景 D 即普通预置动作、即时提交非 cron、taskrunner 侧零改动；粒度与幂等提醒；反面清单）|
 | 2026-09-04 | 澄清任务完成情况查询口径（zhuzhao-integration §2.3 补充）：业务查询走 `/v1/runs?status=…`（job_runs 为数据源），asynqmon 仅为 M4 运维看板（队列内部态、无业务过滤）不面向用户查询；可选增强：状态计数聚合端点，做页面时按需 |
+| 2026-09-04 | §4 新增后置项「能力服务」：动作按数据归属集中放（当前 = zhuzhao `internal/jobs` 包，加动作一处完成）；通用动作批量涌现或多服务注册动作成负担时，可新建能力服务承接——模型兼容、taskrunner 零改动，触发前不预建 |
 | 2026-09-03 | 拍板定案（所有者）：**回调鉴权不做独立机制**（§4 安全边界 + §10 ⚠️ 关闭该项）——信任边界 = 内网网络隔离（与 API 暴露边界同级）+ `callback_url` 由 zhuzhao 提交时自行指定；zhuzhao 侧可选 URL 密钥路径段增强（capability URL，taskrunner 零感知）。zhuzhao 侧 16 号 P5 撤销、P6 随 M2 定案同步（不做前置校验） |
 | 2026-09-03 | 拍板定案（所有者，P7）：**回调响应不引入状态字段**——2xx 仅代表执行完全成功；zhuzhao handler 业务失败直接映射 HTTP 状态码（不可重试 4xx / 可重试 5xx，常规 errcode）；taskrunner 现有 2xx/4xx/5xx 判定即最终行为（callback client 注释随下次提交更新）。zhuzhao 侧 16 号 P1–P7 同日全部关闭，M-E 动工前决策面清零 |
 | 2026-09-03 | 登记全链路关联小改（随 M3）：callback client 回调请求带 `X-Request-ID: <payload.request_id>` 头（有则带，cron 触发为空则不带）——zhuzhao 入站 RequestID 中间件接受入站同 rid，回调链路与 `job_runs` 贯通（zhuzhao 03-audit-l2 §3.4 全链路矩阵） |
@@ -235,3 +238,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-03 | **B3 拍板：存储统一 PG**——job_runs 迁独立 PG 数据库（C7，utils `postgres` 复用、schema 不变、约半天，随 M3/M4；§6/§8 同步）；SQLite 保留为 M1/M2 已交付实现；解除单副本约束（多副本按运维需要）；C4 readyz 改检 Redis+PG |
 | 2026-09-03 | **AK/SK 基线修订**（所有者拍板，SSOT = zhuzhao 16 号 §9）：服务间通信统一 **AK/SK HMAC 签名**（utils `aksk` 包 C8 先行；C2 = Bearer→验签、C9 = 回调签名；覆盖当日「零认证+拓扑」与「回调不做鉴权」两条早前拍板；capability URL 作废；专用 network 降为第二道防线） |
 | 2026-09-04 | **微服务结构重构**（所有者拍板：以正式微服务标准建设，内部与 zhuzhao 同规格——zhuzhao 16 号 §9「工程结构」基线）：目录重排 `cmd`（薄入口）/ `internal/app`（**Wire DI** + 生命周期）/ `handler`（薄 HTTP 层）/ `service`（TaskService 业务下沉 + submit/cron）/ `repository`（原 store）/ `middleware`（C1 访问日志 + C2 AK/SK 验签）/ `worker` / `callback`；config 改 **yaml + env**（C6，viper，全 env 兼容；密钥环空拒绝启动 fail-closed）；**C1/C2/C4/C5/C9 同批收口**（统一访问日志中间件含 rid 回显与 operator 兜底；API 验签 Bearer→AK/SK；/readyz 检 Redis+SQLite；Dockerfile TZ；回调以自身 SK 签名+rid 透传）；Makefile 门禁（lint=vet+gofmt / test / build）；handler 测试 ×7 重写为 aksk 口径 + C9 签名测试；C3（网络拓扑）/C7（迁 PG）仍待部署批次 |
+| 2026-09-04 | **全仓审计修复**：① job_runs.request_id 跨查链断裂（API 提交/触发 body-only 绑定 + zhuzhao client body 未带 → 恒空）——双侧修复（handler 头值兜底 + client body 补 request_id）；② 容器崩溃循环（默认 configs/config.yaml 缺失即 fatal）→ env-only 模式 + Dockerfile 拷贝 configs；③ fail-closed 扩至 self_sk（回调签名身份缺失=zhuzhao 验签必 401）与空 queue；④ wire 清理对补齐（client/inspector/readyz-redis Close）；⑤ 本表 action_id 参数名/readyz 行/job_id 过滤/Scheduler 措辞修正 + README quickstart |

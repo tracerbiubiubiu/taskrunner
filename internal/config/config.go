@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/viper"
@@ -41,11 +42,16 @@ type Config struct {
 }
 
 // Load 从 path 读 yaml；env 覆盖（容器部署敏感值注入）。
+// 文件不存在 → env-only 模式（镜像可只注入 TASKRUNNER_* 环境变量运行）。
 func Load(path string) (*Config, error) {
 	if path != "" {
-		viper.SetConfigFile(path)
-		if err := viper.ReadInConfig(); err != nil {
-			return nil, fmt.Errorf("read config: %w", err)
+		if _, statErr := os.Stat(path); statErr == nil {
+			viper.SetConfigFile(path)
+			if err := viper.ReadInConfig(); err != nil {
+				return nil, fmt.Errorf("read config: %w", err)
+			}
+		} else if !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("stat config: %w", statErr)
 		}
 	}
 	viper.AutomaticEnv()
@@ -89,6 +95,14 @@ func Load(path string) (*Config, error) {
 	// fail-closed：验签密钥环为空 = API 完全裸奔——拒绝启动（对齐 zhuzhao internal_jobs 拍板）
 	if len(cfg.Security.Callers) == 0 {
 		return nil, fmt.Errorf("security.callers 为空（env TASKRUNNER_CALLER_ZHUZHAO_SK 注入 zhuzhao 的 SK）——API 不允许无验签启动")
+	}
+	// fail-closed：C9 回调签名身份缺失 = 每次回调被 zhuzhao /internal 验签 401 → 无限重试
+	if cfg.Security.SelfAK == "" || cfg.Security.SelfSK == "" {
+		return nil, fmt.Errorf("security.self_ak/self_sk 缺失（env TASKRUNNER_SELF_AK/SELF_SK）——回调无签名将被 zhuzhao 拒绝")
+	}
+	// 显式空串会压过 SetDefault，导致 worker 监听 "" 队列——拒绝
+	if cfg.Queue == "" {
+		return nil, fmt.Errorf("queue 不能为空")
 	}
 	return &cfg, nil
 }

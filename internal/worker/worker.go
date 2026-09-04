@@ -22,7 +22,7 @@ type Deps struct {
 	Logger   *slog.Logger
 }
 
-// NewMux 注册任务处理器。scheduler 由 main 以空载接线启动（M2 接入 job 定义后动态注册）。
+// NewMux 注册任务处理器（cron 触发由 service.Loop 分钟级 tick 扫 DB，§10 定案）。
 func NewMux(d Deps) *asynq.ServeMux {
 	mux := asynq.NewServeMux()
 	mux.HandleFunc(task.TypeCallback, d.handleCallback)

@@ -17,21 +17,42 @@ func InitializeApp(cfg *config.Config) (*App, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	submitter := provideSubmitter(cfg, store, redisOpt)
-	inspector := provideInspector(redisOpt)
+	submitter, cleanup2, err := provideSubmitter(cfg, store, redisOpt)
+	if err != nil {
+		cleanup1()
+		return nil, nil, err
+	}
+	inspector, cleanup3, err := provideInspector(redisOpt)
+	if err != nil {
+		cleanup2()
+		cleanup1()
+		return nil, nil, err
+	}
 	taskService := provideTaskService(cfg, store, submitter, inspector)
 	cronLoop := provideCron(cfg, store, submitter, logger)
-	asynqServer, cleanup2, err := provideAsynqServer(cfg, redisOpt, logger)
+	asynqServer, cleanup4, err := provideAsynqServer(cfg, redisOpt, logger)
 	if err != nil {
+		cleanup3()
+		cleanup2()
 		cleanup1()
 		return nil, nil, err
 	}
 	callbackClient := provideCallback(cfg)
 	keys := provideKeys(cfg)
-	ready := provideReadyz(cfg, store)
+	ready, cleanup5, err := provideReadyz(cfg, store)
+	if err != nil {
+		cleanup4()
+		cleanup3()
+		cleanup2()
+		cleanup1()
+		return nil, nil, err
+	}
 	engine := provideEngine(taskService, keys, ready, logger)
 	app := NewApp(cfg, logger, engine, asynqServer, cronLoop, store, callbackClient)
 	return app, func() {
+		cleanup5()
+		cleanup4()
+		cleanup3()
 		cleanup2()
 		cleanup1()
 	}, nil

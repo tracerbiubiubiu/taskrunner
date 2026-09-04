@@ -239,6 +239,9 @@ type triggerReq struct {
 func (d *Deps) triggerJob(c *gin.Context) {
 	var req triggerReq
 	_ = c.ShouldBindJSON(&req) // body 可空
+	if req.RequestID == "" {
+		req.RequestID = c.GetString("request_id") // 同 submitTask：头值兜底
+	}
 	out, err := d.Tasks.TriggerJob(c.Request.Context(), c.Param("id"), service.TriggerInput{
 		RequestID: req.RequestID, Actor: req.Actor, SourceIP: req.SourceIP,
 	})

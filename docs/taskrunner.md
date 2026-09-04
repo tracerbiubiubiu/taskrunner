@@ -12,6 +12,23 @@
 
 一句话：**zhuzhao 负责"决定要做什么"，taskrunner 负责"可靠地去做"。**
 
+### 什么算一个「任务」（2026-09-04 确认）
+
+**判定标准：任务 = 要求「必须发生、失败要重试、执行要留痕」的动作单位。** 满足越多越该走 taskrunner：
+
+| 特征 | 走 taskrunner | 不走 |
+|---|---|---|
+| 调用方可立刻走人、不等结果 | ✅ 异步 | 要同步拿结果 → 普通接口调用 |
+| 失败要自动重试 | ✅ 退避 + 死信 | 失败就算了 / 调用方自处理 |
+| 要执行记录（何时/几次/成败） | ✅ job_runs | 不关心 |
+| 定时 / 延迟触发 | ✅ cron | 即时即弃 |
+| 动作耗时不稳定（网络 IO 如 SMTP） | ✅ 超时控制 | — |
+
+- **示例——消息通知（ADR-002 场景 D，后续将集成）**：发消息就是普通预置动作。zhuzhao 注册 `notify_send` handler（发送要用 zhuzhao 的模板/用户偏好/notifications 表/SMTP 配置，按「函数访问什么数据」归 zhuzhao 侧）；业务点调 `POST /v1/tasks` **即时提交**（非 cron），taskrunner 秒级回调执行；taskrunner 侧零改动；
+- **粒度**：默认一个动作单位一个任务；批量场景（一次命中 N 条）提交 1 个批量任务、handler 内循环处理，避免 N 次 HTTP 回调开销；
+- **幂等提醒**：at-least-once 下重试可能重复执行（首次实际成功但响应超时），通知类一般可容忍，严格不重靠 zhuzhao 侧唯一键去重；
+- **反面清单**：进程内轻量、丢了无所谓的动作（记缓存、打点）不过队列。
+
 ## 2. 与 zhuzhao 的关系
 
 ```
@@ -77,17 +94,17 @@
 - **语义**：at-least-once——幂等是 zhuzhao 侧义务，不是 taskrunner 承诺；
 - **结果归属**：回调的 HTTP 响应即本次执行结果，handler 执行侧当场感知成败（仅此一次同步感知）；对提交方**不推送**，任务级执行结果一律经 §5 查询接口获取，详细过程只在 taskrunner `job_runs`，不回传、不复制（§7）；
 - **终败通知（后置，按需启用）**：默认不做任何结果推送——执行结果一律由 zhuzhao 按需查询（§5）；死信的知情路径默认是 M4 死信告警（运维侧）与 `/monitor` 看板。仅当出现「无人盯守的周期任务、失败需业务方主动知情」的场景时，再启用死信回调通知（如 `POST /internal/notifications/task-dead`，带 task_id / request_id / 最后错误）；
-- **重试判定**：5xx / 超时 → 按 Asynq 退避策略重试；4xx → 不重试，直接判失败；HTTP 2xx = 受理成功，业务级失败用响应体状态字段表达（避免"200 但失败"无法归因，字段定义落地时定）；
+- **重试判定**：5xx / 超时 → 按 Asynq 退避策略重试；4xx → 不重试，直接判失败；HTTP 2xx = **执行完全成功**（✅ 拍板定案 2026-09-03：~~业务级失败用响应体状态字段表达~~ **无状态字段**——zhuzhao handler 直接用 HTTP 状态码表达业务失败：不可重试 → 4xx、可重试 → 5xx，走常规 errcode 映射；taskrunner 侧现有 2xx/4xx/5xx 判定即最终行为）；
 - **超时**：默认值落地时定（建议 30s），可按 action 覆盖；
 - **L1 边界**：回调执行产生的业务事件（如 SLA 违约）仍由 zhuzhao 侧 handler 落 L1 `ticket_events`；taskrunner 只触发回调、**不写业务事实**；
-- **安全边界**：独立部署下需明确内网可达性（如同 VPC）。~~回调鉴权（token/签名，防伪造回调）~~ ✅ **拍板定案（2026-09-03）：不做独立回调鉴权机制**——信任边界 = 内网网络隔离（与 API 暴露边界同级）+ 回调目标 `callback_url` 由 zhuzhao 提交时自行指定（taskrunner 只透传，不感知）；如需增强，zhuzhao 可在 `callback_url` 内携带密钥路径段（capability URL，taskrunner 零改动）。
+- **安全边界**：独立部署下需明确内网可达性（如同 VPC）。~~回调鉴权~~ ✅ **基线修订定案（2026-09-03，覆盖当日早前「不做独立回调鉴权」拍板）**：回调请求带 **AK/SK HMAC 签名**（C9：callback client 以 taskrunner 自身 SK 签名，覆盖 X-Request-ID / X-Operator / body；zhuzhao `/internal` 端点验签）；~~capability URL 增强~~ 随之作废；专用 network 为第二道防线。
 
 ## 5. HTTP API（内部，v1 范围定稿）
 
 taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，拆分留待需要时再议）。
 
-- 暴露边界：**仅内网 + 服务级鉴权**（✅ 已实现：静态 Bearer token，env `TASKRUNNER_API_TOKEN` 注入，常量时间比较；未设置时拒绝启动）。分工：**用户权限（zhuzhao 三层校验）全部收敛在网关**——前端所有操作先过网关授权，通过后才代理调 taskrunner API；taskrunner 只认证「调用方服务」，不认证用户、不复刻权限模型；
-- 调用方身份：按调用方发 credential（token 携带 caller id；当前仅 zhuzhao，设计预留多服务）；API 写操作（建/改定义、触发、取消、重试）在 slog 打点归因（caller + actor + IP + request_id）；`job` 表记 `created_by`（工号，§4 透传，审计归因）与 `owner_service`（来自 credential，当前恒为 zhuzhao）——跨服务归属约束待第二个调用方出现再启用，当前不实现；
+- 暴露边界：**仅内网 + AK/SK HMAC 签名**（✅ 基线修订拍板 2026-09-03：服务间通信一律签名/验签——utils `aksk` 包，按调用方发 SK；**覆盖当日早前「零认证+拓扑」与 M2 静态 Bearer 两条口径**：C2 从「拆 Bearer」改为「Bearer → AK/SK 验签」，不再依赖拓扑时序；专用 network 保留为第二道防线）。基线 SSOT = zhuzhao `docs/phase3/16-external-integration.md` §9。分工：**用户权限（zhuzhao 三层校验）全部收敛在网关**——前端所有操作先过网关授权，通过后才代理调 taskrunner API；taskrunner 不认证用户、不复刻权限模型；
+- 调用方身份：API 写操作（建/改定义、触发、取消、重试）在 slog 打点归因（caller + actor + IP + request_id——**B2 缺口，随 §10 C1 统一访问日志中间件补齐**）；`job` 表记 `created_by`（工号，§4 透传，审计归因）与 `owner_service`（当前恒为 zhuzhao）——跨服务归属约束待第二个调用方出现再启用，当前不实现；
 - 响应结构 / 错误码复用 zhuzhao-utils `errcode` + `response`，与网关风格一致。
 
 | 端点 | 用途 |
@@ -111,7 +128,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 **执行记录落库**（不存文件、不依赖 Asynq/Redis 自带记录——Redis 只保队列运转，撑不起按 request_id/action/时间段的查询）：
 
-- 存储：**独立 DB**，SQLite 起步（嵌入式、单机零运维、当前量级足够）；量级/部署升级再迁 Postgres，表结构不变。起步直接 `database/sql` + 驱动，不为 SQLite 抽公共包；
+- 存储：**独立 DB**。~~SQLite 起步~~ ✅ **拍板统一 PG（2026-09-03）**：迁独立 PG 数据库（utils `postgres` + pgx，schema 不变，随 M3/M4 C7 落地）；SQLite 保留为 M1/M2 已交付实现（`database/sql` 接口无感切换）；
 - 最小 schema：`task_id`、`request_id`、`action`、`status`（pending / running / succeeded / failed / dead）、`attempts`、`callback_url`、`error`、`duration_ms`、`submitted_by` / `source_ip`（zhuzhao 透传的原始调用人，cron 触发为空，仅审计归因）、`enqueued_at` / `started_at` / `finished_at`；
 - 存储层代码放**本仓库 `internal/store`**：job_runs 是 taskrunner 领域 schema，**不放 zhuzhao-utils**（utils 只收通用件；出现第二个同类消费者再考虑下沉）；
 - 保留策略 ⚠️ 落地时定（建议：保留期可配置 + 定时清理，思路同审计归档；`submitted_by` / `source_ip` 属个人信息，同受保留期约束）。
@@ -143,8 +160,8 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **独立仓库**（本仓库，可独立部署）；
 - **独立部署**（独立进程/容器，不与 zhuzhao 布一块——zhuzhao 只作网关调用各能力、拉起各任务）；
 - **独立 Redis**（Asynq 队列归属 taskrunner，能力自包含，同 activelist 独立库原则）。口径：指 Redis 命名空间/库独立归属 taskrunner，**不必然新增一套 Redis 部署**，与 ADR-002「复用现有 Redis、不新增基础设施」不冲突，按部署环境落地；
-- **独立 DB**（`job_runs` 归 taskrunner 自有，SQLite 起步——嵌入式单文件，无新增部署负担；同独立库原则）；
-- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + Scheduler 同进程，§5）；挂载卷：SQLite 数据目录 + 日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量。SQLite 单写者 → **单副本部署**，需水平扩容（多副本 worker）时先迁 Postgres；`/monitor` 随容器同端口暴露，仅内网可达；
+- **独立 DB**（`job_runs` 归 taskrunner 自有）。~~SQLite 起步~~ ✅ **拍板统一 PG（2026-09-03，基线 §8/zhuzhao 16 号 §9 C7）**：迁独立 PG 数据库（复用 utils `postgres`，schema 不变，约半天，随 M3/M4）；SQLite 保留为 M1/M2 已交付里程碑实现；
+- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + Scheduler 同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要）；`/monitor` 随容器同端口暴露，仅内网可达；
 - 公共工具统一引自 [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils)：`logger`（应用日志）、`postgres`（迁 PG 时）、`errcode` + `response`（API 统一响应）；`redis` 包用不上（Asynq 走自己的 `RedisClientOpt`）。依赖 utils（独立通用工具库）**不属于**「不反向依赖」的禁止范围。
 
 ## 9. 首个预置动作（M-E 验收入口）
@@ -168,11 +185,13 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 ⚠️ 随 M2/M3 落地细化（M2 已定案部分随实现入档）：
 - ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；
-- ~~credential 具体形式~~ ✅ M2 定案：**静态 Bearer token**（`TASKRUNNER_API_TOKEN`）；多调用方时代再升级签名 / mTLS；
+- ~~credential 具体形式~~ ✅ M2 定案：静态 Bearer token（`TASKRUNNER_API_TOKEN`）——**2026-09-03 被 AK/SK 基线修订覆盖：Bearer → AK/SK HMAC 验签**（utils `aksk`，C2/C8）；
+- **公共能力对齐清单（2026-09-03 基线统一，zhuzhao 16 号 §9 C1–C6）**：C1 统一访问日志中间件（X-Request-ID 读头/回显 + X-Operator 兜底 `system`，M3 随手）；C2 API 鉴权换 **AK/SK 验签**（Bearer → HMAC，前置 C8 utils `aksk` 包；不再依赖 C3 时序）；C3 compose 双 network（端口仅挂 zhuzhao 专用网络，M3 联调/M4 部署）；C4 `/readyz` 检 Redis+SQLite（M4）；C5 Dockerfile `TZ=Asia/Shanghai`（下次提交）；C6 配置迁 yaml+`${VAR}` 展开（低优可选）；
 - ~~回调鉴权机制（taskrunner → zhuzhao `/internal`）~~ ✅ 拍板定案（2026-09-03）：**不做独立机制**（见 §4 安全边界）——信任边界 = 内网隔离 + `callback_url` 由 zhuzhao 提交时指定；zhuzhao 侧可选 URL 密钥段增强（taskrunner 零感知）；
 - ~~`GET /v1/tasks/{id}` 状态数据源~~ ✅ M2 定案：**job_runs 为主 + Asynq Inspector 补充 in-flight 实时态**（pending/active/retry/scheduled 只在 Redis，以 `live_state` 字段并返回）；
 - ~~action 校验方式~~ ✅ M2 定案：**不做前置校验**——不存在 / 未注册的 action 经回调 4xx 快速失败（non-retryable，failed 可见）；zhuzhao 清单端点方案保留为可选增强；
 - 回调超时默认值：实现取 30s（env `TASKRUNNER_CALLBACK_TIMEOUT` 可改，载荷可按任务覆盖）——随 M3 验证后转正式口径；
+- **同一 job 重叠执行策略（2026-09-03 登记，随 M3/M4 落地）**：现状 cron 到点即触发新 task_id，上次未完成也再触发一份（重叠允许，仅幂等兜底）。job 定义缺 overlap 策略字段——建议增 `overlap_policy: allow | skip_if_running`（默认 allow；audit_archive 等周期批任务配 skip_if_running，对齐 zhuzhao 13 号 M-E「阻塞策略按任务拍板」）；
 - `job_runs` 保留期：仍待定（M4 随清理任务落地）。
 
 ## 11. 关联文档
@@ -205,4 +224,13 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-03 | 环境决策与配套拆分：确认无日志平台（过程日志先落文件，§6 入档 ES 演进路径——slog JSON Lines，shipper 采集零改应用，字段稳定命名自 M1 约束）；部署形态定 **Docker**（单容器单进程、卷挂载 SQLite/日志、SQLite 单写者 → 单副本约束入档）；zhuzhao 侧配套需求拆出独立文档 [zhuzhao-integration.md](./zhuzhao-integration.md)，§11 改为链接；M4 补 `asynq.Retention` 留观口径 |
 | 2026-09-03 | M1 完成（feat/m1-runtime）：核心运行时落地——Asynq worker + 回调客户端（2xx/4xx/5xx·超时判定）+ job_runs SQLite（WAL）+ healthz + enqueue CLI + Dockerfile；端到端冒烟通过（成功 / 4xx 死信 / 幂等重提）；实现中修正：store 自动建目录、先入队后落库防孤儿行 |
 | 2026-09-03 | M2 完成（feat/m2-api）：HTTP API v1 全量落地——gin + utils `errcode`/`response` 统一响应；静态 Bearer 鉴权（未设 token 拒绝启动）；提交 / 查询（runs 条件分页 + live_state）/ jobs CRUD（dept 过滤、cron 校验）/ trigger / cancel / retry / 死信列表；`cronloop` 分钟级 tick 触发 cron 定义（§10 定案入档）；job_runs 增 `job_id` 列关联任务定义；API 层选型：token 取消用 asynq Scheduler 改自研 tick（静态 payload 限制）；单测 19 个 + 真 Redis 端到端冒烟（含 cron 到点自动触发、停用即不触发）|
+| 2026-09-04 | 代码评审修复（fix/idempotency-and-cancel-race）：**提交幂等扩为终身**——原仅靠 Asynq TaskID 冲突（succeeded 后 ID 释放，同 task_id 重提会重复执行并覆盖历史），Submit 入口先查 job_runs、行存在即幂等拒绝；**cancel 竞态三道防护**——删队列前 GetTaskInfo 查 active、DeleteTask 报 active 映射 409、MarkCanceled 改条件更新（WHERE status=pending）|
+| 2026-09-04 | §1 新增「什么算一个任务」判定标准（任务 = 必须发生/失败重试/执行留痕的动作单位；含消息通知示例——ADR-002 场景 D 即普通预置动作、即时提交非 cron、taskrunner 侧零改动；粒度与幂等提醒；反面清单）|
+| 2026-09-04 | 澄清任务完成情况查询口径（zhuzhao-integration §2.3 补充）：业务查询走 `/v1/runs?status=…`（job_runs 为数据源），asynqmon 仅为 M4 运维看板（队列内部态、无业务过滤）不面向用户查询；可选增强：状态计数聚合端点，做页面时按需 |
 | 2026-09-03 | 拍板定案（所有者）：**回调鉴权不做独立机制**（§4 安全边界 + §10 ⚠️ 关闭该项）——信任边界 = 内网网络隔离（与 API 暴露边界同级）+ `callback_url` 由 zhuzhao 提交时自行指定；zhuzhao 侧可选 URL 密钥路径段增强（capability URL，taskrunner 零感知）。zhuzhao 侧 16 号 P5 撤销、P6 随 M2 定案同步（不做前置校验） |
+| 2026-09-03 | 拍板定案（所有者，P7）：**回调响应不引入状态字段**——2xx 仅代表执行完全成功；zhuzhao handler 业务失败直接映射 HTTP 状态码（不可重试 4xx / 可重试 5xx，常规 errcode）；taskrunner 现有 2xx/4xx/5xx 判定即最终行为（callback client 注释随下次提交更新）。zhuzhao 侧 16 号 P1–P7 同日全部关闭，M-E 动工前决策面清零 |
+| 2026-09-03 | 登记全链路关联小改（随 M3）：callback client 回调请求带 `X-Request-ID: <payload.request_id>` 头（有则带，cron 触发为空则不带）——zhuzhao 入站 RequestID 中间件接受入站同 rid，回调链路与 `job_runs` 贯通（zhuzhao 03-audit-l2 §3.4 全链路矩阵） |
+| 2026-09-03 | **公共能力统一基线**（所有者拍板，SSOT = zhuzhao 16 号 §9）：同级内部服务策略必须一致——鉴权统一**零认证 + 专用 network 拓扑**（覆盖 M2 静态 Bearer 定案，时序=先拓扑后拆，C2/C3）；访问日志统一中间件（X-Request-ID 读头/回显 + X-Operator 兜底，C1 关 B2）；`/readyz`（C4）、TZ（C5）、配置形态（C6 可选）；对齐清单 C1–C6 落 §10 |
+| 2026-09-03 | 登记重叠执行策略缺口（§10）：cron 触发无 overlap 控制，仅幂等兜底——建议 job 增 `overlap_policy: allow \| skip_if_running`（默认 allow），随 M3/M4 落地，对齐 zhuzhao 13 号「阻塞策略按任务拍板」 |
+| 2026-09-03 | **B3 拍板：存储统一 PG**——job_runs 迁独立 PG 数据库（C7，utils `postgres` 复用、schema 不变、约半天，随 M3/M4；§6/§8 同步）；SQLite 保留为 M1/M2 已交付实现；解除单副本约束（多副本按运维需要）；C4 readyz 改检 Redis+PG |
+| 2026-09-03 | **AK/SK 基线修订**（所有者拍板，SSOT = zhuzhao 16 号 §9）：服务间通信统一 **AK/SK HMAC 签名**（utils `aksk` 包 C8 先行；C2 = Bearer→验签、C9 = 回调签名；覆盖当日「零认证+拓扑」与「回调不做鉴权」两条早前拍板；capability URL 作废；专用 network 降为第二道防线） |

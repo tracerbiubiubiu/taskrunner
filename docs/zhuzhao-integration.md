@@ -34,7 +34,7 @@ zhuzhao 查执行结果：GET /v1/tasks/{id} / GET /v1/runs?request_id=…（拉
 | `GET /v1/tasks/{id}` / `GET /v1/runs?request_id=…` | 查当前状态 / 查执行历史 | **执行结果的唯一出口** |
 | `POST /v1/tasks/{id}/cancel` `/retry`、`GET /v1/dead-letters` | 干预与死信管理 | 运维向 |
 
-所有请求带内网 credential；**写接口**（提交 / 建改定义 / 触发 / 取消 / 重试）显式携带 `actor`（调用人工号）与 `source_ip`——taskrunner 原样存档仅作审计归因。
+所有请求带 **AK/SK HMAC 签名**（zhuzhao client 以自身 SK 签名，taskrunner 验签——2026-09-03 基线修订，覆盖当日早前「零认证/静态 Bearer 过渡」口径；utils `aksk`，基线 SSOT = zhuzhao 16 号 §9）；**写接口**（提交 / 建改定义 / 触发 / 取消 / 重试）显式携带 `actor`（调用人工号）与 `source_ip`——taskrunner 原样存档仅作审计归因（actor 入签名覆盖，不可伪造）。
 
 ## 2. 需求清单
 
@@ -55,16 +55,22 @@ var registry = map[string]JobHandler{
 **回调契约**（taskrunner.md §4 摘要，zhuzhao handler 必须遵守）：
 
 - 幂等：重试会重复回调，按 `task_id + request_id` 先查重再执行（「导出 + 删除」类副作用动作尤其必要）；
-- 语义：5xx / 超时 → taskrunner 自动重试；4xx → 不重试直接判失败；2xx = 受理成功，业务级失败用响应体状态字段表达（字段定义随 M3 定）；
+- 语义：5xx / 超时 → taskrunner 自动重试；4xx → 不重试直接判失败；2xx = **执行完全成功**（✅ 拍板 2026-09-03：无响应体状态字段——zhuzhao handler 业务失败直接映射状态码：不可重试 4xx / 可重试 5xx，走常规 errcode）；
+- 全链路关联（2026-09-03 登记，taskrunner 侧小改随 M3）：回调请求带 **`X-Request-ID: <payload.request_id>` 头**（有则带，cron 触发为空则不带）——zhuzhao 入站 RequestID 中间件「接受入站」逻辑直接复用同一 rid，回调链路与 `job_runs` 不再断链；**回调请求带 AK/SK 签名**（C9，覆盖 X-Request-ID / X-Operator / body；zhuzhao `/internal` 验签——同日基线修订）；
 - L1 边界：回调执行产生的业务事件由 handler 照常落 L1 `ticket_events`；taskrunner 不写业务事实。
 
 ### 2.2 动作清单端点【待选型，M2 前定】
 
 `GET /internal/jobs` 列出已注册 action，供 taskrunner 创建任务定义时校验 `action_id` 存在性。与「提交时探活」二选一。
 
-### 2.3 任务管理功能【必做，对齐 M2】
+### 2.3 任务管理功能【必做，对齐 M2/M3】
 
 提交任务、建/改任务定义、手动执行、查执行记录的**接口与前端页面**（代理 taskrunner API）。全部过三层校验后才能调 taskrunner；`request_id` 在此生成并透传（跨查关联键）。
+
+任务完成情况查询的口径（2026-09-04 补充）：
+
+- 前端「排队中 / 执行中 / 已完成 / 失败 / 死信」视图 = 代理 `GET /v1/runs?status=…`（各状态过滤，含 request_id/action/时间组合），单任务详情 = `GET /v1/tasks/{id}`——**数据源是 job_runs（业务语义、终身历史），不是 asynqmon**（那是 M4 运维看板，看队列内部态，无业务过滤、无历史，不能面向用户查询）；
+- 若前端需要各状态计数总览卡片：现有端点需按 status 各查一次；可选增强 = taskrunner 加轻量聚合端点（如 `GET /v1/runs/stats` 返回各状态计数），做页面时按需启用，暂不预先实现。
 
 ### 2.4 部门可见性策略【必做，对齐 M2/M3】
 

@@ -86,7 +86,8 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		// 业务级失败经响应体状态字段表达：字段约定随 M3 定（zhuzhao-integration.md §2.1），当前 2xx 即成功
+		// 2xx = 执行完全成功（拍板 2026-09-03：无响应体状态字段——zhuzhao handler 业务失败
+		// 直接映射 4xx/5xx，本判定即最终行为）；body 不再解析，排障走 zhuzhao 侧日志。
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:

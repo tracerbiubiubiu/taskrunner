@@ -1,5 +1,5 @@
 // Package task 定义 Asynq 任务载荷。载荷即跨进程契约，字段命名保持稳定
-//（同时是应用日志 / 未来 ES 采集的索引字段，见设计文档 §6）。
+// （同时是应用日志 / 未来 ES 采集的索引字段，见设计文档 §6）。
 package task
 
 import "encoding/json"
@@ -11,7 +11,7 @@ const TypeCallback = "taskrunner:callback"
 type Payload struct {
 	TaskID      string          `json:"task_id"` // 调用方生成，全局唯一，幂等键
 	RequestID   string          `json:"request_id"`
-	Action      string          `json:"action"` // 预置动作 id（zhuzhao 注册表键）
+	Action      string          `json:"action"`           // 预置动作 id（zhuzhao 注册表键）
 	JobID       string          `json:"job_id,omitempty"` // 经由哪个任务定义触发
 	CallbackURL string          `json:"callback_url"`
 	Params      json.RawMessage `json:"params,omitempty"`

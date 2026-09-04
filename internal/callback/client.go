@@ -12,23 +12,32 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
+
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
 // ErrNonRetryable 4xx 类失败：worker 应跳过重试直接判失败。
 var ErrNonRetryable = errors.New("callback: non-retryable failure")
 
-// Client 回调执行器。DefaultTimeout 为默认超时，载荷 TimeoutSecs 可按任务覆盖。
-type Client struct {
-	DefaultTimeout time.Duration
-	HTTP           *http.Client
+// Config 回调客户端参数。
+type Config struct {
+	Timeout time.Duration // 默认回调超时（载荷 TimeoutSecs 可按任务覆盖）
+	AK      string        // 本服务签名身份（zhuzhao /internal 验签用；空 = 不签名）
+	SK      []byte
 }
 
-func New(defaultTimeout time.Duration) *Client {
-	return &Client{
-		DefaultTimeout: defaultTimeout,
-		HTTP:           &http.Client{}, // 超时走 per-request context，便于按任务覆盖
+// Client 回调执行器（C9：以 taskrunner 自身 SK 做 AK/SK 签名 + X-Request-ID 头透传）。
+type Client struct {
+	cfg  Config
+	http *http.Client
+}
+
+func New(cfg Config) *Client {
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 30 * time.Second
 	}
+	return &Client{cfg: cfg, http: &http.Client{}} // 超时走 per-request context
 }
 
 // body 回调请求体（契约见 zhuzhao-integration.md §2.1）。
@@ -37,7 +46,7 @@ type body struct {
 	RequestID string    `json:"request_id"`
 	Action    string    `json:"action"`
 	Params    paramJSON `json:"params,omitempty"`
-	Actor     string    `json:"actor,omitempty"`  // 原始提交人工号，回传供 zhuzhao 审计串联
+	Actor     string    `json:"actor,omitempty"` // 原始提交人工号，回传供 zhuzhao 审计串联
 	SourceIP  string    `json:"source_ip,omitempty"`
 }
 
@@ -53,7 +62,7 @@ func (p paramJSON) MarshalJSON() ([]byte, error) {
 
 // Do 执行一次回调。nil = 成功；ErrNonRetryable = 4xx；其他 error = 可重试。
 func (c *Client) Do(ctx context.Context, p task.Payload) error {
-	timeout := c.DefaultTimeout
+	timeout := c.cfg.Timeout
 	if p.TimeoutSecs > 0 {
 		timeout = time.Duration(p.TimeoutSecs) * time.Second
 	}
@@ -77,8 +86,15 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 		return fmt.Errorf("callback: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// C9（基线 §9）：回调请求以自身 SK 签名（覆盖 body/X-Request-ID/X-Operator），
+	// zhuzhao /internal 端点验签——「回调鉴权不做」的原拍板被 AK/SK 基线修订覆盖。
+	// X-Request-ID 透传：zhuzhao 入站中间件复用同一 rid，回调链路与 job_runs 不再断链。
+	if c.cfg.AK != "" && len(c.cfg.SK) > 0 {
+		aksk.Sign(req, b, aksk.SignOptions{AK: c.cfg.AK, SK: c.cfg.SK,
+			RequestID: p.RequestID, Operator: p.SubmittedBy})
+	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("callback: do: %w", err) // 含 context 超时，可重试
 	}

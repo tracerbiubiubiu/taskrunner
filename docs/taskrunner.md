@@ -187,7 +187,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；
 - ~~credential 具体形式~~ ✅ M2 定案：静态 Bearer token（`TASKRUNNER_API_TOKEN`）——**2026-09-03 被 AK/SK 基线修订覆盖：Bearer → AK/SK HMAC 验签**（utils `aksk`，C2/C8）；
 - **公共能力对齐清单（2026-09-03 基线统一，zhuzhao 16 号 §9 C1–C6）**：C1 统一访问日志中间件（X-Request-ID 读头/回显 + X-Operator 兜底 `system`，M3 随手）；C2 API 鉴权换 **AK/SK 验签**（Bearer → HMAC，前置 C8 utils `aksk` 包；不再依赖 C3 时序）；C3 compose 双 network（端口仅挂 zhuzhao 专用网络，M3 联调/M4 部署）；C4 `/readyz` 检 Redis+SQLite（M4）；C5 Dockerfile `TZ=Asia/Shanghai`（下次提交）；C6 配置迁 yaml+`${VAR}` 展开（低优可选）；
-- ~~回调鉴权机制（taskrunner → zhuzhao `/internal`）~~ ✅ 拍板定案（2026-09-03）：**不做独立机制**（见 §4 安全边界）——信任边界 = 内网隔离 + `callback_url` 由 zhuzhao 提交时指定；zhuzhao 侧可选 URL 密钥段增强（taskrunner 零感知）；
+- ~~回调鉴权机制（taskrunner → zhuzhao `/internal`）~~ ✅ 拍板定案（2026-09-03）：不做独立机制——信任边界 = 内网隔离 + `callback_url` 由 zhuzhao 提交时指定；**2026-09-03 被 AK/SK 基线修订覆盖**：回调请求带 HMAC 签名（§4 安全边界，C9，zhuzhao `/internal` 验签），capability URL 增强作废，专用 network 降为第二道防线；
 - ~~`GET /v1/tasks/{id}` 状态数据源~~ ✅ M2 定案：**job_runs 为主 + Asynq Inspector 补充 in-flight 实时态**（pending/active/retry/scheduled 只在 Redis，以 `live_state` 字段并返回）；
 - ~~action 校验方式~~ ✅ M2 定案：**不做前置校验**——不存在 / 未注册的 action 经回调 4xx 快速失败（non-retryable，failed 可见）；zhuzhao 清单端点方案保留为可选增强；
 - 回调超时默认值：实现取 30s（env `TASKRUNNER_CALLBACK_TIMEOUT` 可改，载荷可按任务覆盖）——随 M3 验证后转正式口径；
@@ -234,3 +234,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-03 | 登记重叠执行策略缺口（§10）：cron 触发无 overlap 控制，仅幂等兜底——建议 job 增 `overlap_policy: allow \| skip_if_running`（默认 allow），随 M3/M4 落地，对齐 zhuzhao 13 号「阻塞策略按任务拍板」 |
 | 2026-09-03 | **B3 拍板：存储统一 PG**——job_runs 迁独立 PG 数据库（C7，utils `postgres` 复用、schema 不变、约半天，随 M3/M4；§6/§8 同步）；SQLite 保留为 M1/M2 已交付实现；解除单副本约束（多副本按运维需要）；C4 readyz 改检 Redis+PG |
 | 2026-09-03 | **AK/SK 基线修订**（所有者拍板，SSOT = zhuzhao 16 号 §9）：服务间通信统一 **AK/SK HMAC 签名**（utils `aksk` 包 C8 先行；C2 = Bearer→验签、C9 = 回调签名；覆盖当日「零认证+拓扑」与「回调不做鉴权」两条早前拍板；capability URL 作废；专用 network 降为第二道防线） |
+| 2026-09-04 | **微服务结构重构**（所有者拍板：以正式微服务标准建设，内部与 zhuzhao 同规格——zhuzhao 16 号 §9「工程结构」基线）：目录重排 `cmd`（薄入口）/ `internal/app`（**Wire DI** + 生命周期）/ `handler`（薄 HTTP 层）/ `service`（TaskService 业务下沉 + submit/cron）/ `repository`（原 store）/ `middleware`（C1 访问日志 + C2 AK/SK 验签）/ `worker` / `callback`；config 改 **yaml + env**（C6，viper，全 env 兼容；密钥环空拒绝启动 fail-closed）；**C1/C2/C4/C5/C9 同批收口**（统一访问日志中间件含 rid 回显与 operator 兜底；API 验签 Bearer→AK/SK；/readyz 检 Redis+SQLite；Dockerfile TZ；回调以自身 SK 签名+rid 透传）；Makefile 门禁（lint=vet+gofmt / test / build）；handler 测试 ×7 重写为 aksk 口径 + C9 签名测试；C3（网络拓扑）/C7（迁 PG）仍待部署批次 |

@@ -3,10 +3,13 @@ package callback
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
 
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
@@ -28,7 +31,7 @@ func TestSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(time.Second)
+	c := New(Config{Timeout: time.Second})
 	if err := c.Do(context.Background(), payload(srv.URL)); err != nil {
 		t.Fatalf("want success, got %v", err)
 	}
@@ -47,7 +50,7 @@ func Test4xxNonRetryable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := New(time.Second).Do(context.Background(), payload(srv.URL))
+	err := New(Config{Timeout: time.Second}).Do(context.Background(), payload(srv.URL))
 	if !errors.Is(err, ErrNonRetryable) {
 		t.Fatalf("want ErrNonRetryable, got %v", err)
 	}
@@ -59,7 +62,7 @@ func Test5xxRetryable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := New(time.Second).Do(context.Background(), payload(srv.URL))
+	err := New(Config{Timeout: time.Second}).Do(context.Background(), payload(srv.URL))
 	if err == nil || errors.Is(err, ErrNonRetryable) {
 		t.Fatalf("want retryable error, got %v", err)
 	}
@@ -72,7 +75,7 @@ func TestTimeoutRetryable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := New(50 * time.Millisecond).Do(context.Background(), payload(srv.URL))
+	err := New(Config{Timeout: 50 * time.Millisecond}).Do(context.Background(), payload(srv.URL))
 	if err == nil || errors.Is(err, ErrNonRetryable) {
 		t.Fatalf("want timeout (retryable) error, got %v", err)
 	}
@@ -87,7 +90,43 @@ func TestPerTaskTimeoutOverride(t *testing.T) {
 
 	p := payload(srv.URL)
 	p.TimeoutSecs = 1 // 默认 50ms 太短，按任务覆盖为 1s 后应成功
-	if err := New(50 * time.Millisecond).Do(context.Background(), p); err != nil {
+	if err := New(Config{Timeout: 50 * time.Millisecond}).Do(context.Background(), p); err != nil {
 		t.Fatalf("override timeout should succeed, got %v", err)
+	}
+}
+
+// TestC9SignedCallback C9：回调请求以自身 SK 做 AK/SK 签名（覆盖 body/X-Request-ID/
+// X-Operator）——zhuzhao /internal 端点验签不通过即 401，签名正确才放行。
+func TestC9SignedCallback(t *testing.T) {
+	verifier := &aksk.Verifier{Keys: map[string][]byte{"taskrunner": []byte("sk-self")}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := verifier.Verify(r, body); err != nil {
+			w.WriteHeader(401)
+			w.Write([]byte(err.Error()))
+			return
+		}
+		if r.Header.Get("X-Request-ID") != "req-cb-9" {
+			w.WriteHeader(400)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	c := New(Config{Timeout: time.Second, AK: "taskrunner", SK: []byte("sk-self")})
+	if err := c.Do(context.Background(), task.Payload{
+		TaskID: "t9", RequestID: "req-cb-9", Action: "a", CallbackURL: srv.URL,
+		SubmittedBy: "10086",
+	}); err != nil {
+		t.Fatalf("signed callback must pass verifier: %v", err)
+	}
+
+	// 错误 SK：验签拒绝 → 401 → 可重试错误
+	bad := New(Config{Timeout: time.Second, AK: "taskrunner", SK: []byte("sk-wrong")})
+	if err := bad.Do(context.Background(), task.Payload{
+		TaskID: "t9b", Action: "a", CallbackURL: srv.URL,
+	}); err == nil {
+		t.Fatal("bad sk must be rejected (401 → retryable error)")
 	}
 }

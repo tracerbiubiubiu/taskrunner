@@ -1,0 +1,28 @@
+# taskrunner 配置（C6：yaml + env 展开，对齐 zhuzhao 模式；全 env 兼容见 internal/config）
+server:
+  addr: ":8080"           # env TASKRUNNER_HTTP_ADDR
+
+redis:
+  addr: "127.0.0.1:6379"  # env TASKRUNNER_REDIS_ADDR（Asynq 队列，独立命名空间归属本服务）
+  password: ""            # env TASKRUNNER_REDIS_PASSWORD
+  db: 0                   # env TASKRUNNER_REDIS_DB
+
+db:
+  path: "data/taskrunner.db"  # env TASKRUNNER_DB_PATH（B3：SQLite 既有实现，迁移 PG 待 C7）
+
+queue: "jobs"             # env TASKRUNNER_QUEUE
+concurrency: 10           # env TASKRUNNER_CONCURRENCY
+max_retry: 5              # env TASKRUNNER_MAX_RETRY
+callback_timeout: 30s     # env TASKRUNNER_CALLBACK_TIMEOUT
+cron_tick: 30s            # env TASKRUNNER_CRON_TICK
+
+log:
+  level: info             # env TASKRUNNER_LOG_LEVEL
+  dir: logs               # env TASKRUNNER_LOG_DIR
+
+security:
+  # 验签密钥环（C2）：预期调用方 AK→SK；当前唯一调用方 zhuzhao
+  callers:
+    zhuzhao: ""           # env TASKRUNNER_CALLER_ZHUZHAO_SK（必填——空密钥环拒绝启动）
+  self_ak: taskrunner     # env TASKRUNNER_SELF_AK（回调签名身份，须与 zhuzhao internal_jobs.taskrunner_ak 一致）
+  self_sk: ""             # env TASKRUNNER_SELF_SK（回调签名密钥，C9）

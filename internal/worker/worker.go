@@ -12,12 +12,12 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/tracerbiubiubiu/taskrunner/internal/callback"
-	"github.com/tracerbiubiubiu/taskrunner/internal/store"
+	"github.com/tracerbiubiubiu/taskrunner/internal/repository"
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
 type Deps struct {
-	Store    *store.Store
+	Store    *repository.Store
 	Callback *callback.Client
 	Logger   *slog.Logger
 }
@@ -66,14 +66,14 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 	err := d.Callback.Do(ctx, p)
 	switch {
 	case err == nil:
-		if ferr := d.Store.Finish(ctx, p.TaskID, store.StatusSucceeded, "", attempt, now, time.Now()); ferr != nil {
+		if ferr := d.Store.Finish(ctx, p.TaskID, repository.StatusSucceeded, "", attempt, now, time.Now()); ferr != nil {
 			logger.Error("persist succeeded failed", slog.Any("err", ferr))
 		}
 		logger.Info("task succeeded", slog.Int("attempt", attempt))
 		return nil
 
 	case errors.Is(err, callback.ErrNonRetryable):
-		if ferr := d.Store.Finish(ctx, p.TaskID, store.StatusFailed, err.Error(), attempt, now, time.Now()); ferr != nil {
+		if ferr := d.Store.Finish(ctx, p.TaskID, repository.StatusFailed, err.Error(), attempt, now, time.Now()); ferr != nil {
 			logger.Error("persist failed(4xx) failed", slog.Any("err", ferr))
 		}
 		logger.Warn("task failed (non-retryable), giving up", slog.Int("attempt", attempt), slog.Any("err", err))
@@ -81,9 +81,9 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 
 	default:
 		final := maxRetry > 0 && attempt >= maxRetry
-		status := store.StatusFailed
+		status := repository.StatusFailed
 		if final {
-			status = store.StatusDead
+			status = repository.StatusDead
 		}
 		if ferr := d.Store.Finish(ctx, p.TaskID, status, err.Error(), attempt, now, time.Now()); ferr != nil {
 			logger.Error("persist failure state failed", slog.Any("err", ferr))

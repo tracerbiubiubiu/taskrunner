@@ -1,0 +1,295 @@
+// Package handler HTTP 层（微服务结构重构 2026-09-04：只做绑定/映射，
+// 业务在 service.TaskService）。路由挂载于 app 装配：全局 RequestID + AccessLog（C1），
+// /v1 组 AK/SK 验签（C2）；/healthz /readyz 裸露（探针）。
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/tracerbiubiubiu/zhuzhao-utils/errcode"
+	"github.com/tracerbiubiubiu/zhuzhao-utils/response"
+
+	"github.com/tracerbiubiubiu/taskrunner/internal/middleware"
+	"github.com/tracerbiubiubiu/taskrunner/internal/repository"
+	"github.com/tracerbiubiubiu/taskrunner/internal/service"
+)
+
+type Deps struct {
+	Tasks  *service.TaskService
+	Ready  func() error // readyz 探针（检 Redis/DB 依赖；nil = 恒就绪）
+	Keys   map[string][]byte
+	Logger *slog.Logger
+}
+
+func New(d Deps) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery(), middleware.RequestID(), middleware.AccessLog(d.Logger))
+
+	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
+	r.GET("/readyz", func(c *gin.Context) {
+		if d.Ready != nil {
+			if err := d.Ready(); err != nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unready", "err": err.Error()})
+				return
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ready"})
+	})
+
+	v1 := r.Group("/v1", middleware.AKSKAuth(d.Keys))
+	{
+		v1.POST("/tasks", d.submitTask)
+		v1.GET("/tasks/:id", d.getTask)
+		v1.POST("/tasks/:id/cancel", d.cancelTask)
+		v1.POST("/tasks/:id/retry", d.retryTask)
+		v1.GET("/runs", d.listRuns)
+		v1.GET("/dead-letters", d.listDeadLetters)
+		v1.GET("/jobs", d.listJobs)
+		v1.POST("/jobs", d.createJob)
+		v1.PATCH("/jobs/:id", d.patchJob)
+		v1.POST("/jobs/:id/trigger", d.triggerJob)
+	}
+	return r
+}
+
+// ---- 提交 ----
+
+type submitReq struct {
+	TaskID      string          `json:"task_id"`
+	RequestID   string          `json:"request_id"`
+	Action      string          `json:"action" binding:"required"`
+	CallbackURL string          `json:"callback_url" binding:"required"`
+	Params      json.RawMessage `json:"params"`
+	SubmittedBy string          `json:"submitted_by"` // 工号（审计归因）
+	SourceIP    string          `json:"source_ip"`
+	TimeoutSecs int             `json:"timeout_secs"`
+}
+
+func (d *Deps) submitTask(c *gin.Context) {
+	var req submitReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "action 与 callback_url 必填")
+		return
+	}
+	out, err := d.Tasks.Submit(c.Request.Context(), service.SubmitInput{
+		TaskID: req.TaskID, RequestID: req.RequestID, Action: req.Action,
+		CallbackURL: req.CallbackURL, Params: req.Params,
+		SubmittedBy: req.SubmittedBy, SourceIP: req.SourceIP, TimeoutSecs: req.TimeoutSecs,
+	})
+	if err != nil {
+		d.fail(c, err, "提交失败")
+		return
+	}
+	d.logOp(c, "submit", out.TaskID)
+	response.OK(c, out)
+}
+
+// ---- 查询 ----
+
+func (d *Deps) getTask(c *gin.Context) {
+	v, err := d.Tasks.GetTask(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		d.fail(c, err, "查询失败")
+		return
+	}
+	response.OK(c, v)
+}
+
+func (d *Deps) listRuns(c *gin.Context) {
+	q := service.RunQuery{
+		RequestID: c.Query("request_id"), Action: c.Query("action"),
+		Status: c.Query("status"), JobID: c.Query("job_id"),
+		Page: atoi(c.Query("page"), 1), PageSize: atoi(c.Query("page_size"), 20),
+	}
+	for k, dest := range map[string]**time.Time{"from": &q.From, "to": &q.To} {
+		if v := c.Query(k); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				response.BadRequest(c, k+" 需为 RFC3339 时间")
+				return
+			}
+			*dest = &t
+		}
+	}
+	runs, total, err := d.Tasks.ListRuns(c.Request.Context(), q)
+	if err != nil {
+		d.fail(c, err, "查询失败")
+		return
+	}
+	response.OKPage(c, runs, total, q.Page, q.PageSize)
+}
+
+func (d *Deps) listDeadLetters(c *gin.Context) {
+	list, err := d.Tasks.ListDeadLetters(c.Request.Context(), atoi(c.Query("page_size"), 50))
+	if err != nil {
+		d.fail(c, err, "查询失败")
+		return
+	}
+	response.OK(c, list)
+}
+
+// ---- 干预 ----
+
+func (d *Deps) cancelTask(c *gin.Context) {
+	if err := d.Tasks.CancelTask(c.Request.Context(), c.Param("id")); err != nil {
+		d.fail(c, err, "取消失败")
+		return
+	}
+	d.logOp(c, "cancel", c.Param("id"))
+	response.OKWithMessage(c, "已取消", gin.H{"task_id": c.Param("id"), "status": "canceled"})
+}
+
+func (d *Deps) retryTask(c *gin.Context) {
+	if err := d.Tasks.RetryTask(c.Request.Context(), c.Param("id")); err != nil {
+		d.fail(c, err, "重试失败")
+		return
+	}
+	d.logOp(c, "retry", c.Param("id"))
+	response.OKWithMessage(c, "已重新入队", gin.H{"task_id": c.Param("id"), "status": "pending"})
+}
+
+// ---- 任务定义 ----
+
+type createJobReq struct {
+	ActionID     string          `json:"action_id" binding:"required"`
+	CallbackURL  string          `json:"callback_url" binding:"required"`
+	TriggerType  string          `json:"trigger_type" binding:"required"`
+	CronSpec     string          `json:"cron_spec"`
+	Params       json.RawMessage `json:"params"`
+	Dept         string          `json:"dept"`
+	Enabled      *bool           `json:"enabled"`
+	TimeoutSecs  int             `json:"timeout_secs"`
+	Description  string          `json:"description"`
+	CreatedBy    string          `json:"created_by"`
+	OwnerService string          `json:"owner_service"`
+}
+
+func (d *Deps) createJob(c *gin.Context) {
+	var req createJobReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "action_id / callback_url / trigger_type 必填")
+		return
+	}
+	v, err := d.Tasks.CreateJob(c.Request.Context(), service.JobInput{
+		ActionID: req.ActionID, CallbackURL: req.CallbackURL, TriggerType: req.TriggerType,
+		CronSpec: req.CronSpec, Params: req.Params, Dept: req.Dept, Enabled: req.Enabled,
+		TimeoutSecs: req.TimeoutSecs, Description: req.Description,
+		CreatedBy: req.CreatedBy, OwnerService: req.OwnerService,
+	})
+	if err != nil {
+		d.fail(c, err, "创建失败")
+		return
+	}
+	d.logOp(c, "create_job", v.JobID)
+	response.OK(c, v)
+}
+
+func (d *Deps) listJobs(c *gin.Context) {
+	f := jobFilterOf(c)
+	jobs, err := d.Tasks.ListJobs(c.Request.Context(), f)
+	if err != nil {
+		d.fail(c, err, "查询失败")
+		return
+	}
+	response.OK(c, jobs)
+}
+
+type patchJobReq struct {
+	CallbackURL *string         `json:"callback_url"`
+	CronSpec    *string         `json:"cron_spec"`
+	Params      json.RawMessage `json:"params"`
+	Dept        *string         `json:"dept"`
+	Enabled     *bool           `json:"enabled"`
+	TimeoutSecs *int            `json:"timeout_secs"`
+	Description *string         `json:"description"`
+}
+
+func (d *Deps) patchJob(c *gin.Context) {
+	var req patchJobReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	v, err := d.Tasks.UpdateJob(c.Request.Context(), c.Param("id"), service.JobPatch{
+		CallbackURL: req.CallbackURL, CronSpec: req.CronSpec, Params: req.Params,
+		Dept: req.Dept, Enabled: req.Enabled, TimeoutSecs: req.TimeoutSecs, Description: req.Description,
+	})
+	if err != nil {
+		d.fail(c, err, "更新失败")
+		return
+	}
+	d.logOp(c, "patch_job", v.JobID)
+	response.OK(c, v)
+}
+
+type triggerReq struct {
+	RequestID string `json:"request_id"`
+	Actor     string `json:"actor"`
+	SourceIP  string `json:"source_ip"`
+}
+
+func (d *Deps) triggerJob(c *gin.Context) {
+	var req triggerReq
+	_ = c.ShouldBindJSON(&req) // body 可空
+	out, err := d.Tasks.TriggerJob(c.Request.Context(), c.Param("id"), service.TriggerInput{
+		RequestID: req.RequestID, Actor: req.Actor, SourceIP: req.SourceIP,
+	})
+	if err != nil {
+		d.fail(c, err, "触发失败")
+		return
+	}
+	d.logOp(c, "trigger_job", c.Param("id"))
+	response.OK(c, out)
+}
+
+// ---- 工具 ----
+
+// fail service 错误 → HTTP 映射：NotFound→404 / Invalid→400 / Conflict→409 / 其他→500。
+func (d *Deps) fail(c *gin.Context, err error, internalMsg string) {
+	var inv *service.InvalidError
+	var con *service.ConflictError
+	switch {
+	case errors.Is(err, service.ErrTaskNotFound), errors.Is(err, service.ErrJobNotFound):
+		response.NotFound(c, "对象不存在")
+	case errors.As(err, &inv):
+		response.BadRequest(c, inv.Msg)
+	case errors.As(err, &con):
+		response.Fail(c, http.StatusConflict, errcode.ErrConflict.Code, con.Msg)
+	default:
+		d.Logger.Error("handler: service error", "err", err, "op", c.Request.Method+" "+c.Request.URL.Path)
+		response.InternalError(c, internalMsg)
+	}
+}
+
+// logOp 写操作归因打点（C1 访问日志之外的定向补充：op + 对象 + caller + request_id）。
+func (d *Deps) logOp(c *gin.Context, op, object string) {
+	d.Logger.Info("api op", "op", op, "object", object,
+		"caller", c.GetString("caller"), "request_id", c.GetString("request_id"))
+}
+
+func jobFilterOf(c *gin.Context) repository.JobFilter {
+	f := repository.JobFilter{Dept: c.Query("dept"), Action: c.Query("action_id")}
+	if v := c.Query("enabled"); v != "" {
+		b := v == "true" || v == "1"
+		f.Enabled = &b
+	}
+	return f
+}
+
+func atoi(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return def
+}

@@ -9,6 +9,9 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/taskrunner ./cmd/taskrunner
 
 FROM alpine:3.21
 COPY --from=build /out/taskrunner /usr/local/bin/taskrunner
+# C5：固定时区（cron 语义一致性，基线 §9）
+RUN apk add --no-cache tzdata
+ENV TZ=Asia/Shanghai
 VOLUME ["/data", "/logs"]
 ENV TASKRUNNER_DB_PATH=/data/taskrunner.db \
     TASKRUNNER_LOG_DIR=/logs \

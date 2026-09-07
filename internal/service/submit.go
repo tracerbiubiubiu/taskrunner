@@ -54,9 +54,13 @@ func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, wa
 		}
 		return false, nil, err
 	}
+	params := string(p.Params)
+	if params == "" {
+		params = "{}" // 与 schema 默认一致（jobs 路径存定义 params 的 JSON 文本）
+	}
 	if err := s.Store.InsertPending(ctx, repository.Run{
 		TaskID: p.TaskID, RequestID: p.RequestID, Action: p.Action, JobID: p.JobID,
-		Dept: p.Dept, CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
+		Dept: p.Dept, Params: params, CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
 		EnqueuedAt: time.Now(),
 	}); err != nil {
 		return true, err, nil // 已入队：只提示记录缺失

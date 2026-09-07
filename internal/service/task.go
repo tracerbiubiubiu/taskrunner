@@ -108,6 +108,7 @@ type TaskView struct {
 	Action      string     `json:"action"`
 	JobID       string     `json:"job_id"`
 	Dept        string     `json:"dept"`
+	Params      string     `json:"params"`
 	Status      string     `json:"status"`
 	Attempts    int        `json:"attempts"`
 	Error       string     `json:"error"`
@@ -127,6 +128,7 @@ type RunView struct {
 	Action      string     `json:"action"`
 	JobID       string     `json:"job_id"`
 	Dept        string     `json:"dept"`
+	Params      string     `json:"params"`
 	Status      string     `json:"status"`
 	Attempts    int        `json:"attempts"`
 	Error       string     `json:"error"`
@@ -140,7 +142,7 @@ type RunView struct {
 func runView(r *repository.Run) RunView {
 	return RunView{
 		TaskID: r.TaskID, RequestID: r.RequestID, Action: r.Action, JobID: r.JobID, Dept: r.Dept,
-		Status: r.Status, Attempts: r.Attempts, Error: r.Error, DurationMS: r.DurationMS,
+		Params: r.Params, Status: r.Status, Attempts: r.Attempts, Error: r.Error, DurationMS: r.DurationMS,
 		SubmittedBy: r.SubmittedBy, EnqueuedAt: r.EnqueuedAt,
 		StartedAt: nullTime(r.StartedAt), FinishedAt: nullTime(r.FinishedAt),
 	}
@@ -163,7 +165,7 @@ func (s *TaskService) GetTask(ctx context.Context, taskID string) (*TaskView, er
 	}
 	v := &TaskView{
 		TaskID: run.TaskID, RequestID: run.RequestID, Action: run.Action, JobID: run.JobID, Dept: run.Dept,
-		Status: run.Status, Attempts: run.Attempts, Error: run.Error, DurationMS: run.DurationMS,
+		Params: run.Params, Status: run.Status, Attempts: run.Attempts, Error: run.Error, DurationMS: run.DurationMS,
 		SubmittedBy: run.SubmittedBy, SourceIP: run.SourceIP,
 		EnqueuedAt: run.EnqueuedAt, StartedAt: nullTime(run.StartedAt), FinishedAt: nullTime(run.FinishedAt),
 	}

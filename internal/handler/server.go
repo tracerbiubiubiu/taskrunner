@@ -85,6 +85,11 @@ func (d *Deps) submitTask(c *gin.Context) {
 	if req.RequestID == "" {
 		req.RequestID = c.GetString("request_id")
 	}
+	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
+	if len(req.Params) > 64<<10 {
+		response.BadRequest(c, "params 超过上限（64KB）")
+		return
+	}
 	out, err := d.Tasks.Submit(c.Request.Context(), service.SubmitInput{
 		Dept:   req.Dept,
 		TaskID: req.TaskID, RequestID: req.RequestID, Action: req.Action,

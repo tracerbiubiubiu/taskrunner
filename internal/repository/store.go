@@ -38,6 +38,7 @@ type Run struct {
 	Action      string
 	JobID       string // 经由哪个任务定义触发（一次性提交为空）
 	Dept        string // 归属标签快照（C11：插入时从 Payload 定格；删 job/改 dept 不影响历史归属）
+	Params      string // 执行入参快照（C11：JSON 原文；重试重放组装回调需要完整值）
 	CallbackURL string
 	Status      string
 	Attempts    int
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	action        TEXT NOT NULL,
 	job_id        TEXT NOT NULL DEFAULT '',
 	dept          TEXT NOT NULL DEFAULT '',
+	params        TEXT NOT NULL DEFAULT '{}',
 	callback_url  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT 'pending',
 	attempts      INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +73,10 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	started_at    TIMESTAMP,
 	finished_at   TIMESTAMP
 );
+`
+
+// indexes 建表/补列之后执行——引用新列（job_id）的索引依赖列迁移先行。
+const indexes = `
 CREATE INDEX IF NOT EXISTS idx_job_runs_request_id ON job_runs(request_id);
 CREATE INDEX IF NOT EXISTS idx_job_runs_action_status ON job_runs(action, status);
 CREATE INDEX IF NOT EXISTS idx_job_runs_job_id ON job_runs(job_id);
@@ -99,7 +105,49 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("store: migrate extra: %w", err)
 		}
 	}
+	// 轻量列迁移（SQLite 无 ADD COLUMN IF NOT EXISTS）：CREATE TABLE IF NOT EXISTS 对
+	// 已存在的旧库空转——新列（job_id/dept/params）必须在此补齐，否则旧库升级后
+	// INSERT/SELECT 报 no column named ... 全量失败。新增列在此登记。
+	if err := migrateColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate columns: %w", err)
+	}
+	// 索引最后建：引用新列的索引（如 idx_job_runs_job_id）在旧库补列前会失败
+	if _, err := db.Exec(indexes); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate indexes: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrateColumns 按列判存补齐旧库缺失列（幂等：新库全部命中跳过）。
+// 依赖 SQLite ALTER TABLE ADD COLUMN 不带默认值时对 NOT NULL 约束的限制，
+// 故新列均先加可空再回填默认值——本表默认均为 ”/'{}' 文本，直接带 DEFAULT 即可。
+func migrateColumns(db *sql.DB) error {
+	type colDef struct {
+		table string
+		col   string
+		ddl   string
+	}
+	for _, c := range []colDef{
+		{"job_runs", "job_id", "ALTER TABLE job_runs ADD COLUMN job_id TEXT NOT NULL DEFAULT ''"},
+		{"job_runs", "dept", "ALTER TABLE job_runs ADD COLUMN dept TEXT NOT NULL DEFAULT ''"},
+		{"job_runs", "params", "ALTER TABLE job_runs ADD COLUMN params TEXT NOT NULL DEFAULT '{}'"},
+	} {
+		rows, err := db.Query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", c.table, c.col)
+		if err != nil {
+			return err
+		}
+		has := rows.Next()
+		rows.Close()
+		if has {
+			continue
+		}
+		if _, err := db.Exec(c.ddl); err != nil {
+			return fmt.Errorf("add column %s.%s: %w", c.table, c.col, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -113,9 +161,9 @@ func (s *Store) Ping() error {
 // InsertPending 入队时写入 pending 行；task_id 重复（幂等重提）返回已存在错误。
 func (s *Store) InsertPending(ctx context.Context, r Run) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO job_runs (task_id, request_id, action, job_id, dept, callback_url, status, submitted_by, source_ip, enqueued_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
+INSERT INTO job_runs (task_id, request_id, action, job_id, dept, params, callback_url, status, submitted_by, source_ip, enqueued_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.Params, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
 	if err != nil {
 		return fmt.Errorf("store: insert job_run: %w", err)
 	}
@@ -124,11 +172,11 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 
 func (s *Store) GetByTaskID(ctx context.Context, taskID string) (*Run, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT task_id, request_id, action, job_id, dept, callback_url, status, attempts, error, duration_ms,
+SELECT task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
        submitted_by, source_ip, enqueued_at, started_at, finished_at
 FROM job_runs WHERE task_id = ?`, taskID)
 	var r Run
-	err := row.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.CallbackURL, &r.Status, &r.Attempts,
+	err := row.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.Params, &r.CallbackURL, &r.Status, &r.Attempts,
 		&r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP, &r.EnqueuedAt, &r.StartedAt, &r.FinishedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -227,7 +275,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	if size < 1 || size > 200 {
 		size = 20
 	}
-	q := `SELECT task_id, request_id, action, job_id, dept, callback_url, status, attempts, error, duration_ms,
+	q := `SELECT task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
        submitted_by, source_ip, enqueued_at, started_at, finished_at FROM job_runs` + where +
 		` ORDER BY enqueued_at DESC LIMIT ? OFFSET ?`
 	rows, err := s.db.QueryContext(ctx, q, append(args, size, (page-1)*size)...)
@@ -239,7 +287,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	var out []*Run
 	for rows.Next() {
 		var r Run
-		if err := rows.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.CallbackURL, &r.Status,
+		if err := rows.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.Params, &r.CallbackURL, &r.Status,
 			&r.Attempts, &r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP,
 			&r.EnqueuedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 			return nil, 0, fmt.Errorf("store: scan run: %w", err)

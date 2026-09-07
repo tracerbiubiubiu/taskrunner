@@ -38,9 +38,13 @@ func (f *fakeSubmitter) Submit(ctx context.Context, p task.Payload) (bool, error
 	}
 	f.submitted = append(f.submitted, p)
 	if f.st != nil {
+		fakeParams := string(p.Params)
+		if fakeParams == "" {
+			fakeParams = "{}"
+		}
 		_ = f.st.InsertPending(ctx, repository.Run{
 			TaskID: p.TaskID, RequestID: p.RequestID, Action: p.Action, JobID: p.JobID,
-			Dept: p.Dept, CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
+			Dept: p.Dept, Params: fakeParams, CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
 			EnqueuedAt: time.Now(),
 		})
 	}
@@ -279,6 +283,47 @@ func TestListRunsFilter(t *testing.T) {
 }
 
 // TestC10NegativeBindings C10 负向：标识缺失 → 400；旧路由（path 带标识）→ 404 防混布错配。
+// TestSubmitParamsRoundTrip params 快照往返（P0-1 回归锚点）：提交带 params →
+// job_runs.params 落库（非空串）→ task/runs 查询回显。
+func TestSubmitParamsRoundTrip(t *testing.T) {
+	f := newFixture(t)
+	w := f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
+		"task_id": "p-rt-1", "action": "a", "callback_url": "http://x",
+		"dept": "d1", "params": map[string]any{"retain_days": 7},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("submit: %s", w.Body.String())
+	}
+	// TaskView 回显
+	wg := f.do(t, http.MethodGet, "/v1/tasks/p-rt-1", nil)
+	_, mg := decode(t, wg)
+	d := mg["data"].(map[string]any)
+	if d["params"] != `{"retain_days":7}` {
+		t.Fatalf("task params 回显错误：%v", d["params"])
+	}
+	if d["dept"] != "d1" {
+		t.Fatalf("task dept 回显错误：%v", d["dept"])
+	}
+	// runs 列表回显
+	wr := f.do(t, http.MethodGet, "/v1/runs?request_id=", nil)
+	_ = wr
+	_, mr := decode(t, f.do(t, http.MethodGet, "/v1/runs", nil))
+	list := mr["data"].(map[string]any)["list"].([]any)
+	found := false
+	for _, it := range list {
+		row := it.(map[string]any)
+		if row["task_id"] == "p-rt-1" {
+			found = true
+			if row["params"] != `{"retain_days":7}` {
+				t.Fatalf("run params 回显错误：%v", row["params"])
+			}
+		}
+	}
+	if !found {
+		t.Fatal("runs 列表未见 p-rt-1")
+	}
+}
+
 func TestC10NegativeBindings(t *testing.T) {
 	f := newFixture(t)
 

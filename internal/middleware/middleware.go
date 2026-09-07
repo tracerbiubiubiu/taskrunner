@@ -53,9 +53,14 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 		if operator == "" {
 			operator = "system"
 		}
+		q := c.Request.URL.RawQuery
+		if len(q) > 4096 {
+			q = q[:4096]
+		}
 		logger.Info("access",
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
+			"query", q,
 			"status", c.Writer.Status(),
 			"cost_ms", time.Since(start).Milliseconds(),
 			"request_id", c.GetString("request_id"),

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -97,5 +98,55 @@ func TestNotFound(t *testing.T) {
 	s := openTestStore(t)
 	if _, err := s.GetByTaskID(context.Background(), "nope"); err != ErrNotFound {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// TestOpenMigratesOldSchema 旧库升级回归（P0-2）：CREATE TABLE IF NOT EXISTS 对旧库空转，
+// Open 必须补齐 job_id/dept/params 三列，否则升级后 INSERT/SELECT 全量失败。
+func TestOpenMigratesOldSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSchema := `CREATE TABLE job_runs (
+		id            INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id       TEXT NOT NULL UNIQUE,
+		request_id    TEXT NOT NULL DEFAULT '',
+		action        TEXT NOT NULL,
+		callback_url  TEXT NOT NULL DEFAULT '',
+		status        TEXT NOT NULL DEFAULT 'pending',
+		attempts      INTEGER NOT NULL DEFAULT 0,
+		error         TEXT NOT NULL DEFAULT '',
+		duration_ms   INTEGER NOT NULL DEFAULT 0,
+		submitted_by  TEXT NOT NULL DEFAULT '',
+		source_ip     TEXT NOT NULL DEFAULT '',
+		enqueued_at   TIMESTAMP NOT NULL,
+		started_at    TIMESTAMP,
+		finished_at   TIMESTAMP
+	);`
+	if _, err := db.Exec(oldSchema); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("open with migration: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if err := st.InsertPending(ctx, Run{
+		TaskID: "upg-1", Action: "a", JobID: "j1", Dept: "d1", Params: `{"k":1}`,
+		EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("insert after upgrade: %v", err)
+	}
+	run, err := st.GetByTaskID(ctx, "upg-1")
+	if err != nil {
+		t.Fatalf("get after upgrade: %v", err)
+	}
+	if run.JobID != "j1" || run.Dept != "d1" || run.Params != `{"k":1}` {
+		t.Fatalf("upgraded row fields wrong: %+v", run)
 	}
 }

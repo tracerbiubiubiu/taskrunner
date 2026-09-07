@@ -111,40 +111,54 @@ UPDATE jobs SET action_id=?, trigger_type=?, callback_url=?, cron_spec=?, params
 	return nil
 }
 
-// JobFilter 列表过滤（全部可选，零值 = 不过滤）。
+// JobFilter 列表过滤与分页（全部可选，零值 = 不过滤；Page<1 视为 1，PageSize 越界回落 50）。
 type JobFilter struct {
-	Dept    string
-	Action  string
-	Enabled *bool
+	Dept     string
+	Action   string
+	Enabled  *bool
+	Page     int
+	PageSize int
 }
 
-func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, error) {
-	q, args := `SELECT `+jobsCols+` FROM jobs WHERE 1=1`, []any{}
+func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, int64, error) {
+	where, args := " WHERE 1=1", []any{}
 	if f.Dept != "" {
-		q, args = q+" AND dept = ?", append(args, f.Dept)
+		where, args = where+" AND dept = ?", append(args, f.Dept)
 	}
 	if f.Action != "" {
-		q, args = q+" AND action_id = ?", append(args, f.Action)
+		where, args = where+" AND action_id = ?", append(args, f.Action)
 	}
 	if f.Enabled != nil {
-		q, args = q+" AND enabled = ?", append(args, *f.Enabled)
+		where, args = where+" AND enabled = ?", append(args, *f.Enabled)
 	}
-	q += " ORDER BY created_at DESC"
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("store: count jobs: %w", err)
+	}
+
+	page, size := f.Page, f.PageSize
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 200 {
+		size = 50
+	}
+	q := `SELECT ` + jobsCols + ` FROM jobs` + where + ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, q, append(args, size, (page-1)*size)...)
 	if err != nil {
-		return nil, fmt.Errorf("store: list jobs: %w", err)
+		return nil, 0, fmt.Errorf("store: list jobs: %w", err)
 	}
 	defer rows.Close()
 	var out []*Job
 	for rows.Next() {
 		j, err := scanJob(rows)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, j)
 	}
-	return out, rows.Err()
+	return out, total, rows.Err()
 }
 
 // ListDueCronJobs 取出到期待触发的 cron 定义（cronloop 每 tick 调用）。

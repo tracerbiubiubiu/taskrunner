@@ -106,6 +106,7 @@ type TaskView struct {
 	RequestID   string     `json:"request_id"`
 	Action      string     `json:"action"`
 	JobID       string     `json:"job_id"`
+	Dept        string     `json:"dept"`
 	Status      string     `json:"status"`
 	Attempts    int        `json:"attempts"`
 	Error       string     `json:"error"`
@@ -124,6 +125,7 @@ type RunView struct {
 	RequestID   string     `json:"request_id"`
 	Action      string     `json:"action"`
 	JobID       string     `json:"job_id"`
+	Dept        string     `json:"dept"`
 	Status      string     `json:"status"`
 	Attempts    int        `json:"attempts"`
 	Error       string     `json:"error"`
@@ -136,7 +138,7 @@ type RunView struct {
 
 func runView(r *repository.Run) RunView {
 	return RunView{
-		TaskID: r.TaskID, RequestID: r.RequestID, Action: r.Action, JobID: r.JobID,
+		TaskID: r.TaskID, RequestID: r.RequestID, Action: r.Action, JobID: r.JobID, Dept: r.Dept,
 		Status: r.Status, Attempts: r.Attempts, Error: r.Error, DurationMS: r.DurationMS,
 		SubmittedBy: r.SubmittedBy, EnqueuedAt: r.EnqueuedAt,
 		StartedAt: nullTime(r.StartedAt), FinishedAt: nullTime(r.FinishedAt),
@@ -159,7 +161,7 @@ func (s *TaskService) GetTask(ctx context.Context, taskID string) (*TaskView, er
 		return nil, err
 	}
 	v := &TaskView{
-		TaskID: run.TaskID, RequestID: run.RequestID, Action: run.Action, JobID: run.JobID,
+		TaskID: run.TaskID, RequestID: run.RequestID, Action: run.Action, JobID: run.JobID, Dept: run.Dept,
 		Status: run.Status, Attempts: run.Attempts, Error: run.Error, DurationMS: run.DurationMS,
 		SubmittedBy: run.SubmittedBy, SourceIP: run.SourceIP,
 		EnqueuedAt: run.EnqueuedAt, StartedAt: nullTime(run.StartedAt), FinishedAt: nullTime(run.FinishedAt),
@@ -173,13 +175,14 @@ func (s *TaskService) GetTask(ctx context.Context, taskID string) (*TaskView, er
 // RunQuery 执行记录查询（全部可选；from/to 为 RFC3339）。
 type RunQuery struct {
 	RequestID, Action, Status, JobID string
+	Depts                            []string
 	From, To                         *time.Time
 	Page, PageSize                   int
 }
 
 func (s *TaskService) ListRuns(ctx context.Context, q RunQuery) ([]RunView, int64, error) {
 	runs, total, err := s.repo.ListRuns(ctx, repository.RunFilter{
-		RequestID: q.RequestID, Action: q.Action, Status: q.Status, JobID: q.JobID,
+		RequestID: q.RequestID, Action: q.Action, Status: q.Status, JobID: q.JobID, Depts: q.Depts,
 		From: q.From, To: q.To, Page: q.Page, PageSize: q.PageSize,
 	})
 	if err != nil {
@@ -382,16 +385,16 @@ func (s *TaskService) CreateJob(ctx context.Context, in JobInput) (*JobView, err
 	return &v, nil
 }
 
-func (s *TaskService) ListJobs(ctx context.Context, f repository.JobFilter) ([]JobView, error) {
-	jobs, err := s.repo.ListJobs(ctx, f)
+func (s *TaskService) ListJobs(ctx context.Context, f repository.JobFilter) ([]JobView, int64, error) {
+	jobs, total, err := s.repo.ListJobs(ctx, f)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	out := make([]JobView, 0, len(jobs))
 	for _, j := range jobs {
 		out = append(out, jobView(j))
 	}
-	return out, nil
+	return out, total, nil
 }
 
 func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (*JobView, error) {

@@ -48,14 +48,14 @@ func New(d Deps) *gin.Engine {
 	{
 		v1.POST("/tasks", d.submitTask)
 		v1.GET("/tasks/:id", d.getTask)
-		v1.POST("/tasks/:id/cancel", d.cancelTask)
-		v1.POST("/tasks/:id/retry", d.retryTask)
+		v1.POST("/tasks/cancel", d.cancelTask)
+		v1.POST("/tasks/retry", d.retryTask)
 		v1.GET("/runs", d.listRuns)
 		v1.GET("/dead-letters", d.listDeadLetters)
 		v1.GET("/jobs", d.listJobs)
 		v1.POST("/jobs", d.createJob)
-		v1.PATCH("/jobs/:id", d.patchJob)
-		v1.POST("/jobs/:id/trigger", d.triggerJob)
+		v1.POST("/jobs/update", d.patchJob)
+		v1.POST("/jobs/trigger", d.triggerJob)
 	}
 	return r
 }
@@ -111,7 +111,7 @@ func (d *Deps) getTask(c *gin.Context) {
 func (d *Deps) listRuns(c *gin.Context) {
 	q := service.RunQuery{
 		RequestID: c.Query("request_id"), Action: c.Query("action"),
-		Status: c.Query("status"), JobID: c.Query("job_id"),
+		Status: c.Query("status"), JobID: c.Query("job_id"), Depts: c.QueryArray("dept"),
 		Page: atoi(c.Query("page"), 1), PageSize: atoi(c.Query("page_size"), 20),
 	}
 	for k, dest := range map[string]**time.Time{"from": &q.From, "to": &q.To} {
@@ -143,22 +143,37 @@ func (d *Deps) listDeadLetters(c *gin.Context) {
 
 // ---- 干预 ----
 
+// taskIDReq 干预类操作的请求体（C10：POST URL 不携带业务信息，标识全在 body）。
+type taskIDReq struct {
+	TaskID string `json:"task_id" binding:"required"`
+}
+
 func (d *Deps) cancelTask(c *gin.Context) {
-	if err := d.Tasks.CancelTask(c.Request.Context(), c.Param("id")); err != nil {
+	var req taskIDReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "task_id 必填")
+		return
+	}
+	if err := d.Tasks.CancelTask(c.Request.Context(), req.TaskID); err != nil {
 		d.fail(c, err, "取消失败")
 		return
 	}
-	d.logOp(c, "cancel", c.Param("id"))
-	response.OKWithMessage(c, "已取消", gin.H{"task_id": c.Param("id"), "status": "canceled"})
+	d.logOp(c, "cancel", req.TaskID)
+	response.OKWithMessage(c, "已取消", gin.H{"task_id": req.TaskID, "status": "canceled"})
 }
 
 func (d *Deps) retryTask(c *gin.Context) {
-	if err := d.Tasks.RetryTask(c.Request.Context(), c.Param("id")); err != nil {
+	var req taskIDReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "task_id 必填")
+		return
+	}
+	if err := d.Tasks.RetryTask(c.Request.Context(), req.TaskID); err != nil {
 		d.fail(c, err, "重试失败")
 		return
 	}
-	d.logOp(c, "retry", c.Param("id"))
-	response.OKWithMessage(c, "已重新入队", gin.H{"task_id": c.Param("id"), "status": "pending"})
+	d.logOp(c, "retry", req.TaskID)
+	response.OKWithMessage(c, "已重新入队", gin.H{"task_id": req.TaskID, "status": "pending"})
 }
 
 // ---- 任务定义 ----
@@ -199,15 +214,16 @@ func (d *Deps) createJob(c *gin.Context) {
 
 func (d *Deps) listJobs(c *gin.Context) {
 	f := jobFilterOf(c)
-	jobs, err := d.Tasks.ListJobs(c.Request.Context(), f)
+	jobs, total, err := d.Tasks.ListJobs(c.Request.Context(), f)
 	if err != nil {
 		d.fail(c, err, "查询失败")
 		return
 	}
-	response.OK(c, jobs)
+	response.OKPage(c, jobs, total, f.Page, f.PageSize)
 }
 
 type patchJobReq struct {
+	JobID       string          `json:"job_id" binding:"required"`
 	CallbackURL *string         `json:"callback_url"`
 	CronSpec    *string         `json:"cron_spec"`
 	Params      json.RawMessage `json:"params"`
@@ -223,7 +239,7 @@ func (d *Deps) patchJob(c *gin.Context) {
 		response.BadRequest(c, err.Error())
 		return
 	}
-	v, err := d.Tasks.UpdateJob(c.Request.Context(), c.Param("id"), service.JobPatch{
+	v, err := d.Tasks.UpdateJob(c.Request.Context(), req.JobID, service.JobPatch{
 		CallbackURL: req.CallbackURL, CronSpec: req.CronSpec, Params: req.Params,
 		Dept: req.Dept, Enabled: req.Enabled, TimeoutSecs: req.TimeoutSecs, Description: req.Description,
 	})
@@ -236,6 +252,7 @@ func (d *Deps) patchJob(c *gin.Context) {
 }
 
 type triggerReq struct {
+	JobID     string `json:"job_id" binding:"required"`
 	RequestID string `json:"request_id"`
 	Actor     string `json:"actor"`
 	SourceIP  string `json:"source_ip"`
@@ -243,18 +260,21 @@ type triggerReq struct {
 
 func (d *Deps) triggerJob(c *gin.Context) {
 	var req triggerReq
-	_ = c.ShouldBindJSON(&req) // body 可空
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "job_id 必填")
+		return
+	}
 	if req.RequestID == "" {
 		req.RequestID = c.GetString("request_id") // 同 submitTask：头值兜底
 	}
-	out, err := d.Tasks.TriggerJob(c.Request.Context(), c.Param("id"), service.TriggerInput{
+	out, err := d.Tasks.TriggerJob(c.Request.Context(), req.JobID, service.TriggerInput{
 		RequestID: req.RequestID, Actor: req.Actor, SourceIP: req.SourceIP,
 	})
 	if err != nil {
 		d.fail(c, err, "触发失败")
 		return
 	}
-	d.logOp(c, "trigger_job", c.Param("id"))
+	d.logOp(c, "trigger_job", req.JobID)
 	response.OK(c, out)
 }
 
@@ -289,6 +309,8 @@ func jobFilterOf(c *gin.Context) repository.JobFilter {
 		b := v == "true" || v == "1"
 		f.Enabled = &b
 	}
+	f.Page = atoi(c.Query("page"), 1)
+	f.PageSize = atoi(c.Query("page_size"), 50)
 	return f
 }
 

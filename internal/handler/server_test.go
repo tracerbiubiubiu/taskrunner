@@ -247,25 +247,54 @@ func TestListRunsFilter(t *testing.T) {
 	if d["list"].([]any)[0].(map[string]any)["task_id"] != "r1" {
 		t.Fatalf("filter wrong row: %v", d["list"])
 	}
+
+	// C11：dept 多值过滤（job 定义的归属标签约束执行记录可见性）
+	var jaID, jbID string
+	for _, job := range []struct{ id, dept string }{{"j-a", "deptA"}, {"j-b", "deptB"}} {
+		wj := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
+			"action_id": "a1", "callback_url": "http://x", "trigger_type": "cron",
+			"cron_spec": "0 4 * * *", "dept": job.dept,
+		})
+		if wj.Code != http.StatusOK {
+			t.Fatalf("create job %s: %s", job.id, wj.Body.String())
+		}
+		_, mj := decode(t, wj)
+		jid := mj["data"].(map[string]any)["job_id"].(string)
+		if job.id == "j-a" {
+			jaID = jid
+		} else {
+			jbID = jid
+		}
+	}
+	// 带 dept 的 run 经 trigger 产生（直接提交的一次性任务 job_id 为空，不挂 dept）
+	f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": jaID, "actor": "10086"})
+	f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": jbID, "actor": "10086"})
+
+	wd := f.do(t, http.MethodGet, "/v1/runs?dept=deptA", nil)
+	_, md := decode(t, wd)
+	list := md["data"].(map[string]any)["list"].([]any)
+	if len(list) != 1 || list[0].(map[string]any)["dept"] != "deptA" {
+		t.Fatalf("dept=deptA 应只含 deptA 的执行记录：%v", list)
+	}
 }
 
 func TestCancelAndRetry(t *testing.T) {
 	f := newFixture(t)
 	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "c1", "action": "a", "callback_url": "http://x"})
 
-	// 取消 pending
-	w := f.do(t, http.MethodPost, "/v1/tasks/c1/cancel", map[string]any{})
+	// 取消 pending（C10：POST URL 不携带业务信息，标识在 body）
+	w := f.do(t, http.MethodPost, "/v1/tasks/cancel", map[string]any{"task_id": "c1"})
 	if w.Code != http.StatusOK {
 		t.Fatalf("cancel pending want 200, got %d: %s", w.Code, w.Body.String())
 	}
 	// 已取消再取消 → 409
-	w2 := f.do(t, http.MethodPost, "/v1/tasks/c1/cancel", map[string]any{})
+	w2 := f.do(t, http.MethodPost, "/v1/tasks/cancel", map[string]any{"task_id": "c1"})
 	if w2.Code != http.StatusConflict {
 		t.Fatalf("double cancel want 409, got %d", w2.Code)
 	}
 
 	// retry 非 failed → 409
-	w3 := f.do(t, http.MethodPost, "/v1/tasks/c1/retry", map[string]any{})
+	w3 := f.do(t, http.MethodPost, "/v1/tasks/retry", map[string]any{"task_id": "c1"})
 	if w3.Code != http.StatusConflict {
 		t.Fatalf("retry non-failed want 409, got %d", w3.Code)
 	}
@@ -275,7 +304,7 @@ func TestCancelAndRetry(t *testing.T) {
 	if err := f.st.Finish(context.Background(), "c2", repository.StatusFailed, "boom", 1, time.Now(), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	w4 := f.do(t, http.MethodPost, "/v1/tasks/c2/retry", map[string]any{})
+	w4 := f.do(t, http.MethodPost, "/v1/tasks/retry", map[string]any{"task_id": "c2"})
 	if w4.Code != http.StatusOK {
 		t.Fatalf("retry failed want 200, got %d: %s", w4.Code, w4.Body.String())
 	}
@@ -315,23 +344,24 @@ func TestJobsCRUDAndTrigger(t *testing.T) {
 	// 列表过滤
 	wList := f.do(t, http.MethodGet, "/v1/jobs?dept=audit", nil)
 	_, mList := decode(t, wList)
-	if mList["data"].([]any)[0].(map[string]any)["job_id"] != jobID {
+	// OKPage 形态：data = {list, total, page, page_size}
+	if mList["data"].(map[string]any)["list"].([]any)[0].(map[string]any)["job_id"] != jobID {
 		t.Fatalf("list filter wrong: %v", mList)
 	}
 
-	// PATCH 启停
-	wPatch := f.do(t, http.MethodPatch, "/v1/jobs/"+jobID, map[string]any{"enabled": false})
+	// POST /jobs/update 启停（C10：方法仅 POST，标识在 body）
+	wPatch := f.do(t, http.MethodPost, "/v1/jobs/update", map[string]any{"job_id": jobID, "enabled": false})
 	if wPatch.Code != http.StatusOK {
-		t.Fatalf("patch want 200, got %d", wPatch.Code)
+		t.Fatalf("update want 200, got %d: %s", wPatch.Code, wPatch.Body.String())
 	}
 	// 停用后 trigger → 409
-	wTrig := f.do(t, http.MethodPost, "/v1/jobs/"+jobID+"/trigger", map[string]any{"actor": "10086"})
+	wTrig := f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": jobID, "actor": "10086"})
 	if wTrig.Code != http.StatusConflict {
 		t.Fatalf("trigger disabled want 409, got %d", wTrig.Code)
 	}
 	// 重新启用后 trigger 成功
-	f.do(t, http.MethodPatch, "/v1/jobs/"+jobID, map[string]any{"enabled": true})
-	wTrig2 := f.do(t, http.MethodPost, "/v1/jobs/"+jobID+"/trigger", map[string]any{"actor": "10086", "request_id": "req-t"})
+	f.do(t, http.MethodPost, "/v1/jobs/update", map[string]any{"job_id": jobID, "enabled": true})
+	wTrig2 := f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": jobID, "actor": "10086", "request_id": "req-t"})
 	if wTrig2.Code != http.StatusOK {
 		t.Fatalf("trigger enabled want 200, got %d: %s", wTrig2.Code, wTrig2.Body.String())
 	}

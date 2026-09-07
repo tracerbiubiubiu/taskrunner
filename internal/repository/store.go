@@ -189,7 +189,7 @@ func toAny(ss []string) []any {
 }
 
 // ListRuns 按条件分页查询执行记录，返回行列表与总数。
-// C11：JOIN jobs——支持按归属标签（dept）多值过滤，并在行内返回 dept（zhuzhao E-⑤ 可见性）。
+// C11：按归属标签（dept 快照列）多值过滤，行内返回 dept（zhuzhao E-⑤ 可见性）——纯表查询不 JOIN jobs。
 func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error) {
 	where, args := " WHERE 1=1", []any{}
 	if f.RequestID != "" {

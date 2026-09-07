@@ -13,7 +13,7 @@
    taskrunner API（AK/SK HMAC 签名；写接口显式带 actor 工号 + source_ip）
      │ cron 到点 / 出队
      ▼
-   taskrunner 回调 zhuzhao：POST /internal/jobs/callback（body：task_id + request_id + action_id + params——C10 约定化，action_id 不再走 URL 路径，2026-09-07）
+   taskrunner 回调 zhuzhao：POST /internal/jobs/callback（body：task_id + request_id + action + params——C10 约定化，action_id 不再走 URL 路径，2026-09-07）
      │ zhuzhao 查注册表执行 handler，HTTP 响应即单次结果
      ▼
    taskrunner 记 job_runs（详细过程只在 taskrunner，不回传）
@@ -51,7 +51,7 @@ type JobHandler interface{ Handle(ctx context.Context, params json.RawMessage) e
 var registry = map[string]JobHandler{
     "audit_archive": auditArchiveHandler{},
 }
-// POST /internal/jobs/callback → 按 body.action_id 查表分发（C10 约定化，2026-09-07）
+// POST /internal/jobs/callback → 按 body.action 查表分发（C10 约定化，2026-09-07）
 ```
 
 **回调契约**（taskrunner.md §4 摘要，zhuzhao handler 必须遵守）：

@@ -102,7 +102,7 @@
   // zhuzhao 侧（示意）
   type JobHandler interface{ Handle(ctx, params) error }
   var registry = map[action_id]JobHandler{ "audit_archive": …, … }
-  // POST /internal/jobs/callback → 按 body.action_id 查表分发执行
+  // POST /internal/jobs/callback → 按 body.action 查表分发执行
   ```
 
 - **触发链路**：cron 到点 / `trigger` / `POST /v1/tasks` → taskrunner 按 job 定义组装回调（action_id + params + request_id）→ zhuzhao 查注册表执行 handler → 结果记 `job_runs`；
@@ -285,7 +285,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 |---|---|---|
 | **M1 核心运行时** | Asynq worker；回调客户端（超时 / 5xx·4xx 判定 / 退避重试）；`job_runs` 落库（SQLite + `internal/repository`）；`/healthz`；入队暂以 CLI / 测试入口触发 | 任务能从入队走到回调并正确记录，失败按策略重试，死信可查 |
 | **M2 HTTP API** | §5 全部 v1 端点（含任务定义 jobs 组、归属标签过滤）；内网 credential 鉴权；调用人上下文字段（`actor` / `source_ip`）；`errcode`/`response` 统一响应；提交幂等（task_id 去重） | zhuzhao 可走 API 建任务定义、提交任务，并按 request_id 查到执行记录 |
-| **M3 首个预置动作** | 审计归档（B11②）：创建任务定义（job）+ zhuzhao 回调端点 `POST /internal/jobs/callback`（body.action_id，2026-09-07 拍板） | 「触发 → 回调执行 → 失败重试」按周期闭环跑通（对齐 zhuzhao `docs/phase3/03-audit-l2.md`） |
+| **M3 首个预置动作** | 审计归档（B11②）：创建任务定义（job）+ zhuzhao 回调端点 `POST /internal/jobs/callback`（body.action，2026-09-07 拍板） | 「触发 → 回调执行 → 失败重试」按周期闭环跑通（对齐 zhuzhao `docs/phase3/03-audit-l2.md`） |
 | **M4 运维完善** | 指标（队列深度/成功率/回调延迟）；死信告警；asynqmon **以库嵌入 API server**（挂 `/monitor`，置于内网 token 之后，read-only 起步，前端随包内嵌；入队配 `asynq.Retention` 短期留观——Redis 里那份只作近期观察，长期事实以 `job_runs` 为准）；`job_runs` 保留清理 | 异常可感知、死信有出口、存储有界；运维看板可用且不裸暴露 |
 
 模块内顺序 **M1 → M2 → M3**，M4 可与 M3 并行。
@@ -355,4 +355,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-07 | 目标架构注记入档（§2/§4）：zhuzhao 演进为 **API 网关 + IAM**（薄网关，不持业务能力），业务数据/能力下沉各服务；动作归属泛化为「能力属主服务」——各服务挂自己的动作端点，taskrunner 统一调度（xxl-job 一调度中心 + N 执行器形态），handler 随数据迁移、taskrunner 仅改路由指向；多服务时代启用 owner_service / 多调用方 credential 预留；与「能力目录」方案（端点自注册）互为表里 |
 | 2026-09-07 | **日志描述全面性整理**（§6/§7）：① run_id 取消——job_runs 一行一任务、attempts 覆盖更新，无独立 run 行；打点定为四件套 `request_id / task_id / action / attempt`（对齐实现），ES 演进字段清单同步；② 新增日志级别约定（成功 Info / 将重试 Warn / 死信·丢弃·启动失败 Error，告警按此建立）；③ 脱敏与截断边界（params/报文当前全量、错误片段截 1KB 入 job_runs.error，脱敏后置：日志出内网/入 ES 时启动，落点 C1 钩子）；④ 应用日志 MaxAge 必须显式配置（lumberjack 零值不限天数，含个人信息，建议与 job_runs 保留期同档随 M4 定值）；⑤ §7 补「访问日志（技术层）」行成四层全景；双写路径（文件+stdout）入档；⑥ 复审补漏：§6 status 枚举补 `canceled`（API 取消终态，M2 引入时漏同步） |
 | 2026-09-07 | 执行模型与扩展后置项入档（§5/§8/§10）：§5 新增「执行模型」（固定协程池、重试=延迟重投递非自循环、租约崩溃恢复、多副本队列安全 + cronloop 分布式锁配套，§8 同步）；§10 后置项三则：优先级队列（加权防饥饿、场景触发）、一次性延迟任务（ProcessAt）、编排（红线=不做通用流程引擎；首选外部 DAG 调 API、最小替代=on_success 钩子+result 列） |
-| 2026-09-07 | **回调端点 C10 约定化 + dept 快照列 + 口径同步**（§4/§5/§6）：① 回调端点改 `POST /internal/jobs/callback` + body.action_id（方案 A 拍板；~~路径 /internal/jobs/:action_id~~ 废弃；统一 body schema 补 action_id；zhuzhao 16 号 E-② 同步定案）；② C11 runs dept 过滤改 **`runs.dept` 快照列**（提交时从 job/请求带入、一次性任务由 zhuzhao 携带、不 JOIN jobs——堵一次性任务/删 job/转派三缺口；§6 schema 同步）；③ dept 过滤边界明示（信任前提=zhuzhao 唯一入口 / fail-closed 契约 / 部门继承扩展点）；④ 回调超时措辞同步 §10（30s + env）；⑤ 能力目录术语统一为 `action_id`；⑥ zhuzhao-integration §2.2 更新为已定案（不做前置校验，可选增强） |
+| 2026-09-07 | **回调端点 C10 约定化 + dept 快照列 + 口径同步**（§4/§5/§6）：① 回调端点改 `POST /internal/jobs/callback` + body.action（方案 A 拍板；~~路径 /internal/jobs/:action_id~~ 废弃；统一 body schema 补 action_id；zhuzhao 16 号 E-② 同步定案）；② C11 runs dept 过滤改 **`runs.dept` 快照列**（提交时从 job/请求带入、一次性任务由 zhuzhao 携带、不 JOIN jobs——堵一次性任务/删 job/转派三缺口；§6 schema 同步）；③ dept 过滤边界明示（信任前提=zhuzhao 唯一入口 / fail-closed 契约 / 部门继承扩展点）；④ 回调超时措辞同步 §10（30s + env）；⑤ 能力目录术语统一为 `action_id`；⑥ zhuzhao-integration §2.2 更新为已定案（不做前置校验，可选增强） |

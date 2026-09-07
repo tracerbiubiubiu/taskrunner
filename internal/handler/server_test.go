@@ -40,7 +40,7 @@ func (f *fakeSubmitter) Submit(ctx context.Context, p task.Payload) (bool, error
 	if f.st != nil {
 		_ = f.st.InsertPending(ctx, repository.Run{
 			TaskID: p.TaskID, RequestID: p.RequestID, Action: p.Action, JobID: p.JobID,
-			CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
+			Dept: p.Dept, CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
 			EnqueuedAt: time.Now(),
 		})
 	}
@@ -275,6 +275,74 @@ func TestListRunsFilter(t *testing.T) {
 	list := md["data"].(map[string]any)["list"].([]any)
 	if len(list) != 1 || list[0].(map[string]any)["dept"] != "deptA" {
 		t.Fatalf("dept=deptA 应只含 deptA 的执行记录：%v", list)
+	}
+}
+
+// TestC10NegativeBindings C10 负向：标识缺失 → 400；旧路由（path 带标识）→ 404 防混布错配。
+func TestC10NegativeBindings(t *testing.T) {
+	f := newFixture(t)
+
+	cases := []struct {
+		name, method, path string
+		body               map[string]any
+	}{
+		{"cancel 缺 task_id", http.MethodPost, "/v1/tasks/cancel", map[string]any{}},
+		{"retry 缺 task_id", http.MethodPost, "/v1/tasks/retry", map[string]any{}},
+		{"trigger 缺 job_id", http.MethodPost, "/v1/jobs/trigger", map[string]any{}},
+		{"update 缺 job_id", http.MethodPost, "/v1/jobs/update", map[string]any{"enabled": true}},
+	}
+	for _, tc := range cases {
+		w := f.do(t, tc.method, tc.path, tc.body)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s want 400, got %d: %s", tc.name, w.Code, w.Body.String())
+		}
+	}
+
+	// 旧路由（信息在 URL 的形态）应已不存在——404 而非被静默匹配
+	for _, old := range []struct{ method, path string }{
+		{http.MethodPatch, "/v1/jobs/anything"},
+		{http.MethodPost, "/v1/jobs/anything/trigger"},
+		{http.MethodPost, "/v1/tasks/anything/cancel"},
+		{http.MethodPost, "/v1/tasks/anything/retry"},
+	} {
+		w := f.do(t, old.method, old.path, map[string]any{})
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("旧路由 %s %s 应 404，got %d", old.method, old.path, w.Code)
+		}
+	}
+}
+
+// TestC11DeptFilterNegative C11 负向/边界：不存在的 dept → 空；多值并集；task 响应带 dept。
+func TestC11DeptFilterNegative(t *testing.T) {
+	f := newFixture(t)
+	wj := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
+		"action_id": "a1", "callback_url": "http://x", "trigger_type": "cron",
+		"cron_spec": "0 4 * * *", "dept": "deptA",
+	})
+	if wj.Code != http.StatusOK {
+		t.Fatalf("create job: %s", wj.Body.String())
+	}
+	_, mj := decode(t, wj)
+	jid := mj["data"].(map[string]any)["job_id"].(string)
+	wt := f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": jid, "actor": "10086"})
+	if wt.Code != http.StatusOK {
+		t.Fatalf("trigger: %s", wt.Body.String())
+	}
+	_, mt := decode(t, wt)
+	tid := mt["data"].(map[string]any)["task_id"].(string)
+
+	// task 响应应回显 dept（C11 对外承诺）
+	wg := f.do(t, http.MethodGet, "/v1/tasks/"+tid, nil)
+	_, mg := decode(t, wg)
+	if mg["data"].(map[string]any)["dept"] != "deptA" {
+		t.Fatalf("task 响应应带 dept=deptA：%v", mg["data"])
+	}
+
+	// 不存在的 dept → 空列表（fail-closed 语义：无归属即不可见）
+	wn := f.do(t, http.MethodGet, "/v1/runs?dept=nonexistent", nil)
+	_, mn := decode(t, wn)
+	if got := mn["data"].(map[string]any)["total"]; got != float64(0) {
+		t.Fatalf("不存在 dept 应 0 条，got %v", got)
 	}
 }
 

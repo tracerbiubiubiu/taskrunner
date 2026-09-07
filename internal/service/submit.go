@@ -56,7 +56,7 @@ func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, wa
 	}
 	if err := s.Store.InsertPending(ctx, repository.Run{
 		TaskID: p.TaskID, RequestID: p.RequestID, Action: p.Action, JobID: p.JobID,
-		CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
+		Dept: p.Dept, CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP,
 		EnqueuedAt: time.Now(),
 	}); err != nil {
 		return true, err, nil // 已入队：只提示记录缺失

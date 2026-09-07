@@ -67,6 +67,7 @@ type SubmitInput struct {
 	TaskID      string
 	RequestID   string
 	Action      string
+	Dept        string // 一次性任务的归属标签（zhuzhao 携带，C11 快照）
 	CallbackURL string
 	Params      json.RawMessage
 	SubmittedBy string
@@ -88,7 +89,7 @@ func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput
 		in.TaskID = uuid.NewString()
 	}
 	accepted, _, err := s.submitter.Submit(ctx, task.Payload{
-		TaskID: in.TaskID, RequestID: in.RequestID, Action: in.Action,
+		TaskID: in.TaskID, RequestID: in.RequestID, Action: in.Action, Dept: in.Dept,
 		CallbackURL: in.CallbackURL, Params: in.Params,
 		SubmittedBy: in.SubmittedBy, SourceIP: in.SourceIP, TimeoutSecs: in.TimeoutSecs,
 	})
@@ -463,7 +464,7 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 	}
 	taskID := uuid.NewString()
 	accepted, _, err := s.submitter.Submit(ctx, task.Payload{
-		TaskID: taskID, RequestID: in.RequestID, Action: j.ActionID, JobID: j.JobID,
+		TaskID: taskID, RequestID: in.RequestID, Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
 		CallbackURL: j.CallbackURL, Params: []byte(j.Params),
 		SubmittedBy: in.Actor, SourceIP: in.SourceIP, TimeoutSecs: j.TimeoutSecs,
 	})

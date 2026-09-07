@@ -74,9 +74,8 @@ func (l *Loop) FireDue(ctx context.Context) {
 	for _, j := range due {
 		newID := l.newTaskID()
 		p := task.Payload{
-			TaskID:      newID,
-			Action:      j.ActionID,
-			JobID:       j.JobID,
+			TaskID: newID,
+			Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
 			CallbackURL: j.CallbackURL,
 			Params:      []byte(j.Params),
 			TimeoutSecs: j.TimeoutSecs,

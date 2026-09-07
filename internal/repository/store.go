@@ -37,7 +37,7 @@ type Run struct {
 	RequestID   string
 	Action      string
 	JobID       string // 经由哪个任务定义触发（一次性提交为空）
-	Dept        string // 归属标签（冗余自 jobs.dept，C11 可见性过滤/展示）
+	Dept        string // 归属标签快照（C11：插入时从 Payload 定格；删 job/改 dept 不影响历史归属）
 	CallbackURL string
 	Status      string
 	Attempts    int
@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	request_id    TEXT NOT NULL DEFAULT '',
 	action        TEXT NOT NULL,
 	job_id        TEXT NOT NULL DEFAULT '',
+	dept          TEXT NOT NULL DEFAULT '',
 	callback_url  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT 'pending',
 	attempts      INTEGER NOT NULL DEFAULT 0,
@@ -112,9 +113,9 @@ func (s *Store) Ping() error {
 // InsertPending 入队时写入 pending 行；task_id 重复（幂等重提）返回已存在错误。
 func (s *Store) InsertPending(ctx context.Context, r Run) error {
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO job_runs (task_id, request_id, action, job_id, callback_url, status, submitted_by, source_ip, enqueued_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.TaskID, r.RequestID, r.Action, r.JobID, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
+INSERT INTO job_runs (task_id, request_id, action, job_id, dept, callback_url, status, submitted_by, source_ip, enqueued_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
 	if err != nil {
 		return fmt.Errorf("store: insert job_run: %w", err)
 	}
@@ -123,9 +124,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 
 func (s *Store) GetByTaskID(ctx context.Context, taskID string) (*Run, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT r.task_id, r.request_id, r.action, r.job_id, COALESCE(j.dept, '') AS dept, r.callback_url, r.status, r.attempts, r.error, r.duration_ms,
-       r.submitted_by, r.source_ip, r.enqueued_at, r.started_at, r.finished_at
-FROM job_runs r LEFT JOIN jobs j ON j.job_id = r.job_id WHERE r.task_id = ?`, taskID)
+SELECT task_id, request_id, action, job_id, dept, callback_url, status, attempts, error, duration_ms,
+       submitted_by, source_ip, enqueued_at, started_at, finished_at
+FROM job_runs WHERE task_id = ?`, taskID)
 	var r Run
 	err := row.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.CallbackURL, &r.Status, &r.Attempts,
 		&r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP, &r.EnqueuedAt, &r.StartedAt, &r.FinishedAt)
@@ -192,30 +193,30 @@ func toAny(ss []string) []any {
 func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error) {
 	where, args := " WHERE 1=1", []any{}
 	if f.RequestID != "" {
-		where, args = where+" AND r.request_id = ?", append(args, f.RequestID)
+		where, args = where+" AND request_id = ?", append(args, f.RequestID)
 	}
 	if f.Action != "" {
-		where, args = where+" AND r.action = ?", append(args, f.Action)
+		where, args = where+" AND action = ?", append(args, f.Action)
 	}
 	if f.Status != "" {
-		where, args = where+" AND r.status = ?", append(args, f.Status)
+		where, args = where+" AND status = ?", append(args, f.Status)
 	}
 	if f.JobID != "" {
-		where, args = where+" AND r.job_id = ?", append(args, f.JobID)
+		where, args = where+" AND job_id = ?", append(args, f.JobID)
 	}
 	if len(f.Depts) > 0 {
 		ph := strings.Repeat("?,", len(f.Depts))
-		where, args = where+" AND j.dept IN ("+ph[:len(ph)-1]+")", append(args, toAny(f.Depts)...)
+		where, args = where+" AND dept IN ("+ph[:len(ph)-1]+")", append(args, toAny(f.Depts)...)
 	}
 	if f.From != nil {
-		where, args = where+" AND r.enqueued_at >= ?", append(args, *f.From)
+		where, args = where+" AND enqueued_at >= ?", append(args, *f.From)
 	}
 	if f.To != nil {
-		where, args = where+" AND r.enqueued_at <= ?", append(args, *f.To)
+		where, args = where+" AND enqueued_at <= ?", append(args, *f.To)
 	}
 
 	var total int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_runs r LEFT JOIN jobs j ON j.job_id = r.job_id`+where, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_runs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("store: count runs: %w", err)
 	}
 
@@ -226,9 +227,9 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	if size < 1 || size > 200 {
 		size = 20
 	}
-	q := `SELECT r.task_id, r.request_id, r.action, r.job_id, COALESCE(j.dept, '') AS dept, r.callback_url, r.status, r.attempts, r.error, r.duration_ms,
-       r.submitted_by, r.source_ip, r.enqueued_at, r.started_at, r.finished_at FROM job_runs r LEFT JOIN jobs j ON j.job_id = r.job_id` + where +
-		` ORDER BY r.enqueued_at DESC LIMIT ? OFFSET ?`
+	q := `SELECT task_id, request_id, action, job_id, dept, callback_url, status, attempts, error, duration_ms,
+       submitted_by, source_ip, enqueued_at, started_at, finished_at FROM job_runs` + where +
+		` ORDER BY enqueued_at DESC LIMIT ? OFFSET ?`
 	rows, err := s.db.QueryContext(ctx, q, append(args, size, (page-1)*size)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: list runs: %w", err)

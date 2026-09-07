@@ -13,6 +13,7 @@ type Payload struct {
 	RequestID   string          `json:"request_id"`
 	Action      string          `json:"action"`           // 预置动作 id（zhuzhao 注册表键）
 	JobID       string          `json:"job_id,omitempty"` // 经由哪个任务定义触发
+	Dept        string          `json:"dept,omitempty"`   // 归属标签快照（C11：job 触发取定义、一次性提交由 zhuzhao 携带；入 job_runs.dept）
 	CallbackURL string          `json:"callback_url"`
 	Params      json.RawMessage `json:"params,omitempty"`
 	SubmittedBy string          `json:"submitted_by,omitempty"` // 工号，审计归因（§4 透传）

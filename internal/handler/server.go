@@ -66,6 +66,7 @@ type submitReq struct {
 	TaskID      string          `json:"task_id"`
 	RequestID   string          `json:"request_id"`
 	Action      string          `json:"action" binding:"required"`
+	Dept        string          `json:"dept"` // 一次性任务归属标签（zhuzhao E-⑤ 携带，C11 快照列）
 	CallbackURL string          `json:"callback_url" binding:"required"`
 	Params      json.RawMessage `json:"params"`
 	SubmittedBy string          `json:"submitted_by"` // 工号（审计归因）
@@ -85,6 +86,7 @@ func (d *Deps) submitTask(c *gin.Context) {
 		req.RequestID = c.GetString("request_id")
 	}
 	out, err := d.Tasks.Submit(c.Request.Context(), service.SubmitInput{
+		Dept:   req.Dept,
 		TaskID: req.TaskID, RequestID: req.RequestID, Action: req.Action,
 		CallbackURL: req.CallbackURL, Params: req.Params,
 		SubmittedBy: req.SubmittedBy, SourceIP: req.SourceIP, TimeoutSecs: req.TimeoutSecs,
@@ -129,7 +131,7 @@ func (d *Deps) listRuns(c *gin.Context) {
 		d.fail(c, err, "查询失败")
 		return
 	}
-	response.OKPage(c, runs, total, q.Page, q.PageSize)
+	response.OKPage(c, runs, total, clampPage(q.Page), clampSize(q.PageSize, 20))
 }
 
 func (d *Deps) listDeadLetters(c *gin.Context) {
@@ -219,7 +221,7 @@ func (d *Deps) listJobs(c *gin.Context) {
 		d.fail(c, err, "查询失败")
 		return
 	}
-	response.OKPage(c, jobs, total, f.Page, f.PageSize)
+	response.OKPage(c, jobs, total, clampPage(f.Page), clampSize(f.PageSize, 50))
 }
 
 type patchJobReq struct {
@@ -236,7 +238,7 @@ type patchJobReq struct {
 func (d *Deps) patchJob(c *gin.Context) {
 	var req patchJobReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		response.BadRequest(c, "job_id 必填")
 		return
 	}
 	v, err := d.Tasks.UpdateJob(c.Request.Context(), req.JobID, service.JobPatch{
@@ -312,6 +314,21 @@ func jobFilterOf(c *gin.Context) repository.JobFilter {
 	f.Page = atoi(c.Query("page"), 1)
 	f.PageSize = atoi(c.Query("page_size"), 50)
 	return f
+}
+
+// clampPage / clampSize 与 repository 钳制口径一致，回显生效值防响应元数据失真。
+func clampPage(p int) int {
+	if p < 1 {
+		return 1
+	}
+	return p
+}
+
+func clampSize(size, def int) int {
+	if size < 1 || size > 200 {
+		return def
+	}
+	return size
 }
 
 func atoi(s string, def int) int {

@@ -188,6 +188,13 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 **明确后置**（不算缺口）：全文检索、聚合统计、深分页——当前无日志平台，临时查库；未来上 ES 等平台时归平台（演进路径见 §6）。
 
+### 执行模型（2026-09-07 补充）
+
+- **worker = 固定大小协程池**（asynq `Concurrency`，默认 10）：每取到一个任务，池内一个协程**同步**执行 handler（组装回调 → HTTP POST，受回调超时约束——协程占用时长有界）；并发上限即池大小，超出自然积压在 Redis 队列（`/monitor` 可见）；
+- **重试不是自循环**：handler 返回错误 → asynq 按退避策略把任务延迟重投递（`ProcessIn`），到期由池内任意协程再取——重试与首次是同一条消费路径；
+- **崩溃不丢**：执行中任务有租约（lease），协程存活即自动续期；进程挂 → 租约到期自动重新投递（at-least-once 的机制来源，也是回调幂等义务的来源）；
+- **多副本**：队列消费天然安全（多实例共享 Redis 队列、原子弹出，一条任务只被一个实例取走）；**cronloop tick 每实例独立跑——多副本部署前必须给 fireDue 加分布式锁**（Redis SETNX 即可），是 PG 解除单副本约束后的配套项，随多副本部署落地。
+
 ## 6. job_runs 存储与日志分工（2026-09-03 定稿）
 
 **执行记录落库**（不存文件、不依赖 Asynq/Redis 自带记录——Redis 只保队列运转，撑不起按 request_id/action/时间段的查询）：
@@ -230,7 +237,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **独立部署**（独立进程/容器，不与 zhuzhao 布一块——zhuzhao 只作网关调用各能力、拉起各任务）；
 - **独立 Redis**（Asynq 队列归属 taskrunner，能力自包含，同 activelist 独立库原则）。口径：指 Redis 命名空间/库独立归属 taskrunner，**不必然新增一套 Redis 部署**，与 ADR-002「复用现有 Redis、不新增基础设施」不冲突，按部署环境落地；
 - **独立 DB**（`job_runs` 归 taskrunner 自有）。~~SQLite 起步~~ ✅ **拍板统一 PG（2026-09-03，基线 §8/zhuzhao 16 号 §9 C7）**：迁独立 PG 数据库（复用 utils `postgres`，schema 不变，约半天，随 M3/M4）；SQLite 保留为 M1/M2 已交付里程碑实现；
-- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + cron 循环同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要）；`/monitor` 随容器同端口暴露，仅内网可达；
+- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + cron 循环同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要；**配套：cronloop 需先加分布式锁**，见 §5 执行模型）；`/monitor` 随容器同端口暴露，仅内网可达；
 - 公共工具统一引自 [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils)：`logger`（应用日志）、`postgres`（迁 PG 时）、`errcode` + `response`（API 统一响应）；`redis` 包用不上（Asynq 走自己的 `RedisClientOpt`）。依赖 utils（独立通用工具库）**不属于**「不反向依赖」的禁止范围。
 
 ### 工程结构与依赖注入（Wire，2026-09-04 确认）
@@ -291,6 +298,9 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - 回调超时默认值：实现取 30s（env `TASKRUNNER_CALLBACK_TIMEOUT` 可改，载荷可按任务覆盖）——随 M3 验证后转正式口径；
 - **同一 job 重叠执行策略（2026-09-03 登记，随 M3/M4 落地）**：现状 cron 到点即触发新 task_id，上次未完成也再触发一份（重叠允许，仅幂等兜底）。job 定义缺 overlap 策略字段——建议增 `overlap_policy: allow | skip_if_running`（默认 allow；audit_archive 等周期批任务配 skip_if_running，对齐 zhuzhao 13 号 M-E「阻塞策略按任务拍板」）；
 - `job_runs` 保留期：仍待定（M4 随清理任务落地）。
+- **优先级队列（后置，2026-09-07）**：asynq 原生多队列加权（如 critical/default/low = 6/3/1）；预留设计 = job 定义加可选 `priority` 字段 + worker 队列权重配置化，回调链路零改动。**饥饿风险**：用加权不用严格优先、最多三档。触发条件：出现任务抢并发的场景（如通知要插队归档）；
+- **一次性延迟任务（后置，2026-09-07）**：asynq `ProcessAt` 原生支持（重试退避内部即此机制）；暴露成 API = 提交路径加可选参数（「N 分钟后 / 指定时刻跑一次」）；
+- **编排（后置，红线先行，2026-09-07）**：**taskrunner 不做通用流程引擎**（DAG 状态机 / 持久化工作流实例——ADR-002 铁律，跨线即成 Temporal 类产品）。两种形态：① **首选 = 外部 DAG 引擎**（Airflow / Dagster / 自研）逐节点调 `POST /v1/tasks`、轮询 `GET /v1/runs` 拿完成态（完成通知启用后可免轮询）——taskrunner 零改动、编排状态全归 DAG；② 无 DAG 时的最小替代 = job 定义加 `on_success` 字段 + worker 终态钩子 + `job_runs` 加 `result` 摘要列（该列不论编排都值得加，查询接口可返回任务产出）。触发条件：真实链式需求出现。
 
 ## 11. 关联文档
 
@@ -342,3 +352,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-04 | **回调消息体约定 + 统一 body schema**（§4 回调契约补充）：业务参数 `params` 统一走回调 body（唯一业务负载通道、进 AK/SK 签名）；路由标识走路径、链路标识走 header、鉴权走签名层——各归其位；统一回调 schema `{task_id, request_id, params}` 为执行端 SDK 入口约定，加能力 = 注册 code + 写 Handler 回调入口零改动；params 存储（Asynq payload + job_runs）与传输（body）分离 |
 | 2026-09-07 | 目标架构注记入档（§2/§4）：zhuzhao 演进为 **API 网关 + IAM**（薄网关，不持业务能力），业务数据/能力下沉各服务；动作归属泛化为「能力属主服务」——各服务挂自己的动作端点，taskrunner 统一调度（xxl-job 一调度中心 + N 执行器形态），handler 随数据迁移、taskrunner 仅改路由指向；多服务时代启用 owner_service / 多调用方 credential 预留；与「能力目录」方案（端点自注册）互为表里 |
 | 2026-09-07 | **日志描述全面性整理**（§6/§7）：① run_id 取消——job_runs 一行一任务、attempts 覆盖更新，无独立 run 行；打点定为四件套 `request_id / task_id / action / attempt`（对齐实现），ES 演进字段清单同步；② 新增日志级别约定（成功 Info / 将重试 Warn / 死信·丢弃·启动失败 Error，告警按此建立）；③ 脱敏与截断边界（params/报文当前全量、错误片段截 1KB 入 job_runs.error，脱敏后置：日志出内网/入 ES 时启动，落点 C1 钩子）；④ 应用日志 MaxAge 必须显式配置（lumberjack 零值不限天数，含个人信息，建议与 job_runs 保留期同档随 M4 定值）；⑤ §7 补「访问日志（技术层）」行成四层全景；双写路径（文件+stdout）入档；⑥ 复审补漏：§6 status 枚举补 `canceled`（API 取消终态，M2 引入时漏同步） |
+| 2026-09-07 | 执行模型与扩展后置项入档（§5/§8/§10）：§5 新增「执行模型」（固定协程池、重试=延迟重投递非自循环、租约崩溃恢复、多副本队列安全 + cronloop 分布式锁配套，§8 同步）；§10 后置项三则：优先级队列（加权防饥饿、场景触发）、一次性延迟任务（ProcessAt）、编排（红线=不做通用流程引擎；首选外部 DAG 调 API、最小替代=on_success 钩子+result 列） |

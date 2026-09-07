@@ -37,7 +37,7 @@
               ▼
       taskrunner（独立仓库/部署/Redis/DB）
        ├── HTTP API server（任务定义管理 / 提交 / 查询 / 取消 / 重试 / 死信）
-       ├── Asynq worker + Scheduler
+       ├── Asynq worker + cron 循环（分钟级 tick 扫 DB）
        ├── 消费任务 → HTTP 回调 zhuzhao 内网端点（携带 task_id + 参数 + request_id）
        ├── 失败重试 / 超时 / 死信
        └── 自维护 job_runs（独立 DB，执行记录，可经 API 查询）
@@ -46,6 +46,29 @@
 - zhuzhao = 网关 + 业务归属（预置动作 handler 在 zhuzhao）；taskrunner = 通用调度/触发/重试运行时；
 - **不反向依赖**：taskrunner 不 import zhuzhao 代码，只通过 HTTP 回调执行预置动作、通过 API 接收任务；
 - 任务提交方式 ✅ **定稿（2026-09-03）**：**调 taskrunner API 提交**（原 Open Question「直连 Redis Enqueue vs API」随「taskrunner 提供内部 HTTP API」一并落定；直连 Redis 不作为对外契约）。
+
+### 独立部署定位与动作分发模式（2026-09-04 确认）
+
+**定位**：taskrunner 定位为**可独立部署、可复用的通用调度平台**（独立仓库/部署/Redis/DB，§8）。「只做调度、不承载业务能力」是硬边界；与 zhuzhao 的关系是**协议级解耦**——taskrunner 只认 `action_id`（不透明字符串）+ `callback_url`（HTTP 端点），不感知对端是谁。
+
+**当前与 zhuzhao 的耦合盘点（3 处，均可解耦，无需改代码）**：
+
+| 层 | 实际依赖 | 解耦方式 |
+|---|---|---|
+| 编译期 | 仅依赖 zhuzhao-utils（`errcode`/`response`/`aksk`/`logger`），**不 import 任何 zhuzhao 业务代码** | 共享工具库不算业务耦合；彻底独立时把 `aksk` 等抽独立 module |
+| 配置期 | `Security.Callers` 默认只配 zhuzhao 一个调用方（fail-closed：密钥环空拒绝启动）——本身是 **map**，可配多对端 | 改配置即可泛化，零代码改动 |
+| 运行时 | 回调是纯 HTTP 协议（`CallbackURL` 由提交方指定；2xx=成功 / 4xx=不可重试 / 5xx+超时=重试 + AK/SK 验签） | 任何符合契约的服务都能当回调对端 |
+
+**两种动作分发模式（判断）**：
+
+- **模式 B · 能力集中（= 当前现状）**：所有动作集中在 zhuzhao `internal/jobs` 包（§4 三层模型「动作层」），taskrunner 只回调 zhuzhao。好处：样板（回调端点 + AK/SK 验签 + 幂等栅栏 + 状态语义）一次实现，接入方走 zhuzhao API 即用；代价：taskrunner 在某种意义上退化为 zhuzhao 的「执行组件」——脱离 zhuzhao 没有执行对象。适合「zhuzhao 是唯一消费者」的阶段。
+- **模式 A · 能力分散（目标方向）**：taskrunner 为通用调度平台，各服务自己暴露回调端点（`/internal/actions/<id>` 类，契约同 §4）承接能力，zhuzhao 是第一个接入方。好处：调度器真正独立、可复用、多系统共用；代价：每个接入服务要复制「回调端点 + AK/SK 验签 + 幂等 + 状态语义」样板。
+
+**结论**：两种模式的共同点「taskrunner 只做调度、数据不丢（`job_runs` 终身 + 幂等 + 重试 + 死信）」正确；**模式 A 更符合独立调度平台定位，且当前架构已天然支持 A**（协议级解耦，taskrunner 零改动）。当前阶段沿用模式 B（zhuzhao 唯一接入方）完全合理，**实现零改动**——不因「未来复用」提前重构。演进到 A 的触发信号与步骤：
+1. **触发信号**：出现第二个需要接入调度的系统/服务；
+2. **密钥环泛化**：`Security.Callers` 增配新调用方（已是 map，仅配置改动）；
+3. **回调契约文档化**：把回调契约（body 字段 + 2xx/4xx/5xx 语义 + AK/SK 签名）固化为对端接入规范（当前摘要见 zhuzhao-integration.md §2.1）；
+4. **可选**：taskrunner 内置动作注册表（同 §4「内置例外」：ping URL / 自清理等无对端动作进程内执行，不回调外部）。
 
 ## 3. 职责边界
 
@@ -99,6 +122,42 @@
 - **超时**：默认值落地时定（建议 30s），可按 action 覆盖；
 - **L1 边界**：回调执行产生的业务事件（如 SLA 违约）仍由 zhuzhao 侧 handler 落 L1 `ticket_events`；taskrunner 只触发回调、**不写业务事实**；
 - **安全边界**：独立部署下需明确内网可达性（如同 VPC）。~~回调鉴权~~ ✅ **基线修订定案（2026-09-03，覆盖当日早前「不做独立回调鉴权」拍板）**：回调请求带 **AK/SK HMAC 签名**（C9：callback client 以 taskrunner 自身 SK 签名，覆盖 X-Request-ID / X-Operator / body；zhuzhao `/internal` 端点验签）；~~capability URL 增强~~ 随之作废；专用 network 为第二道防线。
+- **消息体约定（2026-09-04 补充）**：业务参数（`params`）**统一走回调请求 body**——唯一业务负载通道、任意 JSON、进 AK/SK 签名覆盖范围；各字段各归其位，业务参数不散落到 query / header / 路径：
+  - 路由标识 `action` → URL 路径 `/internal/jobs/:action_id`；
+  - 链路标识 `request_id` → Header `X-Request-ID`（body 内冗余携带兜底，与 header 一致）；
+  - 鉴权 → 签名层（AK/SK HMAC 覆盖 body + 关键头）；
+  - **业务参数 `params` → Body（唯一业务通道）**。
+- **统一回调 body schema（执行端 SDK 的入口约定）**：`{ "task_id": …, "request_id": …, "params": … }`——执行端 SDK 解包统一 schema → 校验 → 取 `params` 传 `jobs.Registry` Handler；**加能力 = 注册 code + 写 Handler，回调入口零改动**；幂等（task_id）、链路（request_id）、错误映射（2xx/4xx/5xx）在 SDK 层统一处理，业务 handler 只关心 `params` 与返回值；
+- **params 存储与传输分离**：存储 = 入队时 Asynq payload + 执行记录 job_runs（taskrunner 内部持久化）；传输 = 回调 body（给执行端的唯一业务通道）——两者不混。
+
+### 能力目录（capability_registry）【方案待定 · 2026-09-04 记录，未拍板】
+
+**现状**：任务定义（job）携带**提交方指定**的 `callback_url`，taskrunner 直接回调——「能力 code → 服务端点」的路由由提交方手填，无跨服务能力发现。
+
+**方案（待定）**：执行端把「能力唯一 code + 对应路由（callback_url + auth_key）」注册进 taskrunner DB（`capability_registry`），taskrunner 提交任务只认 `action_code`，自行查表解析回调目标。
+
+- 表（taskrunner 侧 `internal/repository`，同 job_runs 领域 schema 口径，不放 zhuzhao-utils）：`code` PK / `callback_url` / `auth_key`（指向密钥环条目）/ `enabled` / `created_at` / `updated_at`；
+- **注册**：执行端服务启动自注册 `POST /internal/actions`（upsert 幂等）+ 管理 / 配置兜底（避免启动顺序依赖）——能力服务（network 等）上报后即被 taskrunner 发现，提交方无需知道实现地址；
+- **提交**：job 定义不再必填 `callback_url`，只填 `action_code`；提交时 taskrunner 查表解析出 `callback_url` + `auth_key` **快照入 job 行**（运行期不依赖目录在线，故障隔离、可追溯「当时调用了谁」）；显式 `callback_url` 保留覆盖能力（调试 / 直连 / 未注册目标）；
+- **回调**：复用现有回调 client，按 job 行快照的 URL + auth_key 签名回调（AK/SK HMAC，§4 回调契约安全边界）；
+- **两级路由**：跨服务目录（code → 服务端点，taskrunner 查）+ 服务内 `jobs.Registry`（code → Handler，执行端查）——各管一层、不重复；与 §4「能力服务（后置）」条目衔接（端点从"提交方手填"演进为"能力服务自注册"，taskrunner 仍只认 code）；
+- **规模控制**：单表 + upsert + 提交时解析，不引入 etcd / consul 注册中心（量级上来再评估）。
+
+**实现位置（2026-09-04 补充，随方案待定）**——归属原则同 §6 job_runs：taskrunner 领域 schema / 流程放 taskrunner 仓库，多个执行端复用的通用件放 zhuzhao-utils：
+- `capability_registry` 表 → taskrunner `internal/repository`（领域 schema，唯一查询方 = taskrunner，**不放 zhuzhao-utils**）；
+- 注册 API（`POST /internal/actions`）→ taskrunner `internal/handler`（upsert 幂等；管理 / 配置兜底同层）；
+- 提交时解析快照 → taskrunner `internal/service`（submit 流程内查表 → 快照 `callback_url` + `auth_key` 入 job 行）；
+- 执行端「启动自注册」client → zhuzhao-utils（执行端 SDK 内，多执行端复用，调注册 API + AK/SK 签名）；
+- 可选 `RegistryClient` 接口契约（Register / Resolve / Heartbeat）→ zhuzhao-utils 放**接口定义**，DB 实现在 taskrunner——为将来换 etcd / k8s 实现留平滑迁移口（业务零改动，实现方只换实现不换契约）。
+
+⚠️ **方案待定**（2026-09-04，机制方向已确认有价值，具体点未拍板、待讨论）：
+- 注册表归属：taskrunner DB（唯一查询方，倾向）vs 独立注册中心；
+- 注册方式：自注册 vs 配置录入 vs 两者并存；
+- 解析时机：提交时快照（倾向）vs 每次回调实时查；
+- 显式 `callback_url` 覆盖是否保留；
+- 与「密钥环多对端」合并为同一张表，还是分表。
+
+落地前需定稿。
 
 ## 5. HTTP API（内部，v1 范围定稿）
 
@@ -166,6 +225,34 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + cron 循环同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要）；`/monitor` 随容器同端口暴露，仅内网可达；
 - 公共工具统一引自 [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils)：`logger`（应用日志）、`postgres`（迁 PG 时）、`errcode` + `response`（API 统一响应）；`redis` 包用不上（Asynq 走自己的 `RedisClientOpt`）。依赖 utils（独立通用工具库）**不属于**「不反向依赖」的禁止范围。
 
+### 工程结构与依赖注入（Wire，2026-09-04 确认）
+
+以正式微服务标准建设，内部与 zhuzhao 同规格（对齐 zhuzhao 16 号 §9「工程结构」基线）——**Wire DI + 分层**，入口薄、装配集中在 `internal/app`。
+
+**目录分层**：
+
+| 目录 | 职责 |
+|---|---|
+| `cmd/taskrunner` | 薄入口：`serve`（常驻服务，默认 `configs/config.yaml`，纯 env 亦可）/ `enqueue`（CLI 调试入队，**手工装配不走 Wire**） |
+| `internal/app` | **装配与生命周期**：`wire.go`（Wire 注入描述）/ `wire_gen.go`（生成物）/ `providers.go`（12 个 provider 构造函数）/ `app.go`（Run 优雅启停） |
+| `internal/config` | 配置加载（C6：yaml + `${VAR}` 展开 + 全 env 兼容；密钥环空 / self_sk 缺失 fail-closed） |
+| `internal/handler` | 薄 HTTP 层：绑定/映射 + service 错误→HTTP 映射；业务在 service |
+| `internal/service` | 业务下沉：`TaskService`（提交/查询/取消/重试/jobs 定义）+ `submit`（统一受理，终身幂等）+ `cron`（分钟级 tick 扫 DB） |
+| `internal/repository` | job_runs / jobs 持久化（`database/sql`，SQLite 起步 → PG 无感切换） |
+| `internal/middleware` | C1 访问日志 + C2 AK/SK 验签 |
+| `internal/worker` | Asynq worker：统一 `taskrunner:callback` 处理器（终态判定） |
+| `internal/callback` | 回调客户端（C9：自身 SK 签名 + rid 透传 + 2xx/4xx/5xx 判定） |
+| `internal/task` | Asynq 载荷类型（跨进程契约，字段命名保持稳定） |
+
+**Wire 装配**（`internal/app`）：
+- `wire.go`（`//go:build wireinject`）声明注入集合：`wire.Build(NewApp, provideLogger, provideStore, provideRedisOpt, provideSubmitter, provideInspector, provideTaskService, provideCron, provideAsynqServer, provideCallback, provideKeys, provideReadyz, provideEngine)`；`wire_gen.go`（`//go:build !wireinject`）为生成物——**生成器依赖暂未入 go.sum，改动 `wire.go` 后按 Wire 语义手工同步 `wire_gen.go`**（与 zhuzhao wire_gen 风格对齐）；
+- `providers.go` 提供全部构造函数，依赖由 Wire 解析——显式依赖图 + **编译期校验**（provider 缺失 / 类型不匹配编译即失败，非运行时 panic）；
+- 装配期单例：Store / Redis client / Inspector / readyz-redis 各建一次；`InitializeApp` 统一返回 cleanup（client / inspector / readyz-redis Close、store Close）。
+
+**生命周期**（`app.go Run`）：`serve` → `config.Load` → `InitializeApp(cfg)` → `a.Run()`——HTTP server（`/healthz` `/readyz` `/v1`）+ Asynq worker + cron loop **同进程并发**（§5）；收到 SIGINT/SIGTERM → HTTP drain（10s 超时）→ worker 收尾（等在跑任务完成），干净退出。
+
+**为什么用 Wire**：依赖图显式可见、装配错误编译期暴露（vs 手写 init 的运行时 panic）、cleanup 集中管理（配合容器优雅停机）；与 zhuzhao 工程基线一致，降低跨仓库认知成本。
+
 ## 9. 首个预置动作（M-E 验收入口）
 
 > 代号说明：B11② = zhuzhao 排期中的功能项编号；M-E = 里程碑验收入口。出处见 §11 关联文档。
@@ -179,8 +266,9 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
-| **M1 核心运行时** | Asynq worker + Scheduler；回调客户端（超时 / 5xx·4xx 判定 / 退避重试）；`job_runs` 落库（SQLite + `internal/repository`）；`/healthz`；入队暂以 CLI / 测试入口触发 | 任务能从入队走到回调并正确记录，失败按策略重试，死信可查 |
-| **M2 HTTP API** | §5 全部 v1 端点（含任务定义 jobs 组、归属标签过滤）；内网 credential 鉴权；调用人上下文字段（`actor` / `source_ip`）；`errcode`/`response` 统一响应；提交幂等（task_id 去重） | zhuzhao 可走 API 建任务定义、提交任务，并按 request_id 查到执行记录 || **M3 首个预置动作** | 审计归档（B11②）：创建任务定义（job）+ zhuzhao `/internal/jobs/<action>` 端点 | 「触发 → 回调执行 → 失败重试」按周期闭环跑通（对齐 zhuzhao `docs/phase3/03-audit-l2.md`） |
+| **M1 核心运行时** | Asynq worker；回调客户端（超时 / 5xx·4xx 判定 / 退避重试）；`job_runs` 落库（SQLite + `internal/repository`）；`/healthz`；入队暂以 CLI / 测试入口触发 | 任务能从入队走到回调并正确记录，失败按策略重试，死信可查 |
+| **M2 HTTP API** | §5 全部 v1 端点（含任务定义 jobs 组、归属标签过滤）；内网 credential 鉴权；调用人上下文字段（`actor` / `source_ip`）；`errcode`/`response` 统一响应；提交幂等（task_id 去重） | zhuzhao 可走 API 建任务定义、提交任务，并按 request_id 查到执行记录 |
+| **M3 首个预置动作** | 审计归档（B11②）：创建任务定义（job）+ zhuzhao `/internal/jobs/<action>` 端点 | 「触发 → 回调执行 → 失败重试」按周期闭环跑通（对齐 zhuzhao `docs/phase3/03-audit-l2.md`） |
 | **M4 运维完善** | 指标（队列深度/成功率/回调延迟）；死信告警；asynqmon **以库嵌入 API server**（挂 `/monitor`，置于内网 token 之后，read-only 起步，前端随包内嵌；入队配 `asynq.Retention` 短期留观——Redis 里那份只作近期观察，长期事实以 `job_runs` 为准）；`job_runs` 保留清理 | 异常可感知、死信有出口、存储有界；运维看板可用且不裸暴露 |
 
 模块内顺序 **M1 → M2 → M3**，M4 可与 M3 并行。
@@ -230,6 +318,9 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-04 | §1 新增「什么算一个任务」判定标准（任务 = 必须发生/失败重试/执行留痕的动作单位；含消息通知示例——ADR-002 场景 D 即普通预置动作、即时提交非 cron、taskrunner 侧零改动；粒度与幂等提醒；反面清单）|
 | 2026-09-04 | 澄清任务完成情况查询口径（zhuzhao-integration §2.3 补充）：业务查询走 `/v1/runs?status=…`（job_runs 为数据源），asynqmon 仅为 M4 运维看板（队列内部态、无业务过滤）不面向用户查询；可选增强：状态计数聚合端点，做页面时按需 |
 | 2026-09-04 | §4 新增后置项「能力服务」：动作按数据归属集中放（当前 = zhuzhao `internal/jobs` 包，加动作一处完成）；通用动作批量涌现或多服务注册动作成负担时，可新建能力服务承接——模型兼容、taskrunner 零改动，触发前不预建 |
+| 2026-09-04 | **工程结构与依赖注入补档**（§8 新增子节）：正文补 Wire DI 说明——目录分层表（cmd 薄入口 / internal/app 装配 / handler / service / repository / middleware / worker / callback / task）、Wire 装配（wire.go 注入集合 + wire_gen.go 生成物 + 手工同步约定 + 编译期校验 + cleanup）、生命周期（HTTP + worker + cron 同进程、SIGTERM 优雅停止）、为什么用 Wire（依赖图显式/编译期暴露/cleanup 集中，对齐 zhuzhao 工程基线） |
+| 2026-09-04 | **独立部署定位与动作分发模式确认**（§2 新增子节）：taskrunner = 可独立部署的通用调度平台，与 zhuzhao 协议级解耦——耦合仅 3 处（编译期依赖共享 utils、配置期 Callers 默认单对端、运行时 HTTP 回调协议），均可解耦且**实现零改动**；对比「模式 B 能力集中（现状）vs 模式 A 能力分散（目标）」，确认 A 更符合独立调度定位且当前架构已天然支持，演进触发信号 = 出现第二个接入系统（届时密钥环泛化 + 回调契约文档化 + 可选内置动作注册表，不提前重构） |
+| 2026-09-04 | **典型用例记录**（zhuzhao-integration.md §4 新增）：审批通过 → activelist 加值 + taskrunner 下发任务 + 业务平台操作——链路映射（审批落 L1 / activelist 加值归 zhuzhao 网关 / 组合动作回调）+ **事务性约束**：加值与下发任务跨 activelist/taskrunner 两个独立系统无法强事务，采用 **L2 Outbox**（ADR-001 预留）——审批事务原子写「业务 + L1 + Outbox 两条命令」→ Relay 至少一次投递 → `task_id` 终身幂等 + activelist 幂等键收敛；唯一新设计点 = activelist 加值幂等键；taskrunner / activelist 零改动 |
 | 2026-09-03 | 拍板定案（所有者）：**回调鉴权不做独立机制**（§4 安全边界 + §10 ⚠️ 关闭该项）——信任边界 = 内网网络隔离（与 API 暴露边界同级）+ `callback_url` 由 zhuzhao 提交时自行指定；zhuzhao 侧可选 URL 密钥路径段增强（capability URL，taskrunner 零感知）。zhuzhao 侧 16 号 P5 撤销、P6 随 M2 定案同步（不做前置校验） |
 | 2026-09-03 | 拍板定案（所有者，P7）：**回调响应不引入状态字段**——2xx 仅代表执行完全成功；zhuzhao handler 业务失败直接映射 HTTP 状态码（不可重试 4xx / 可重试 5xx，常规 errcode）；taskrunner 现有 2xx/4xx/5xx 判定即最终行为（callback client 注释随下次提交更新）。zhuzhao 侧 16 号 P1–P7 同日全部关闭，M-E 动工前决策面清零 |
 | 2026-09-03 | 登记全链路关联小改（随 M3）：callback client 回调请求带 `X-Request-ID: <payload.request_id>` 头（有则带，cron 触发为空则不带）——zhuzhao 入站 RequestID 中间件接受入站同 rid，回调链路与 `job_runs` 贯通（zhuzhao 03-audit-l2 §3.4 全链路矩阵） |
@@ -239,3 +330,5 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-03 | **AK/SK 基线修订**（所有者拍板，SSOT = zhuzhao 16 号 §9）：服务间通信统一 **AK/SK HMAC 签名**（utils `aksk` 包 C8 先行；C2 = Bearer→验签、C9 = 回调签名；覆盖当日「零认证+拓扑」与「回调不做鉴权」两条早前拍板；capability URL 作废；专用 network 降为第二道防线） |
 | 2026-09-04 | **微服务结构重构**（所有者拍板：以正式微服务标准建设，内部与 zhuzhao 同规格——zhuzhao 16 号 §9「工程结构」基线）：目录重排 `cmd`（薄入口）/ `internal/app`（**Wire DI** + 生命周期）/ `handler`（薄 HTTP 层）/ `service`（TaskService 业务下沉 + submit/cron）/ `repository`（原 store）/ `middleware`（C1 访问日志 + C2 AK/SK 验签）/ `worker` / `callback`；config 改 **yaml + env**（C6，viper，全 env 兼容；密钥环空拒绝启动 fail-closed）；**C1/C2/C4/C5/C9 同批收口**（统一访问日志中间件含 rid 回显与 operator 兜底；API 验签 Bearer→AK/SK；/readyz 检 Redis+SQLite；Dockerfile TZ；回调以自身 SK 签名+rid 透传）；Makefile 门禁（lint=vet+gofmt / test / build）；handler 测试 ×7 重写为 aksk 口径 + C9 签名测试；C3（网络拓扑）/C7（迁 PG）仍待部署批次 |
 | 2026-09-04 | **全仓审计修复**：① job_runs.request_id 跨查链断裂（API 提交/触发 body-only 绑定 + zhuzhao client body 未带 → 恒空）——双侧修复（handler 头值兜底 + client body 补 request_id）；② 容器崩溃循环（默认 configs/config.yaml 缺失即 fatal）→ env-only 模式 + Dockerfile 拷贝 configs；③ fail-closed 扩至 self_sk（回调签名身份缺失=zhuzhao 验签必 401）与空 queue；④ wire 清理对补齐（client/inspector/readyz-redis Close）；⑤ 本表 action_id 参数名/readyz 行/job_id 过滤/Scheduler 措辞修正 + README quickstart |
+| 2026-09-04 | **能力目录（capability_registry）方案待定**（§4 新增子节）：现状 = 任务定义带提交方指定 `callback_url`、无跨服务能力发现；方案（**未拍板**）= 执行端自注册 code→路由入 taskrunner DB，提交只认 `action_code`、提交时解析快照、两级路由（跨服务目录 + 服务内 Registry），显式 `callback_url` 保留覆盖；开放点：注册表归属 / 注册方式 / 解析时机 / 覆盖保留 / 与密钥环多对端合并——待讨论定稿 |
+| 2026-09-04 | **回调消息体约定 + 统一 body schema**（§4 回调契约补充）：业务参数 `params` 统一走回调 body（唯一业务负载通道、进 AK/SK 签名）；路由标识走路径、链路标识走 header、鉴权走签名层——各归其位；统一回调 schema `{task_id, request_id, params}` 为执行端 SDK 入口约定，加能力 = 注册 code + 写 Handler 回调入口零改动；params 存储（Asynq payload + job_runs）与传输（body）分离 |

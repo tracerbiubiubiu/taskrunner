@@ -92,3 +92,26 @@ var registry = map[string]JobHandler{
 |---|---|
 | M2 HTTP API | 2.2 选型定案；2.3 / 2.4 开发中（联调依赖） |
 | M3 首个预置动作 | 2.1（`audit_archive` handler + 端点）；2.5 提交日志；对齐 zhuzhao `docs/phase3/03-audit-l2.md`（B11②） |
+
+## 4. 典型用例：审批通过 → activelist 加值 + 业务平台操作（2026-09-04 记录）
+
+**场景**：用户发起工单 → 审批通过 → 自动 ① 向 activelist 指定类别添加值，② 把添加的值经 taskrunner 发起任务，调用预置好的能力去对应业务平台操作。
+
+**链路映射（现有机制，零架构改动）**：
+
+| 步骤 | 落点 | 机制 |
+|---|---|---|
+| 用户发起工单 | zhuzhao 工单领域 | 现成 |
+| 审批通过 | zhuzhao **单库事务**：更新工单状态 + 落 L1 `ticket_events`（`ticket.approved`） | ADR-001/ADR-002 |
+| 向 activelist 加值 | **zhuzhao 经网关调 activelist API**（activelist = 数据层 CRUD，独立库、网络仅 zhuzhao 可达、无业务 handler，不作为 taskrunner 回调对端） | activelist ADR-003 |
+| 下发任务 | zhuzhao 调 taskrunner `POST /v1/tasks`（`action` + `params` 携带加值结果 / `request_id` 跨查） | taskrunner.md §5 |
+| 业务平台操作 | taskrunner 可靠执行 → 回调预置动作端点 → **组合 handler** 串行「调 activelist 加值 → 拿值调业务平台」 | 三层模型 + 回调契约 |
+
+**事务性约束（2026-09-04 确认）**：「activelist 加值」与「下发 taskrunner 任务」须保持一致性——跨 activelist / taskrunner 两个独立系统，无法单库强事务（2PC 跨 HTTP 异构系统不可用、补偿 Saga 过度），采用 **L2 事务性 Outbox**（ADR-001 预留演进路径；design-decisions §16）：
+
+- zhuzhao 审批事务内**原子写入**：业务状态 + L1 事件 + **Outbox 两条命令**（① `activelist:add_value` ② `taskrunner:submit`），崩溃不丢、同生共死；
+- **Outbox Relay**（zhuzhao 异步）至少一次投递：activelist 加值（**幂等键去重**）+ taskrunner 提交（**`task_id` 终身幂等**，Submit 先查 job_runs，重放安全）；任一投递失败 Outbox 行保留、Relay 重放，**最终一致、不丢**；
+- 取取舍：最终一致（非强原子）——该场景无「同时读两状态」诉求，足够；
+- **唯一新设计点**：activelist 加值需业务唯一键幂等（activelist 是「每类型一张表 + data JSONB」，需业务唯一键约束或 zhuzhao 先查重再写）；
+- 本场景即 **L2 Outbox 落地触发信号**（「多消费者」= activelist + taskrunner 两个下游），落地全在 zhuzhao 侧（Outbox 表 + Relay），taskrunner / activelist 零改动。
+

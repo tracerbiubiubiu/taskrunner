@@ -168,19 +168,21 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - 调用方身份：API 写操作（建/改定义、触发、取消、重试）在 slog 打点归因（caller + actor + IP + request_id——**B2 缺口，随 §10 C1 统一访问日志中间件补齐**）；`job` 表记 `created_by`（工号，§4 透传，审计归因）与 `owner_service`（当前恒为 zhuzhao）——跨服务归属约束待第二个调用方出现再启用，当前不实现；
 - 响应结构 / 错误码复用 zhuzhao-utils `errcode` + `response`，与网关风格一致。
 
+**API 设计约定（2026-09-04 所有者拍板，SSOT = zhuzhao `docs/phase3/16-external-integration.md` §9）**：方法仅 GET/POST（PUT/DELETE/PATCH 不引入）；**POST URL 不携带业务信息**（资源标识/动作参数全部在请求体；GET 的 path/query 参数不受限）。本节 v1 端点按下表**约定化改造（C10）**，改造前原形态：`PATCH /v1/jobs/{id}`、`POST /v1/jobs/{id}/trigger`、`POST /v1/tasks/{id}/cancel`、`POST /v1/tasks/{id}/retry`。
+
 | 端点 | 用途 |
 |---|---|
 | `POST /v1/tasks` | 提交任务；**受理语义**：校验通过 + 写入队列（Redis AOF）即返回 task_id，「受理 ≠ 执行成功」；**幂等**：接受调用方生成的 `task_id`，重复提交去重 |
-| `GET /v1/tasks/{id}` | 查任务状态 |
-| `GET /v1/runs?request_id=&action=&status=&job_id=&from=&to=&page=&page_size=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；job_id 过滤按定义关联） |
+| `GET /v1/tasks/{id}` | 查任务状态（**C11：响应补 `dept` 字段**——zhuzhao E-⑤ 可见性校验前提） |
+| `GET /v1/runs?request_id=&action=&status=&job_id=&dept=&from=&to=&page=&page_size=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；**C11：加 `dept` 多值过滤**——JOIN jobs.dept，语义同 /v1/jobs；zhuzhao E-⑤ 按调用方可见标签集组装传入，修复「job 定义隔离但执行记录全量可见」旁路） |
 | `GET /v1/jobs?dept=&action_id=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签，§4） |
-| `PATCH /v1/jobs/{id}` | 修改任务定义：cron / params / 启停 |
-| `POST /v1/jobs/{id}/trigger` | 手动执行一次（按定义提交任务，前端「立即执行」按钮） |
-| `POST /v1/tasks/{id}/cancel` | 取消未开始的任务 |
-| `POST /v1/tasks/{id}/retry` | 重试失败/死信任务 |
+| `POST /v1/jobs/update`（原 `PATCH /v1/jobs/{id}`） | 修改任务定义：body 带 job_id + cron / params / 启停 |
+| `POST /v1/jobs/trigger`（原 `POST /v1/jobs/{id}/trigger`） | 手动执行一次：body 带 job_id（按定义提交任务，前端「立即执行」按钮） |
+| `POST /v1/tasks/cancel`（原 `POST /v1/tasks/{id}/cancel`） | 取消未开始的任务：body 带 task_id |
+| `POST /v1/tasks/retry`（原 `POST /v1/tasks/{id}/retry`） | 重试失败/死信任务：body 带 task_id |
 | `GET /v1/dead-letters` | 死信列表（配合 Asynq Inspector 重放，死信处理闭环） |
 | `GET /healthz` | 健康检查（存活） |
-| `GET /readyz` | 就绪探针（检 Redis ping + SQLite；C4） |
+| `GET /readyz` | 就绪探针（检 Redis ping + SQLite；C4；迁 PG 后改检 PG，C7） |
 
 **结果获取模型（2026-09-03 定稿）**：提交响应只回答「是否受理」；执行是否成功，一律通过 `GET /v1/tasks/{id}` / `GET /v1/runs` **按需查询**——查询是执行结果的唯一出口，taskrunner 不主动推送（终败通知为后置项，§4）。
 
@@ -200,10 +202,14 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 路 | 内容 | 载体 | 消费方式 |
 |---|---|---|---|
 | 执行事实 | task_id / request_id / action / 状态 / 重试 / 耗时 / 结果摘要 | `job_runs` 表 | 查询接口（§5） |
-| 过程细节 | 回调请求/响应报文、堆栈、debug 输出 | 应用日志文件（zhuzhao-utils `logger`：slog JSON + lumberjack 轮转） | 人工排障（grep 文件）；后续采集入 ES（见下） |
+| 过程细节 | 回调请求/响应报文、堆栈、debug 输出 | 应用日志文件（zhuzhao-utils `logger`：slog JSON + lumberjack 轮转，**文件+stdout 双写**） | 人工排障（grep 文件）；后续采集入 ES（见下） |
 
-- 关联约定：任务执行链路统一 `slog.With("request_id", …, "run_id", …)` 打点——表里查到一条记录，拿 id 即可在日志文件中定位完整细节；
-- **ES 演进路径（2026-09-03 确认：当前无日志平台，先落文件）**：过程日志即 slog **JSON Lines**——一行一条结构化记录，字段即索引结构，上 ES 时只需加 Filebeat / Vector 等 shipper tail 日志文件（处理轮转）→ ES / Loki，**taskrunner 应用代码零改动**；前提是打点字段保持稳定命名（`request_id` / `run_id` / `action` / `task_id`），M1 起即按此约束写打点。
+- 关联约定：任务执行链路统一打点四件套 `request_id` / `task_id` / `action` / `attempt`（`slog.With` 常驻前三个，attempt 随每次尝试记）——表里查到一条记录，拿 task_id 即可在日志文件中按 attempt 定位每次执行的细节。~~run_id~~ **取消（2026-09-07）**：job_runs 是「一个 task_id 一行、重试覆盖更新 attempts」的模型，不存在独立 run 行，run_id 无从定义；尝试区分由 attempt 字段承担；
+- **日志级别约定（2026-09-07）**：任务成功 = `Info`；失败但还将重试 = `Warn`；死信 / 重试耗尽 / 载荷损坏丢弃 / 组件启动失败 = `Error`；cron 到点触发、API 写操作归因 = `Info`。ES 告警规则按此建立（Error 出现即告警）；
+- **脱敏与截断边界（2026-09-07）**：过程日志中的 params 与回调报文**当前全量记录**（仅内网、文件留存）；错误响应片段截断 1KB 后进 `job_runs.error`，成功响应不落正文。脱敏策略后置（触发条件：日志将出内网 / 接入 ES 时启动；落点 = C1 访问日志中间件已预留的脱敏钩子 + callback 日志一处，不散改）；
+- **应用日志文件保留参数（2026-09-07）**：轮转参数走 config（utils logger：MaxSize / MaxBackups / MaxAge）。**MaxAge 必须显式配置**——lumberjack 零值为不限天数，而文件日志含工号 / IP 等个人信息，保留天数建议与 `job_runs` 保留期同档（随 M4 一并定值）；
+- **双写路径**：utils logger 同时写文件与 stdout——容器 stdout 天然被 Docker 采集，是未来接入日志平台的第二条现成通道（与文件 shipper 二选一或并用）。
+- **ES 演进路径（2026-09-03 确认：当前无日志平台，先落文件）**：过程日志即 slog **JSON Lines**——一行一条结构化记录，字段即索引结构，上 ES 时只需加 Filebeat / Vector 等 shipper tail 日志文件（处理轮转）→ ES / Loki，**taskrunner 应用代码零改动**；前提是打点字段保持稳定命名（`request_id` / `task_id` / `action` / `attempt`），M1 起即按此约束写打点。
 
 ## 7. 日志边界（2026-09-03 确认）
 
@@ -212,6 +218,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 业务审计 | 用户/网关侧业务操作 | zhuzhao `audit_logs` |
 | 任务提交日志 | `{ action, task_id, request_id }` | zhuzhao（提交凭证，薄） |
 | 任务运行日志 | 执行细节/重试/耗时/结果 | taskrunner 自维护 `job_runs`（独立 DB，见 §6），**不传回 zhuzhao** |
+| 访问日志（技术层） | HTTP 进出：method/path/status/耗时/request_id/operator/caller/ip（C1 中间件） | taskrunner 应用日志文件，不单独建存储 |
 
 - 两边以 **`request_id` 关联**（zhuzhao 提交任务时生成/透传，taskrunner 在 job_runs 记下）；
 - 需要追溯时跨查：zhuzhao 以 request_id 调 taskrunner `GET /v1/runs?request_id=…`（§5），**不复制**对方数据；
@@ -334,3 +341,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-04 | **能力目录（capability_registry）方案待定**（§4 新增子节）：现状 = 任务定义带提交方指定 `callback_url`、无跨服务能力发现；方案（**未拍板**）= 执行端自注册 code→路由入 taskrunner DB，提交只认 `action_code`、提交时解析快照、两级路由（跨服务目录 + 服务内 Registry），显式 `callback_url` 保留覆盖；开放点：注册表归属 / 注册方式 / 解析时机 / 覆盖保留 / 与密钥环多对端合并——待讨论定稿 |
 | 2026-09-04 | **回调消息体约定 + 统一 body schema**（§4 回调契约补充）：业务参数 `params` 统一走回调 body（唯一业务负载通道、进 AK/SK 签名）；路由标识走路径、链路标识走 header、鉴权走签名层——各归其位；统一回调 schema `{task_id, request_id, params}` 为执行端 SDK 入口约定，加能力 = 注册 code + 写 Handler 回调入口零改动；params 存储（Asynq payload + job_runs）与传输（body）分离 |
 | 2026-09-07 | 目标架构注记入档（§2/§4）：zhuzhao 演进为 **API 网关 + IAM**（薄网关，不持业务能力），业务数据/能力下沉各服务；动作归属泛化为「能力属主服务」——各服务挂自己的动作端点，taskrunner 统一调度（xxl-job 一调度中心 + N 执行器形态），handler 随数据迁移、taskrunner 仅改路由指向；多服务时代启用 owner_service / 多调用方 credential 预留；与「能力目录」方案（端点自注册）互为表里 |
+| 2026-09-07 | **日志描述全面性整理**（§6/§7）：① run_id 取消——job_runs 一行一任务、attempts 覆盖更新，无独立 run 行；打点定为四件套 `request_id / task_id / action / attempt`（对齐实现），ES 演进字段清单同步；② 新增日志级别约定（成功 Info / 将重试 Warn / 死信·丢弃·启动失败 Error，告警按此建立）；③ 脱敏与截断边界（params/报文当前全量、错误片段截 1KB 入 job_runs.error，脱敏后置：日志出内网/入 ES 时启动，落点 C1 钩子）；④ 应用日志 MaxAge 必须显式配置（lumberjack 零值不限天数，含个人信息，建议与 job_runs 保留期同档随 M4 定值）；⑤ §7 补「访问日志（技术层）」行成四层全景；双写路径（文件+stdout）入档 |

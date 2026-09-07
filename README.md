@@ -31,6 +31,8 @@ export TASKRUNNER_SELF_SK=<zhuzhao侧为本服务分配的SK>       # 必填（�
 ./bin/taskrunner serve my.yaml   # 或纯 env 直接 serve
 ```
 
+> 注：`enqueue` CLI 同样经 `config.Load`（含验签密钥环 fail-closed 校验）——调试机也需注入两个 SK 环境变量。
+
 ## 状态
 
 - 2026-09-03：建仓 + 设计建档（独立仓库/部署/Redis，回调模型，日志边界定稿）；

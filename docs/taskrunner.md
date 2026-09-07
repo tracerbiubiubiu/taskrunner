@@ -172,7 +172,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 |---|---|
 | `POST /v1/tasks` | 提交任务；**受理语义**：校验通过 + 写入队列（Redis AOF）即返回 task_id，「受理 ≠ 执行成功」；**幂等**：接受调用方生成的 `task_id`，重复提交去重 |
 | `GET /v1/tasks/{id}` | 查任务状态 |
-| `GET /v1/runs?request_id=&action=&status=&job_id=&from=&to=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；job_id 过滤按定义关联） |
+| `GET /v1/runs?request_id=&action=&status=&job_id=&from=&to=&page=&page_size=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；job_id 过滤按定义关联） |
 | `GET /v1/jobs?dept=&action_id=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签，§4） |
 | `PATCH /v1/jobs/{id}` | 修改任务定义：cron / params / 启停 |
 | `POST /v1/jobs/{id}/trigger` | 手动执行一次（按定义提交任务，前端「立即执行」按钮） |

@@ -92,6 +92,12 @@ func Load(path string) (*Config, error) {
 	if sk := viper.GetString("security.callers.zhuzhao"); sk != "" {
 		cfg.Security.Callers["zhuzhao"] = sk
 	}
+	// fail-closed：密钥环存在空 SK 条目同样裸奔（HMAC 空密钥可伪造）——拒绝启动
+	for ak, sk := range cfg.Security.Callers {
+		if sk == "" {
+			return nil, fmt.Errorf("security.callers[%q] 为空 SK——空密钥等于无鉴权，拒绝启动", ak)
+		}
+	}
 	// fail-closed：验签密钥环为空 = API 完全裸奔——拒绝启动（对齐 zhuzhao internal_jobs 拍板）
 	if len(cfg.Security.Callers) == 0 {
 		return nil, fmt.Errorf("security.callers 为空（env TASKRUNNER_CALLER_ZHUZHAO_SK 注入 zhuzhao 的 SK）——API 不允许无验签启动")

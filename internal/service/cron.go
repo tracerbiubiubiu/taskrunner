@@ -96,7 +96,12 @@ func (l *Loop) FireDue(ctx context.Context) {
 			l.Logger.Error("cronloop: invalid spec, disabling job", slog.String("job_id", j.JobID), slog.String("spec", j.CronSpec))
 			next, ok = time.Time{}, false
 		}
-		_ = l.Store.UpdateJobNextRun(ctx, j.JobID, next)
+		if uerr := l.Store.UpdateJobNextRun(ctx, j.JobID, next); uerr != nil {
+			// 推进失败 → 下个 tick 以新 task_id 重触发同一动作（task_id 幂等拦不住），
+			// 显式告警供运维介入
+			l.Logger.Error("cronloop: advance next_run failed, duplicate fire risk",
+				slog.String("job_id", j.JobID), slog.Any("err", uerr))
+		}
 		l.Logger.Info("cronloop: job fired",
 			slog.String("job_id", j.JobID), slog.String("action", j.ActionID), slog.String("task_id", newID))
 	}

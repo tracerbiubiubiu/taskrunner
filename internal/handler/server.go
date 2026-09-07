@@ -79,6 +79,11 @@ func (d *Deps) submitTask(c *gin.Context) {
 		response.BadRequest(c, "action 与 callback_url 必填")
 		return
 	}
+	// request_id 兜底：zhuzhao client 签名头携带 X-Request-ID，body 可不带——
+	// 取中间件读到的头值，保证 job_runs.request_id 与跨查链贯通
+	if req.RequestID == "" {
+		req.RequestID = c.GetString("request_id")
+	}
 	out, err := d.Tasks.Submit(c.Request.Context(), service.SubmitInput{
 		TaskID: req.TaskID, RequestID: req.RequestID, Action: req.Action,
 		CallbackURL: req.CallbackURL, Params: req.Params,

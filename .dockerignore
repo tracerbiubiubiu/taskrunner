@@ -1,0 +1,6 @@
+bin/
+data/
+logs/
+vendor/
+*.db
+.git/

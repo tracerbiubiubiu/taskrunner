@@ -205,6 +205,11 @@ func (d *Deps) createJob(c *gin.Context) {
 		response.BadRequest(c, "action_id / callback_url / trigger_type 必填")
 		return
 	}
+	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
+	if len(req.Params) > 64<<10 {
+		response.BadRequest(c, "params 超过上限（64KB）")
+		return
+	}
 	v, err := d.Tasks.CreateJob(c.Request.Context(), service.JobInput{
 		ActionID: req.ActionID, CallbackURL: req.CallbackURL, TriggerType: req.TriggerType,
 		CronSpec: req.CronSpec, Params: req.Params, Dept: req.Dept, Enabled: req.Enabled,
@@ -244,6 +249,10 @@ func (d *Deps) patchJob(c *gin.Context) {
 	var req patchJobReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "job_id 必填")
+		return
+	}
+	if len(req.Params) > 64<<10 {
+		response.BadRequest(c, "params 超过上限（64KB）")
 		return
 	}
 	v, err := d.Tasks.UpdateJob(c.Request.Context(), req.JobID, service.JobPatch{

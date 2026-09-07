@@ -106,7 +106,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { st.Close() })
 	sub := &fakeSubmitter{st: st}
 	insp := &fakeInspector{live: map[string]*asynq.TaskInfo{}}
-	svc := service.NewTaskService(st, sub, insp, "jobs")
+	svc := service.NewTaskService(st, sub, insp, "jobs", slog.Default())
 	d := Deps{Tasks: svc, Keys: map[string][]byte{callerAK: []byte(callerSK)}, Logger: slog.Default()}
 	return &fixture{engine: New(d), st: st, sub: sub, insp: insp}
 }

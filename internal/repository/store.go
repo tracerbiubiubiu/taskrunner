@@ -298,12 +298,17 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 }
 
 // MarkRunning worker 取到任务时置 running 并记本次尝试序号与开始时间。
+// 行不存在（入队成功但落库失败的残留）→ 返回错误——worker 侧据此记日志，
+// 避免任务执行全程无任何 job_runs 记录的「隐形任务」静默发生。
 func (s *Store) MarkRunning(ctx context.Context, taskID string, attempt int, startedAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = '' WHERE task_id = ?`,
 		StatusRunning, attempt, startedAt, taskID)
 	if err != nil {
 		return fmt.Errorf("store: mark running: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("store: mark running: job_runs row missing (task_id=%s)", taskID)
 	}
 	return nil
 }
@@ -315,13 +320,16 @@ func (s *Store) Finish(ctx context.Context, taskID, status, errMsg string, attem
 	if durationMS < 0 {
 		durationMS = 0
 	}
-	_, err := s.db.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 UPDATE job_runs
 SET status = ?, attempts = ?, error = ?, finished_at = ?, duration_ms = ?
 WHERE task_id = ?`,
 		status, attempts, errMsg, finishedAt, durationMS, taskID)
 	if err != nil {
 		return fmt.Errorf("store: finish job_run: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("store: finish job_run: job_runs row missing (task_id=%s)", taskID)
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -54,10 +55,12 @@ type TaskService struct {
 	submitter Submitter
 	inspector TaskInspector
 	queue     string
+	logger    *slog.Logger
 }
 
-func NewTaskService(repo *repository.Store, submitter Submitter, inspector TaskInspector, queue string) *TaskService {
-	return &TaskService{repo: repo, submitter: submitter, inspector: inspector, queue: queue}
+func NewTaskService(repo *repository.Store, submitter Submitter,
+	inspector TaskInspector, queue string, logger *slog.Logger) *TaskService {
+	return &TaskService{repo: repo, submitter: submitter, inspector: inspector, queue: queue, logger: logger}
 }
 
 // ---- 提交 ----
@@ -88,13 +91,18 @@ func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput
 	if in.TaskID == "" {
 		in.TaskID = uuid.NewString()
 	}
-	accepted, _, err := s.submitter.Submit(ctx, task.Payload{
+	accepted, warning, err := s.submitter.Submit(ctx, task.Payload{
 		TaskID: in.TaskID, RequestID: in.RequestID, Action: in.Action, Dept: in.Dept,
 		CallbackURL: in.CallbackURL, Params: in.Params,
 		SubmittedBy: in.SubmittedBy, SourceIP: in.SourceIP, TimeoutSecs: in.TimeoutSecs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("submit: %w", err)
+	}
+	if warning != nil {
+		// 已入队但 job_runs 落库失败：任务会执行，但在查询接口中隐形——必须留痕
+		s.logger.Warn("submit: enqueued but job_runs insert failed, task invisible in queries",
+			slog.String("task_id", in.TaskID), slog.Any("err", warning))
 	}
 	return &SubmitOutput{TaskID: in.TaskID, Accepted: accepted}, nil
 }

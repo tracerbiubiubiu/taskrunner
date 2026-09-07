@@ -34,7 +34,7 @@ func InitializeApp(cfg *config.Config) (*App, func(), error) {
 		cleanup1()
 		return nil, nil, err
 	}
-	taskService := provideTaskService(cfg, store, submitter, inspector)
+	taskService := provideTaskService(cfg, store, submitter, inspector, logger)
 	cronLoop := provideCron(cfg, store, submitter, logger)
 	asynqServer, cleanup4, err := provideAsynqServer(cfg, redisOpt, logger)
 	if err != nil {

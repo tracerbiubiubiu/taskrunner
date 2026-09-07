@@ -150,3 +150,17 @@ func TestOpenMigratesOldSchema(t *testing.T) {
 		t.Fatalf("upgraded row fields wrong: %+v", run)
 	}
 }
+
+// 缺行可见性：入队成功但落库失败的残留任务，worker 侧 MarkRunning/Finish
+// 必须报错（而非静默 0 行）——否则任务执行全程无 job_runs 记录且无日志。
+func TestMissingRowVisible(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	if err := s.MarkRunning(ctx, "ghost", 1, time.Now()); err == nil {
+		t.Fatal("MarkRunning on missing row must error")
+	}
+	if err := s.Finish(ctx, "ghost", StatusFailed, "boom", 1, time.Now(), time.Now()); err == nil {
+		t.Fatal("Finish on missing row must error")
+	}
+}

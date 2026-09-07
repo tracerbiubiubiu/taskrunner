@@ -29,10 +29,12 @@ zhuzhao 查执行结果：GET /v1/tasks/{id} / GET /v1/runs?request_id=…（拉
 |---|---|---|
 | `POST /v1/tasks` | 提交一次性任务 | 受理语义：入队即返回 task_id，受理 ≠ 执行成功；自带幂等（调用方生成 task_id） |
 | `POST /v1/jobs` / `GET /v1/jobs?dept=…` | 建 / 列任务定义（cron 或手动 + params + 归属标签） | 部门差异化展示 = 按标签过滤 |
-| `PATCH /v1/jobs/{id}` | 改 cron / params / 启停 | |
-| `POST /v1/jobs/{id}/trigger` | 手动执行一次（前端「立即执行」） | |
-| `GET /v1/tasks/{id}` / `GET /v1/runs?request_id=…` | 查当前状态 / 查执行历史 | **执行结果的唯一出口** |
-| `POST /v1/tasks/{id}/cancel` `/retry`、`GET /v1/dead-letters` | 干预与死信管理 | 运维向 |
+| `POST /v1/jobs/update`（原 `PATCH /v1/jobs/{id}`，C10） | 改 cron / params / 启停（body 带 job_id） | API 约定见下 |
+| `POST /v1/jobs/trigger`（原 `POST /v1/jobs/{id}/trigger`，C10） | 手动执行一次（前端「立即执行」；body 带 job_id） | |
+| `GET /v1/tasks/{id}` / `GET /v1/runs?request_id=…&dept=…` | 查当前状态 / 查执行历史 | **执行结果的唯一出口**；**C11：task 响应补 `dept` 字段、runs 加 `dept` 多值过滤**（zhuzhao E-⑤ 可见性前提，2026-09-04 登记） |
+| `POST /v1/tasks/cancel` `/retry`（原 `/v1/tasks/{id}/cancel` `/retry`，C10）、`GET /v1/dead-letters` | 干预与死信管理（body 带 task_id） | 运维向 |
+
+**API 设计约定（2026-09-04 所有者拍板，SSOT = zhuzhao 16 号 §9）**：方法仅 GET/POST；POST URL 不携带业务信息（标识/参数全在 body；GET path/query 不受限）。上表 C10 改造随 M3 联调前实施，C11 随 zhuzhao E-⑤ 实施。
 
 所有请求带 **AK/SK HMAC 签名**（zhuzhao client 以自身 SK 签名，taskrunner 验签——2026-09-03 基线修订，覆盖当日早前「零认证/静态 Bearer 过渡」口径；utils `aksk`，基线 SSOT = zhuzhao 16 号 §9）；**写接口**（提交 / 建改定义 / 触发 / 取消 / 重试）显式携带 `actor`（调用人工号）与 `source_ip`——taskrunner 原样存档仅作审计归因（actor 入签名覆盖，不可伪造）。
 
@@ -76,7 +78,8 @@ var registry = map[string]JobHandler{
 
 - 「哪个部门 / 角色能看、能管哪些归属标签」的**策略模型 + 存储（zhuzhao DB 自有表，与用户/部门/角色模型放一起）+ 管理功能**；
 - 由三层校验消费——决定传给 taskrunner 的 `dept` 过滤参数与写权限放行；
-- 创建 job 定义时写入归属标签；策略只存在于 zhuzhao，taskrunner 不感知。
+- 创建 job 定义时写入归属标签；策略只存在于 zhuzhao，taskrunner 不感知；
+- **范围补全（2026-09-04）**：可见性覆盖 job 定义**与执行记录**两层——`GET /v1/runs` 需支持 `dept` 多值过滤、task 查询响应需携带 `dept`（C11），否则 job 定义隔离被执行记录查询旁路。org code 不可变（zhuzhao Update 无 code 列）为「org code 即标签值」的稳定性前提。
 
 ### 2.5 任务提交日志【必做，对齐 §7 日志边界】
 

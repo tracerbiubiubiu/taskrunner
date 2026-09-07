@@ -43,7 +43,7 @@
        └── 自维护 job_runs（独立 DB，执行记录，可经 API 查询）
 ```
 
-- zhuzhao = 网关 + 业务归属（预置动作 handler 在 zhuzhao）；taskrunner = 通用调度/触发/重试运行时；
+- zhuzhao = 网关 + 业务归属（预置动作 handler 当前在 zhuzhao）；taskrunner = 通用调度/触发/重试运行时；（目标架构下 zhuzhao 薄化为 **API 网关 + IAM**，动作归属泛化为「能力属主服务」，见 §4 注记）；
 - **不反向依赖**：taskrunner 不 import zhuzhao 代码，只通过 HTTP 回调执行预置动作、通过 API 接收任务；
 - 任务提交方式 ✅ **定稿（2026-09-03）**：**调 taskrunner API 提交**（原 Open Question「直连 Redis Enqueue vs API」随「taskrunner 提供内部 HTTP API」一并落定；直连 Redis 不作为对外契约）。
 
@@ -92,7 +92,7 @@
 
 | 层 | 是什么 | 归属 | 变更方式 |
 |---|---|---|---|
-| **动作（action）** | 业务 handler，全局唯一 `action_id` | zhuzhao 代码：内网端点 `/internal/jobs/<action_id>` + handler 注册表 | 改代码发版 |
+| **动作（action）** | 业务 handler，全局唯一 `action_id` | **能力属主服务**：内网端点 `/internal/jobs/<action_id>` + handler 注册表（当前 = zhuzhao；目标架构下 = 各业务服务，见下方「目标架构注记」） | 改代码发版（在属主服务） |
 | **任务定义（job）** | `action_id + 触发方式（cron / 手动）+ params + enabled + 归属标签（如 dept，zhuzhao 写入）` | taskrunner **DB**（定稿：API 管理，不再用配置文件） | 运行时调 API（前端经网关操作） |
 | **执行实例（run）** | 每次实际执行（含每次重试） | taskrunner `job_runs`（§6） | 自动产生 |
 
@@ -112,6 +112,7 @@
 - **新增一个可调度动作**：① zhuzhao 新增 handler 并注册进注册表（发版一次）；② 调 `POST /v1/jobs` 建任务定义（运行时，无需再动 taskrunner）；
 - 内置例外（后置，按需再启）：与业务无关的通用动作（如 ping URL、清理自身数据）可在 taskrunner 内实现同款「接口 + id 注册表」，进程内直接执行、不回调 zhuzhao；
 - **能力服务（后置，2026-09-04 记录）**：动作按数据归属放——当前业务数据集中在 zhuzhao，所有动作集中在其 `internal/jobs` 包（加动作 = 加一个文件 + 注册一行，能力并不分散）。若出现以下信号，可新建专门的能力服务承接动作，**模型完全兼容、taskrunner 零改动**（它只认 `action_id + callback_url`，端点在哪不感知）：① 通用动作（不属于任何业务域的 ping / 搬运 / 报表类）批量涌现；② 多个服务都需要注册动作、分散管理成为负担。触发前不预建（新服务承接业务动作要么跨服务连库、要么逻辑劈两半，均为负收益）。
+- **目标架构注记（2026-09-07）**：zhuzhao 演进方向 = **API 网关 + IAM**（薄网关：鉴权、代理任务提交/查询，不持有业务能力），业务数据与能力下沉各服务。动作归属随之泛化为「能力属主服务」：各服务挂自己的动作端点，taskrunner 统一调度全部服务的动作（xxl-job「一调度中心 + N 执行器」形态）——模型零改动，只认 `action_id + callback_url`；下文「能力目录」即为此铺路（端点自注册、提交方不再手填地址）。handler 随数据迁移，taskrunner 仅改路由指向。多服务时代启用已预留的 `owner_service` 与多调用方 credential（§5）。「一处添加所有能力」仅对通用动作成立（→ 能力服务后置项，上一条）；服务专属动作加在属主服务，是「各服务的能力在各服务里」的直接推论。
 
 ### 回调契约（2026-09-03 补充）：
 - **幂等**：任务重试可能重复回调，zhuzhao handler 须按 `request_id`/`task_id` 幂等（先查重再执行）；对「导出 + 删除」类有副作用的动作尤其必要；
@@ -332,3 +333,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-04 | **全仓审计修复**：① job_runs.request_id 跨查链断裂（API 提交/触发 body-only 绑定 + zhuzhao client body 未带 → 恒空）——双侧修复（handler 头值兜底 + client body 补 request_id）；② 容器崩溃循环（默认 configs/config.yaml 缺失即 fatal）→ env-only 模式 + Dockerfile 拷贝 configs；③ fail-closed 扩至 self_sk（回调签名身份缺失=zhuzhao 验签必 401）与空 queue；④ wire 清理对补齐（client/inspector/readyz-redis Close）；⑤ 本表 action_id 参数名/readyz 行/job_id 过滤/Scheduler 措辞修正 + README quickstart |
 | 2026-09-04 | **能力目录（capability_registry）方案待定**（§4 新增子节）：现状 = 任务定义带提交方指定 `callback_url`、无跨服务能力发现；方案（**未拍板**）= 执行端自注册 code→路由入 taskrunner DB，提交只认 `action_code`、提交时解析快照、两级路由（跨服务目录 + 服务内 Registry），显式 `callback_url` 保留覆盖；开放点：注册表归属 / 注册方式 / 解析时机 / 覆盖保留 / 与密钥环多对端合并——待讨论定稿 |
 | 2026-09-04 | **回调消息体约定 + 统一 body schema**（§4 回调契约补充）：业务参数 `params` 统一走回调 body（唯一业务负载通道、进 AK/SK 签名）；路由标识走路径、链路标识走 header、鉴权走签名层——各归其位；统一回调 schema `{task_id, request_id, params}` 为执行端 SDK 入口约定，加能力 = 注册 code + 写 Handler 回调入口零改动；params 存储（Asynq payload + job_runs）与传输（body）分离 |
+| 2026-09-07 | 目标架构注记入档（§2/§4）：zhuzhao 演进为 **API 网关 + IAM**（薄网关，不持业务能力），业务数据/能力下沉各服务；动作归属泛化为「能力属主服务」——各服务挂自己的动作端点，taskrunner 统一调度（xxl-job 一调度中心 + N 执行器形态），handler 随数据迁移、taskrunner 仅改路由指向；多服务时代启用 owner_service / 多调用方 credential 预留；与「能力目录」方案（端点自注册）互为表里 |

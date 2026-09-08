@@ -6,9 +6,10 @@ require (
 	github.com/gin-gonic/gin v1.12.0
 	github.com/google/uuid v1.6.0
 	github.com/hibiken/asynq v0.26.0
+	github.com/redis/go-redis/v9 v9.22.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/viper v1.21.0
-	github.com/tracerbiubiubiu/zhuzhao-utils v0.1.0
+	github.com/tracerbiubiubiu/zhuzhao-utils v0.2.0
 	modernc.org/sqlite v1.58.0
 )
 
@@ -38,7 +39,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.59.0 // indirect
-	github.com/redis/go-redis/v9 v9.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sagikazarmark/locafero v0.11.0 // indirect
 	github.com/sourcegraph/conc v0.3.1-0.20240121214520-5f936abd7ae8 // indirect
@@ -63,6 +63,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
-
-// 过渡：本地引用未发版的 aksk 包（zhuzhao 16 号 §9 基线；utils 发 v0.2.0 后删除）
-replace github.com/tracerbiubiubiu/zhuzhao-utils => ../zhuzhao-utils

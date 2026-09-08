@@ -31,10 +31,10 @@ zhuzhao 查执行结果：GET /v1/tasks/{id} / GET /v1/runs?request_id=…（拉
 | `POST /v1/jobs` / `GET /v1/jobs?dept=…` | 建 / 列任务定义（cron 或手动 + params + 归属标签） | 部门差异化展示 = 按标签过滤 |
 | `POST /v1/jobs/update`（原 `PATCH /v1/jobs/{id}`，C10） | 改 cron / params / 启停（body 带 job_id） | API 约定见下 |
 | `POST /v1/jobs/trigger`（原 `POST /v1/jobs/{id}/trigger`，C10） | 手动执行一次（前端「立即执行」；body 带 job_id） | |
-| `GET /v1/tasks/{id}` / `GET /v1/runs?request_id=…&dept=…` | 查当前状态 / 查执行历史 | **执行结果的唯一出口**；**C11：task 响应补 `dept` 字段、runs 加 `dept` 多值过滤**（按 `runs.dept` 快照列，一次性任务提交时由 zhuzhao 携带 dept；zhuzhao E-⑤ 可见性前提，2026-09-04 登记 / 09-07 快照语义） |
+| `GET /v1/tasks/{id}` / `GET /v1/runs?request_id=…&dept=…` | 查当前状态 / 查执行历史 | **执行结果的唯一出口**；**C11 ✅ 已实施（2026-09-07）**：task 响应补 `dept` 字段、runs 加 `dept` 多值过滤（按 `runs.dept` 快照列，一次性任务提交时由 zhuzhao 携带 dept）；E-⑤ 09-07 简化为全员可见 + dept 仅筛选标签（不再做部门级可见性隔离） |
 | `POST /v1/tasks/cancel` `/retry`（原 `/v1/tasks/{id}/cancel` `/retry`，C10）、`GET /v1/dead-letters` | 干预与死信管理（body 带 task_id） | 运维向 |
 
-**API 设计约定（2026-09-04 所有者拍板，SSOT = zhuzhao 16 号 §9）**：方法仅 GET/POST；POST URL 不携带业务信息（标识/参数全在 body；GET path/query 不受限）。上表 C10 改造随 M3 联调前实施，C11 随 zhuzhao E-⑤ 实施。
+**API 设计约定（2026-09-04 所有者拍板，SSOT = zhuzhao 16 号 §9）**：方法仅 GET/POST；POST URL 不携带业务信息（标识/参数全在 body；GET path/query 不受限）。~~上表 C10 改造随 M3 联调前实施，C11 随 zhuzhao E-⑤ 实施。~~ **C10/C11 ✅ 已实施（2026-09-07，taskrunner 99003bd + zhuzhao 5151e86/c20b73b——哈希为 zhuzhao 历史重写后现行值，对齐 16 号 E-⑦ 行）**。
 
 所有请求带 **AK/SK HMAC 签名**（zhuzhao client 以自身 SK 签名，taskrunner 验签——2026-09-03 基线修订，覆盖当日早前「零认证/静态 Bearer 过渡」口径；utils `aksk`，基线 SSOT = zhuzhao 16 号 §9）；**写接口**（提交 / 建改定义 / 触发 / 取消 / 重试）显式携带 `actor`（调用人工号）与 `source_ip`——taskrunner 原样存档仅作审计归因（actor 入签名覆盖，不可伪造）。
 
@@ -93,8 +93,8 @@ var registry = map[string]JobHandler{
 
 | taskrunner 里程碑 | zhuzhao 侧需要就绪 |
 |---|---|
-| M2 HTTP API | 2.2 选型定案；2.3 / 2.4 开发中（联调依赖） |
-| M3 首个预置动作 | 2.1（`audit_archive` handler + 端点）；2.5 提交日志；对齐 zhuzhao `docs/phase3/03-audit-l2.md`（B11②） |
+| M2 HTTP API | ✅ 已完成：2.2 定案（不做前置校验）+ 2.3 / 2.4 已实施（含 C10/C11 契约改造） |
+| M3 首个预置动作 | ✅ zhuzhao 侧就绪：2.1（`audit_archive` handler + 端点 ✅）；2.5 提交日志 ✅；对齐 zhuzhao `docs/phase3/03-audit-l2.md`（B11②）；E2E 已预演，仅剩部署侧联调 |
 
 ## 4. 典型用例：审批通过 → activelist 加值 + 业务平台操作（2026-09-04 记录）
 

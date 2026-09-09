@@ -20,7 +20,14 @@ type Config struct {
 		DB       int    `mapstructure:"db"`
 	}
 	DB struct {
-		Path string `mapstructure:"path"` // SQLite（B3：迁移 PG 前的既有实现）
+		Driver   string `mapstructure:"driver"` // sqlite | pg（C7；默认 sqlite，开发/单测零依赖）
+		Path     string `mapstructure:"path"`   // sqlite 文件路径
+		Host     string `mapstructure:"host"`
+		Port     int    `mapstructure:"port"`
+		User     string `mapstructure:"user"`
+		Password string `mapstructure:"password"`
+		DBName   string `mapstructure:"dbname"`
+		SSLMode  string `mapstructure:"sslmode"`
 	}
 	Queue           string        `mapstructure:"queue"`
 	Concurrency     int           `mapstructure:"concurrency"`
@@ -71,7 +78,15 @@ func Load(path string) (*Config, error) {
 	bind("redis.password", "TASKRUNNER_REDIS_PASSWORD", "")
 	viper.BindEnv("redis.db", "TASKRUNNER_REDIS_DB")
 	viper.SetDefault("redis.db", 0)
+	bind("db.driver", "TASKRUNNER_DB_DRIVER", "sqlite")
 	bind("db.path", "TASKRUNNER_DB_PATH", "data/taskrunner.db")
+	bind("db.host", "TASKRUNNER_DB_HOST", "127.0.0.1")
+	viper.BindEnv("db.port", "TASKRUNNER_DB_PORT")
+	viper.SetDefault("db.port", 5432)
+	bind("db.user", "TASKRUNNER_DB_USER", "")
+	viper.BindEnv("db.password", "TASKRUNNER_DB_PASSWORD")
+	bind("db.dbname", "TASKRUNNER_DB_NAME", "")
+	bind("db.sslmode", "TASKRUNNER_DB_SSLMODE", "disable")
 	bind("queue", "TASKRUNNER_QUEUE", "jobs")
 	viper.BindEnv("concurrency", "TASKRUNNER_CONCURRENCY")
 	viper.SetDefault("concurrency", 10)
@@ -104,6 +119,10 @@ func Load(path string) (*Config, error) {
 	// fail-closed：验签密钥环为空 = API 完全裸奔——拒绝启动（对齐 zhuzhao internal_jobs 拍板）
 	if len(cfg.Security.Callers) == 0 {
 		return nil, fmt.Errorf("security.callers 为空（env TASKRUNNER_CALLER_ZHUZHAO_SK 注入 zhuzhao 的 SK）——API 不允许无验签启动")
+	}
+	// fail-closed：driver=pg 但库名缺失 → DSN 无法定位库，拒绝启动
+	if cfg.DB.Driver == "pg" && cfg.DB.DBName == "" {
+		return nil, fmt.Errorf("db.driver=pg 需配置 db.dbname（env TASKRUNNER_DB_NAME）")
 	}
 	// fail-closed：C9 回调签名身份缺失 = 每次回调被 zhuzhao /internal 验签 401 → 无限重试
 	if cfg.Security.SelfAK == "" || cfg.Security.SelfSK == "" {

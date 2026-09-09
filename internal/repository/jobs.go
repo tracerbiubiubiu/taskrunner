@@ -35,7 +35,9 @@ type Job struct {
 	UpdatedAt    time.Time
 }
 
-const jobsSchema = `
+// 列集一致，自增/布尔/时间类型按驱动方言。
+const (
+	sqliteJobsSchema = `
 CREATE TABLE IF NOT EXISTS jobs (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
 	job_id        TEXT NOT NULL UNIQUE,
@@ -54,6 +56,31 @@ CREATE TABLE IF NOT EXISTS jobs (
 	created_at    TIMESTAMP NOT NULL,
 	updated_at    TIMESTAMP NOT NULL
 );
+`
+	pgJobsSchema = `
+CREATE TABLE IF NOT EXISTS jobs (
+	id            BIGSERIAL PRIMARY KEY,
+	job_id        TEXT NOT NULL UNIQUE,
+	action_id     TEXT NOT NULL,
+	trigger_type  TEXT NOT NULL DEFAULT 'manual',
+	callback_url  TEXT NOT NULL DEFAULT '',
+	cron_spec     TEXT NOT NULL DEFAULT '',
+	params        TEXT NOT NULL DEFAULT '{}',
+	dept          TEXT NOT NULL DEFAULT '',
+	enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+	timeout_secs  INTEGER NOT NULL DEFAULT 0,
+	description   TEXT NOT NULL DEFAULT '',
+	created_by    TEXT NOT NULL DEFAULT '',
+	owner_service TEXT NOT NULL DEFAULT 'zhuzhao',
+	next_run      TIMESTAMPTZ,
+	created_at    TIMESTAMPTZ NOT NULL,
+	updated_at    TIMESTAMPTZ NOT NULL
+);
+`
+)
+
+// 两驱动共用索引（CREATE INDEX IF NOT EXISTS 方言中立）。
+const jobsIndexes = `
 CREATE INDEX IF NOT EXISTS idx_jobs_dept ON jobs(dept);
 CREATE INDEX IF NOT EXISTS idx_jobs_next_run ON jobs(enabled, trigger_type, next_run);
 `
@@ -61,7 +88,10 @@ CREATE INDEX IF NOT EXISTS idx_jobs_next_run ON jobs(enabled, trigger_type, next
 const jobsCols = `job_id, action_id, trigger_type, callback_url, cron_spec, params, dept, enabled,
 	timeout_secs, description, created_by, owner_service, next_run, created_at, updated_at`
 
-func init() { extraSchemas = append(extraSchemas, jobsSchema) }
+func init() {
+	extraSchemas[DriverSQLite] = append(extraSchemas[DriverSQLite], sqliteJobsSchema)
+	extraSchemas[DriverPG] = append(extraSchemas[DriverPG], pgJobsSchema, jobsIndexes)
+}
 
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
@@ -79,7 +109,7 @@ func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 
 // CreateJob 新建任务定义。nextRun 由调用方算好传入（cron 且 enabled 时非空）。
 func (s *Store) CreateJob(ctx context.Context, j Job) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.exec(ctx, `
 INSERT INTO jobs (job_id, action_id, trigger_type, callback_url, cron_spec, params, dept,
                   enabled, timeout_secs, description, created_by, owner_service, next_run, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -92,12 +122,12 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (s *Store) GetJob(ctx context.Context, jobID string) (*Job, error) {
-	return scanJob(s.db.QueryRowContext(ctx, `SELECT `+jobsCols+` FROM jobs WHERE job_id = ?`, jobID))
+	return scanJob(s.queryRow(ctx, `SELECT `+jobsCols+` FROM jobs WHERE job_id = ?`, jobID))
 }
 
 // UpdateJob 更新任务定义（PATCH 语义：调用方已合并好整行）。nextRun 同 CreateJob。
 func (s *Store) UpdateJob(ctx context.Context, j Job) error {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.exec(ctx, `
 UPDATE jobs SET action_id=?, trigger_type=?, callback_url=?, cron_spec=?, params=?, dept=?,
                  enabled=?, timeout_secs=?, description=?, next_run=?, updated_at=? WHERE job_id=?`,
 		j.ActionID, j.TriggerType, j.CallbackURL, j.CronSpec, j.Params, j.Dept,
@@ -133,7 +163,7 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, int64, error
 	}
 
 	var total int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs`+where, args...).Scan(&total); err != nil {
+	if err := s.queryRow(ctx, `SELECT COUNT(*) FROM jobs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("store: count jobs: %w", err)
 	}
 
@@ -145,7 +175,7 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, int64, error
 		size = 50
 	}
 	q := `SELECT ` + jobsCols + ` FROM jobs` + where + ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
-	rows, err := s.db.QueryContext(ctx, q, append(args, size, (page-1)*size)...)
+	rows, err := s.query(ctx, q, append(args, size, (page-1)*size)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: list jobs: %w", err)
 	}
@@ -163,8 +193,8 @@ func (s *Store) ListJobs(ctx context.Context, f JobFilter) ([]*Job, int64, error
 
 // ListDueCronJobs 取出到期待触发的 cron 定义（cronloop 每 tick 调用）。
 func (s *Store) ListDueCronJobs(ctx context.Context, now time.Time) ([]*Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+jobsCols+` FROM jobs
-WHERE enabled = 1 AND trigger_type = 'cron' AND next_run IS NOT NULL AND next_run <= ?`, now)
+	rows, err := s.query(ctx, `SELECT `+jobsCols+` FROM jobs
+WHERE enabled AND trigger_type = 'cron' AND next_run IS NOT NULL AND next_run <= ?`, now)
 	if err != nil {
 		return nil, fmt.Errorf("store: list due jobs: %w", err)
 	}
@@ -182,7 +212,7 @@ WHERE enabled = 1 AND trigger_type = 'cron' AND next_run IS NOT NULL AND next_ru
 
 // UpdateJobNextRun 推进下次触发时间。
 func (s *Store) UpdateJobNextRun(ctx context.Context, jobID string, next time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET next_run = ?, updated_at = ? WHERE job_id = ?`,
+	_, err := s.exec(ctx, `UPDATE jobs SET next_run = ?, updated_at = ? WHERE job_id = ?`,
 		next, time.Now(), jobID)
 	if err != nil {
 		return fmt.Errorf("store: update next_run: %w", err)

@@ -211,7 +211,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 **执行记录落库**（不存文件、不依赖 Asynq/Redis 自带记录——Redis 只保队列运转，撑不起按 request_id/action/时间段的查询）：
 
-- 存储：**独立 DB**。~~SQLite 起步~~ ✅ **拍板统一 PG（2026-09-03）**：迁独立 PG 数据库（utils `postgres` + pgx，schema 不变，随 M3/M4 C7 落地）；SQLite 保留为 M1/M2 已交付实现（`database/sql` 接口无感切换）；
+- 存储：**独立 DB**。~~SQLite 起步~~ ✅ **统一 PG，C7 已落地（2026-09-08）**：repository 双驱动（`db.driver: sqlite | pg`，默认 sqlite 供开发/单测零依赖；pg = `database/sql` + pgx stdlib，DSN 由 utils `postgres.Config` 构造）——schema 方言双版（PG：BIGSERIAL / BOOLEAN / TIMESTAMPTZ），查询统一 `?` 编写、PG 执行前机械转 `$n`；PG 集成测试 env 门控（`TASKRUNNER_TEST_PG_DSN`）覆盖全生命周期；
 - 最小 schema：`task_id`、`request_id`、`action`、`status`（pending / running / succeeded / failed / dead / canceled——canceled 为 API 取消终态，仅未开始的任务）、`attempts`、`callback_url`、`dept`（归属标签**快照列**——提交时从 job 定义或请求带入、一次性任务由 zhuzhao 携带；C11 查询按此过滤、不 JOIN jobs，2026-09-07）、`error`、`duration_ms`、`submitted_by` / `source_ip`（zhuzhao 透传的原始调用人，cron 触发为空，仅审计归因）、`enqueued_at` / `started_at` / `finished_at`；
 - 存储层代码放**本仓库 `internal/repository`**（2026-09-04 结构重构，原 `internal/store`）：job_runs 是 taskrunner 领域 schema，**不放 zhuzhao-utils**（utils 只收通用件；出现第二个同类消费者再考虑下沉）；
 - 保留策略 ⚠️ 落地时定（建议：保留期可配置 + 定时清理，思路同审计归档；`submitted_by` / `source_ip` 属个人信息，同受保留期约束）。
@@ -248,7 +248,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **独立仓库**（本仓库，可独立部署）；
 - **独立部署**（独立进程/容器，不与 zhuzhao 布一块——zhuzhao 只作网关调用各能力、拉起各任务）；
 - **独立 Redis**（Asynq 队列归属 taskrunner，能力自包含，同 activelist 独立库原则）。口径：指 Redis 命名空间/库独立归属 taskrunner，**不必然新增一套 Redis 部署**，与 ADR-002「复用现有 Redis、不新增基础设施」不冲突，按部署环境落地；
-- **独立 DB**（`job_runs` 归 taskrunner 自有）。~~SQLite 起步~~ ✅ **拍板统一 PG（2026-09-03，基线 §8/zhuzhao 16 号 §9 C7）**：迁独立 PG 数据库（复用 utils `postgres`，schema 不变，约半天，随 M3/M4）；SQLite 保留为 M1/M2 已交付里程碑实现；
+- **独立 DB**（`job_runs` 归 taskrunner 自有）。✅ **C7 已落地（2026-09-08）**：双驱动（sqlite / pg），PG 经 env `TASKRUNNER_DB_DRIVER=pg + TASKRUNNER_DB_HOST/PORT/USER/PASSWORD/NAME/SSLMODE` 配置；readyz 检 Redis + PG；
 - **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + cron 循环同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要；**配套：cronloop 需先加分布式锁**，见 §5 执行模型）；`/monitor` 随容器同端口暴露，仅内网可达；
 - 公共工具统一引自 [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils)：`logger`（应用日志）、`postgres`（迁 PG 时）、`errcode` + `response`（API 统一响应）；`redis` 包用不上（Asynq 走自己的 `RedisClientOpt`）。依赖 utils（独立通用工具库）**不属于**「不反向依赖」的禁止范围。
 
@@ -303,7 +303,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 ⚠️ 随 M2/M3 落地细化（M2 已定案部分随实现入档）：
 - ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；
 - ~~credential 具体形式~~ ✅ M2 定案：静态 Bearer token（`TASKRUNNER_API_TOKEN`）——**2026-09-03 被 AK/SK 基线修订覆盖：Bearer → AK/SK HMAC 验签**（utils `aksk`，C2/C8）；
-- **公共能力对齐清单（zhuzhao 16 号 §9 C1–C9；2026-09-04 结构重构批量收口）**：~~C1~~ ✅ 统一访问日志中间件（rid 读头/回显 + X-Operator 兜底 `system`）；~~C2~~ ✅ API 验签 AK/SK HMAC（Bearer 已移除，密钥环空拒绝启动）；~~C4~~ ✅ `/readyz`（Redis ping + SQLite 探针）；~~C5~~ ✅ Dockerfile `TZ=Asia/Shanghai`；~~C6~~ ✅ viper yaml+env（TASKRUNNER_* 全兼容）；~~C9~~ ✅ 回调以自身 SK 签名 + rid 透传；**C3**（compose 双 network）与 **C7**（SQLite→PG）随部署批次；
+- **公共能力对齐清单（zhuzhao 16 号 §9 C1–C9；2026-09-04 结构重构批量收口）**：~~C1~~ ✅ 统一访问日志中间件（rid 读头/回显 + X-Operator 兜底 `system`）；~~C2~~ ✅ API 验签 AK/SK HMAC（Bearer 已移除，密钥环空拒绝启动）；~~C4~~ ✅ `/readyz`（Redis ping + SQLite 探针）；~~C5~~ ✅ Dockerfile `TZ=Asia/Shanghai`；~~C6~~ ✅ viper yaml+env（TASKRUNNER_* 全兼容）；~~C9~~ ✅ 回调以自身 SK 签名 + rid 透传；**C3**（compose 双 network）随部署批次；~~C7~~ ✅ 已落地（2026-09-08，双驱动 + PG 集成测试门控 env）；
 - ~~回调鉴权机制（taskrunner → zhuzhao `/internal`）~~ ✅ 拍板定案（2026-09-03）：不做独立机制——信任边界 = 内网隔离 + `callback_url` 由 zhuzhao 提交时指定；**2026-09-03 被 AK/SK 基线修订覆盖**：回调请求带 HMAC 签名（§4 安全边界，C9，zhuzhao `/internal` 验签），capability URL 增强作废，专用 network 降为第二道防线；
 - ~~`GET /v1/tasks/{id}` 状态数据源~~ ✅ M2 定案：**job_runs 为主 + Asynq Inspector 补充 in-flight 实时态**（pending/active/retry/scheduled 只在 Redis，以 `live_state` 字段并返回）；
 - ~~action 校验方式~~ ✅ M2 定案：**不做前置校验**——不存在 / 未注册的 action 经回调 4xx 快速失败（non-retryable，failed 可见）；zhuzhao 清单端点方案保留为可选增强；
@@ -365,6 +365,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-07 | 目标架构注记入档（§2/§4）：zhuzhao 演进为 **API 网关 + IAM**（薄网关，不持业务能力），业务数据/能力下沉各服务；动作归属泛化为「能力属主服务」——各服务挂自己的动作端点，taskrunner 统一调度（xxl-job 一调度中心 + N 执行器形态），handler 随数据迁移、taskrunner 仅改路由指向；多服务时代启用 owner_service / 多调用方 credential 预留；与「能力目录」方案（端点自注册）互为表里 |
 | 2026-09-07 | **日志描述全面性整理**（§6/§7）：① run_id 取消——job_runs 一行一任务、attempts 覆盖更新，无独立 run 行；打点定为四件套 `request_id / task_id / action / attempt`（对齐实现），ES 演进字段清单同步；② 新增日志级别约定（成功 Info / 将重试 Warn / 死信·丢弃·启动失败 Error，告警按此建立）；③ 脱敏与截断边界（params/报文当前全量、错误片段截 1KB 入 job_runs.error，脱敏后置：日志出内网/入 ES 时启动，落点 C1 钩子）；④ 应用日志 MaxAge 必须显式配置（lumberjack 零值不限天数，含个人信息，建议与 job_runs 保留期同档随 M4 定值）；⑤ §7 补「访问日志（技术层）」行成四层全景；双写路径（文件+stdout）入档；⑥ 复审补漏：§6 status 枚举补 `canceled`（API 取消终态，M2 引入时漏同步） |
 | 2026-09-08 | **外部评审验证与修复**：① 高·回调 body 字段勘误——实现两侧均为 `action`（zhuzhao jobs_handler / taskrunner client 一致，契约通），§4 SSOT 误写 action_id 已修订（不改实现，避免打挂已上线 E-②）；② 中·RetryTask 竞态防护——ResetPending 改条件更新（WHERE failed/dead），0 行 → 409，防终态被覆盖回 pending；③ 中·4xx 终败日志 Warn→Error（§6 级别约定同步）；④ 中·日志轮转参数落地（config 三字段 + MaxAge 默认 90 天）；⑤ 低·命名口径入档（载荷/回调域 action、定义域 action_id、目录 action_code）；⑥ 后置项确认维持（cron 分布式锁 / overlap_policy / /monitor / wire 生成器） |
+| 2026-09-08 | **C7 落地：存储双驱动（SQLite / PostgreSQL）**——repository 查询统一 `?` 编写、PG 执行前机械转 `$n`（一套 SQL 两驱动）；DDL 方言双版（BIGSERIAL/BOOLEAN/TIMESTAMPTZ）；config 增 `db.driver/db.host/port/user/password/dbname/sslmode`（env `TASKRUNNER_DB_*`，driver=pg 缺 dbname 拒绝启动）；PG 路径 DSN 由 utils `postgres.Config` 构造；readyz 即检 PG；新增 PG 集成测试（`TASKRUNNER_TEST_PG_DSN` 门控，本地 dev PG 实测全生命周期 PASS） |
 | 2026-09-07 | 执行模型与扩展后置项入档（§5/§8/§10）：§5 新增「执行模型」（固定协程池、重试=延迟重投递非自循环、租约崩溃恢复、多副本队列安全 + cronloop 分布式锁配套，§8 同步）；§10 后置项三则：优先级队列（加权防饥饿、场景触发）、一次性延迟任务（ProcessAt）、编排（红线=不做通用流程引擎；首选外部 DAG 调 API、最小替代=on_success 钩子+result 列） |
 | 2026-09-07 | §4 能力目录补「演进平滑性」：手填 → 目录为纯增量三步（建表自注册 / 解析切换 / 可选清理），执行链路零改动、无停机无迁移、每步可回滚；唯一摩擦（双真相来源）以快照可追溯 + 使用纪律化解 |
 | 2026-09-07 | **回调端点 C10 约定化 + dept 快照列 + 口径同步**（§4/§5/§6）：① 回调端点改 `POST /internal/jobs/callback` + body.action（方案 A 拍板；~~路径 /internal/jobs/:action_id~~ 废弃；统一 body schema 补 action_id；zhuzhao 16 号 E-② 同步定案）；② C11 runs dept 过滤改 **`runs.dept` 快照列**（提交时从 job/请求带入、一次性任务由 zhuzhao 携带、不 JOIN jobs——堵一次性任务/删 job/转派三缺口；§6 schema 同步）；③ dept 过滤边界明示（信任前提=zhuzhao 唯一入口 / fail-closed 契约 / 部门继承扩展点）；④ 回调超时措辞同步 §10（30s + env）；⑤ 能力目录术语统一为 `action_id`；⑥ zhuzhao-integration §2.2 更新为已定案（不做前置校验，可选增强） |

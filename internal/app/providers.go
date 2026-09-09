@@ -12,6 +12,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	utilslogger "github.com/tracerbiubiubiu/zhuzhao-utils/logger"
+	"github.com/tracerbiubiubiu/zhuzhao-utils/postgres"
 
 	"github.com/tracerbiubiubiu/taskrunner/internal/callback"
 	"github.com/tracerbiubiubiu/taskrunner/internal/config"
@@ -29,9 +30,21 @@ func provideLogger(cfg *config.Config) *slog.Logger {
 	})
 }
 
-// provideStore SQLite 仓储（B3：迁移 PG 前的既有实现；database/sql 接口无感切换）。
+// provideStore 仓储（C7 双驱动：sqlite 开发/单测零依赖；pg 走 utils postgres 构造 DSN，
+// database/sql + pgx stdlib 接口无感切换）。
 func provideStore(cfg *config.Config) (*repository.Store, func(), error) {
-	st, err := repository.Open(cfg.DB.Path)
+	var st *repository.Store
+	var err error
+	if cfg.DB.Driver == repository.DriverPG {
+		pc := postgres.Config{
+			Host: cfg.DB.Host, Port: cfg.DB.Port, User: cfg.DB.User, Password: cfg.DB.Password,
+			DBName: cfg.DB.DBName, SSLMode: cfg.DB.SSLMode, ApplicationName: "taskrunner",
+		}
+		pc.ApplyDefaults()
+		st, err = repository.OpenPG(pc.DSN())
+	} else {
+		st, err = repository.Open(cfg.DB.Path)
+	}
 	if err != nil {
 		return nil, nil, err
 	}

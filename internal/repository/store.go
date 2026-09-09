@@ -1,4 +1,5 @@
-// Package store 维护 job_runs（taskrunner 自有 SQLite，设计文档 §6）。
+// Package store 维护 job_runs（taskrunner 自有存储，设计文档 §6；C7：SQLite / PostgreSQL 双驱动）。
+// 查询统一 `?` 占位符编写，PG 路径执行前机械转换为 $n（两条驱动共用一套 SQL）。
 // 一行 = 一个任务的完整生命周期：入队 pending → running → succeeded / failed（可重试）/ dead（重试耗尽）。
 package repository
 
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib" // pgx stdlib 驱动注册（C7）
 	_ "modernc.org/sqlite"
 )
 
@@ -27,8 +29,15 @@ const (
 
 var ErrNotFound = errors.New("store: job_run not found")
 
+// 存储驱动（C7）。
+const (
+	DriverSQLite = "sqlite"
+	DriverPG     = "pg"
+)
+
 type Store struct {
 	db *sql.DB
+	pg bool // true = PostgreSQL：执行前做 ?→$n 占位符转换
 }
 
 // Run job_runs 一行。
@@ -51,7 +60,8 @@ type Run struct {
 	FinishedAt  sql.NullTime
 }
 
-var extraSchemas []string // 其他文件（如 jobs.go）注册自己的建表语句
+// extraSchemas 其他文件（如 jobs.go）按驱动注册的建表语句。
+var extraSchemas = map[string][]string{}
 
 const schema = `
 CREATE TABLE IF NOT EXISTS job_runs (
@@ -84,40 +94,122 @@ CREATE INDEX IF NOT EXISTS idx_job_runs_enqueued_at ON job_runs(enqueued_at);
 `
 
 // Open 打开（或创建）SQLite 库并建表。WAL + busy_timeout 适配单容器单进程部署。
-func Open(path string) (*Store, error) {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("store: create db dir: %w", err)
+func Open(path string) (*Store, error) { return open(DriverSQLite, path) }
+
+// OpenPG 打开 PostgreSQL 库并建表（C7：连接串如 postgres://user:pass@host:5432/dbname?sslmode=disable）。
+// PG 为全新建库：schema 即最终形态，无 SQLite 旧库列迁移问题。
+func OpenPG(dsn string) (*Store, error) { return open(DriverPG, dsn) }
+
+func open(driver, target string) (*Store, error) {
+	var db *sql.DB
+	var err error
+	switch driver {
+	case DriverSQLite:
+		if dir := filepath.Dir(target); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, fmt.Errorf("store: create db dir: %w", err)
+			}
+		}
+		// WAL + busy_timeout 适配单容器单进程部署
+		db, err = sql.Open("sqlite", target+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(1) // SQLite 单写者：串行写，读走 WAL
+	case DriverPG:
+		db, err = sql.Open("pgx", target)
+		if err != nil {
+			return nil, err
+		}
+		db.SetMaxOpenConns(10)
+	default:
+		return nil, fmt.Errorf("store: unknown driver %q", driver)
+	}
+
+	for _, ddl := range []string{schemaFor(driver)} {
+		if _, err := db.Exec(ddl); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: migrate: %w", err)
 		}
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1) // SQLite 单写者：串行写，读走 WAL
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: migrate: %w", err)
-	}
-	for _, extra := range extraSchemas {
+	for _, extra := range extraSchemas[driver] {
 		if _, err := db.Exec(extra); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("store: migrate extra: %w", err)
+			return nil, fmt.Errorf("store: migrate extra(%s): %w", driver, err)
 		}
 	}
-	// 轻量列迁移（SQLite 无 ADD COLUMN IF NOT EXISTS）：CREATE TABLE IF NOT EXISTS 对
-	// 已存在的旧库空转——新列（job_id/dept/params）必须在此补齐，否则旧库升级后
-	// INSERT/SELECT 报 no column named ... 全量失败。新增列在此登记。
-	if err := migrateColumns(db); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("store: migrate columns: %w", err)
+	// 轻量列迁移仅 SQLite 存在（旧库升级）；PG 全新建库即最终形态
+	if driver == DriverSQLite {
+		if err := migrateColumns(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: migrate columns: %w", err)
+		}
 	}
 	// 索引最后建：引用新列的索引（如 idx_job_runs_job_id）在旧库补列前会失败
 	if _, err := db.Exec(indexes); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate indexes: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, pg: driver == DriverPG}, nil
+}
+
+// schemaFor 按驱动返回建表 DDL（列集一致，仅自增/类型方言差异）。
+func schemaFor(driver string) string {
+	if driver == DriverPG {
+		return `
+CREATE TABLE IF NOT EXISTS job_runs (
+	id            BIGSERIAL PRIMARY KEY,
+	task_id       TEXT NOT NULL UNIQUE,
+	request_id    TEXT NOT NULL DEFAULT '',
+	action        TEXT NOT NULL,
+	job_id        TEXT NOT NULL DEFAULT '',
+	dept          TEXT NOT NULL DEFAULT '',
+	params        TEXT NOT NULL DEFAULT '{}',
+	callback_url  TEXT NOT NULL DEFAULT '',
+	status        TEXT NOT NULL DEFAULT 'pending',
+	attempts      INTEGER NOT NULL DEFAULT 0,
+	error         TEXT NOT NULL DEFAULT '',
+	duration_ms   BIGINT NOT NULL DEFAULT 0,
+	submitted_by  TEXT NOT NULL DEFAULT '',
+	source_ip     TEXT NOT NULL DEFAULT '',
+	enqueued_at   TIMESTAMPTZ NOT NULL,
+	started_at    TIMESTAMPTZ,
+	finished_at   TIMESTAMPTZ
+);
+`
+	}
+	return schema
+}
+
+// pgq PG 路径把 `?` 占位符顺序转换为 $1..$n（SQL 中无字面量 `?`，机械替换安全；
+// SQLite 原生支持 `?`，原样返回）。单查询内含字符串字面量 `?` 时不可用——当前无此场景。
+func (s *Store) pgq(query string) string {
+	if !s.pg {
+		return query
+	}
+	var b strings.Builder
+	n := 0
+	for _, c := range query {
+		if c == '?' {
+			n++
+			b.WriteString(fmt.Sprintf("$%d", n))
+			continue
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
+
+func (s *Store) exec(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	return s.db.ExecContext(ctx, s.pgq(q), args...)
+}
+
+func (s *Store) query(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, s.pgq(q), args...)
+}
+
+func (s *Store) queryRow(ctx context.Context, q string, args ...any) *sql.Row {
+	return s.db.QueryRowContext(ctx, s.pgq(q), args...)
 }
 
 // migrateColumns 按列判存补齐旧库缺失列（幂等：新库全部命中跳过）。
@@ -160,7 +252,7 @@ func (s *Store) Ping() error {
 
 // InsertPending 入队时写入 pending 行；task_id 重复（幂等重提）返回已存在错误。
 func (s *Store) InsertPending(ctx context.Context, r Run) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.exec(ctx, `
 INSERT INTO job_runs (task_id, request_id, action, job_id, dept, params, callback_url, status, submitted_by, source_ip, enqueued_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.Params, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
@@ -171,7 +263,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 }
 
 func (s *Store) GetByTaskID(ctx context.Context, taskID string) (*Run, error) {
-	row := s.db.QueryRowContext(ctx, `
+	row := s.queryRow(ctx, `
 SELECT task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
        submitted_by, source_ip, enqueued_at, started_at, finished_at
 FROM job_runs WHERE task_id = ?`, taskID)
@@ -191,7 +283,7 @@ FROM job_runs WHERE task_id = ?`, taskID)
 // 条件更新（WHERE status IN failed/dead）：RunTask 之后 worker 可能已完成并写入终态，
 // 0 行 = 状态已被并发改变 → 返回 false，调用方按冲突处理（防止把 succeeded 覆盖回 pending）。
 func (s *Store) ResetPendingIfTerminal(ctx context.Context, taskID string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.exec(ctx, `
 UPDATE job_runs SET status = ?, error = '', started_at = NULL, finished_at = NULL
 WHERE task_id = ? AND status IN (?, ?)`,
 		StatusPending, taskID, StatusFailed, StatusDead)
@@ -208,7 +300,7 @@ WHERE task_id = ? AND status IN (?, ?)`,
 // MarkCanceledIfPending 取消未开始的任务。条件更新（WHERE status=pending）：
 // 影响行数为 0 说明检查后状态已被并发改变（如 worker 刚取走），返回 false 由调用方按冲突处理。
 func (s *Store) MarkCanceledIfPending(ctx context.Context, taskID, errMsg string, finishedAt time.Time) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.exec(ctx, `
 UPDATE job_runs SET status = ?, error = ?, finished_at = ? WHERE task_id = ? AND status = ?`,
 		StatusCanceled, errMsg, finishedAt, taskID, StatusPending)
 	if err != nil {
@@ -271,7 +363,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	}
 
 	var total int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_runs`+where, args...).Scan(&total); err != nil {
+	if err := s.queryRow(ctx, `SELECT COUNT(*) FROM job_runs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("store: count runs: %w", err)
 	}
 
@@ -285,7 +377,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	q := `SELECT task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
        submitted_by, source_ip, enqueued_at, started_at, finished_at FROM job_runs` + where +
 		` ORDER BY enqueued_at DESC LIMIT ? OFFSET ?`
-	rows, err := s.db.QueryContext(ctx, q, append(args, size, (page-1)*size)...)
+	rows, err := s.query(ctx, q, append(args, size, (page-1)*size)...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: list runs: %w", err)
 	}
@@ -308,7 +400,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 // 行不存在（入队成功但落库失败的残留）→ 返回错误——worker 侧据此记日志，
 // 避免任务执行全程无任何 job_runs 记录的「隐形任务」静默发生。
 func (s *Store) MarkRunning(ctx context.Context, taskID string, attempt int, startedAt time.Time) error {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.exec(ctx, `
 UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = '' WHERE task_id = ?`,
 		StatusRunning, attempt, startedAt, taskID)
 	if err != nil {
@@ -327,7 +419,7 @@ func (s *Store) Finish(ctx context.Context, taskID, status, errMsg string, attem
 	if durationMS < 0 {
 		durationMS = 0
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.exec(ctx, `
 UPDATE job_runs
 SET status = ?, attempts = ?, error = ?, finished_at = ?, duration_ms = ?
 WHERE task_id = ?`,

@@ -28,8 +28,11 @@ type Config struct {
 	CallbackTimeout time.Duration `mapstructure:"callback_timeout"`
 	CronTick        time.Duration `mapstructure:"cron_tick"`
 	Log             struct {
-		Level string `mapstructure:"level"`
-		Dir   string `mapstructure:"dir"`
+		Level      string `mapstructure:"level"`
+		Dir        string `mapstructure:"dir"`
+		MaxSizeMB  int    `mapstructure:"max_size_mb"`
+		MaxBackups int    `mapstructure:"max_backups"`
+		MaxAgeDays int    `mapstructure:"max_age_days"`
 	}
 	// Security AK/SK（基线 §9：服务间 HMAC 签名）。Callers = 验签密钥环
 	// （预期调用方 AK→SK，当前唯一调用方 zhuzhao）；Self = 本服务签名身份

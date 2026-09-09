@@ -188,14 +188,21 @@ FROM job_runs WHERE task_id = ?`, taskID)
 }
 
 // ResetPending 死信/终败任务经 API 重试时，回到 pending（Asynq RunTask 同步重置其重试计数）。
-func (s *Store) ResetPending(ctx context.Context, taskID string) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE job_runs SET status = ?, error = '', started_at = NULL, finished_at = NULL WHERE task_id = ?`,
-		StatusPending, taskID)
+// 条件更新（WHERE status IN failed/dead）：RunTask 之后 worker 可能已完成并写入终态，
+// 0 行 = 状态已被并发改变 → 返回 false，调用方按冲突处理（防止把 succeeded 覆盖回 pending）。
+func (s *Store) ResetPendingIfTerminal(ctx context.Context, taskID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE job_runs SET status = ?, error = '', started_at = NULL, finished_at = NULL
+WHERE task_id = ? AND status IN (?, ?)`,
+		StatusPending, taskID, StatusFailed, StatusDead)
 	if err != nil {
-		return fmt.Errorf("store: reset pending: %w", err)
+		return false, fmt.Errorf("store: reset pending: %w", err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: reset pending rows: %w", err)
+	}
+	return n > 0, nil
 }
 
 // MarkCanceledIfPending 取消未开始的任务。条件更新（WHERE status=pending）：

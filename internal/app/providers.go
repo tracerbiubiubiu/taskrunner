@@ -23,7 +23,10 @@ import (
 
 // provideLogger 应用日志（utils logger：slog + lumberjack 轮转，JSON Lines 稳定字段）。
 func provideLogger(cfg *config.Config) *slog.Logger {
-	return utilslogger.New(utilslogger.Config{Level: cfg.Log.Level, Dir: cfg.Log.Dir})
+	return utilslogger.New(utilslogger.Config{
+		Level: cfg.Log.Level, Dir: cfg.Log.Dir,
+		MaxSize: cfg.Log.MaxSizeMB, MaxBackups: cfg.Log.MaxBackups, MaxAge: cfg.Log.MaxAgeDays,
+	})
 }
 
 // provideStore SQLite 仓储（B3：迁移 PG 前的既有实现；database/sql 接口无感切换）。

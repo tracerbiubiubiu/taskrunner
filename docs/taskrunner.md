@@ -105,7 +105,7 @@
   // POST /internal/jobs/callback → 按 body.action 查表分发执行
   ```
 
-- **触发链路**：cron 到点 / `trigger` / `POST /v1/tasks` → taskrunner 按 job 定义组装回调（action_id + params + request_id）→ zhuzhao 查注册表执行 handler → 结果记 `job_runs`；
+- **触发链路**：cron 到点 / `trigger` / `POST /v1/tasks` → taskrunner 按 job 定义组装回调（action + params + request_id）→ zhuzhao 查注册表执行 handler → 结果记 `job_runs`；
 - **前端入口**（若有）：执行 / 加定时 / 启停的页面在 zhuzhao，链路 = 前端 → 网关（鉴权 + 业务审计）→ taskrunner API；cron 自动触发无用户参与，只记 `job_runs`；
 - **调用人上下文透传（2026-09-03 补充）**：zhuzhao 调写接口（提交 / 建改定义 / 触发）时显式携带 `actor`（工号）与 `source_ip` 等原始信息，taskrunner **原样存档**（job 定义记 `created_by`；执行记录记 `submitted_by` / `source_ip`，cron 触发为空）并随 slog 打点（caller + actor + IP + request_id）——仅作审计归因，taskrunner 不校验、不据其做权限判断（信任边界在网关）；
 - **归属过滤（2026-09-03 补充）**：job 定义的归属标签（如 `dept`）对 taskrunner 是不透明字符串，`GET /v1/jobs?dept=…` 按值过滤，实现「不同部门看到不同预置任务」；部门语义与「能看 / 能管哪些」的权限全归 zhuzhao（策略存 zhuzhao 自有 DB，见 §11 配套清单），taskrunner 不建组织模型；跨部门**写保护**随多调用方时代再启用（同 §5 `created_by` 口径）；
@@ -128,7 +128,7 @@
   - 链路标识 `request_id` → Header `X-Request-ID`（body 内冗余携带兜底，与 header 一致）；
   - 鉴权 → 签名层（AK/SK HMAC 覆盖 body + 关键头）；
   - **业务参数 `params` → Body（唯一业务通道）**。
-- **统一回调 body schema（执行端 SDK 的入口约定）**：`{ "task_id": …, "request_id": …, "action_id": …, "params": … }`——执行端 SDK 解包统一 schema → 校验 → **按 `action_id` 查本服务 `jobs.Registry`** → 取 `params` 传 Handler；**加能力 = 注册 code + 写 Handler，回调入口零改动**；幂等（task_id）、链路（request_id）、错误映射（2xx/4xx/5xx）在 SDK 层统一处理，业务 handler 只关心 `params` 与返回值；
+- **统一回调 body schema（执行端 SDK 的入口约定）**：`{ "task_id": …, "request_id": …, "action": …, "params": … }`——执行端 SDK 解包统一 schema → 校验 → **按 `action` 查本服务 `jobs.Registry`** → 取 `params` 传 Handler；~~action_id~~ **2026-09-08 勘误**：C10 实现两侧均为 `action`（zhuzhao jobs_handler binding required / taskrunner client），此前 SSOT 误写为 action_id；**加能力 = 注册 code + 写 Handler，回调入口零改动**；幂等（task_id）、链路（request_id）、错误映射（2xx/4xx/5xx）在 SDK 层统一处理，业务 handler 只关心 `params` 与返回值；
 - **params 存储与传输分离**：存储 = 入队时 Asynq payload + 执行记录 job_runs（taskrunner 内部持久化）；传输 = 回调 body（给执行端的唯一业务通道）——两者不混。
 
 ### 能力目录（capability_registry）【方案待定 · 2026-09-04 记录，未拍板】
@@ -159,6 +159,8 @@
 - 与「密钥环多对端」合并为同一张表，还是分表。
 
 落地前需定稿。
+
+**命名口径（2026-09-08）**：载荷/回调/一次性提交域统一用 **`action`**（task.Payload、回调 body、/v1/tasks 入参）；任务定义域用 **`action_id`**（jobs 表字段、/v1/jobs 入参、Registry 键）——前者是"运行时标识"，后者是"定义字段"，历史形成、语义可区分，不作强行统一（API 已有消费方）；能力目录（未实现）将用 `action_code`，拍板时一并对齐。
 
 **演进平滑性（2026-09-07）**：从现状（提交方手填 `callback_url`）到目录是**纯增量演进**——执行链路（callback client、回调契约、执行端）零改动，因为路由信息从一开始就是数据而非代码：
 
@@ -222,9 +224,9 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 过程细节 | 回调请求/响应报文、堆栈、debug 输出 | 应用日志文件（zhuzhao-utils `logger`：slog JSON + lumberjack 轮转，**文件+stdout 双写**） | 人工排障（grep 文件）；后续采集入 ES（见下） |
 
 - 关联约定：任务执行链路统一打点四件套 `request_id` / `task_id` / `action` / `attempt`（`slog.With` 常驻前三个，attempt 随每次尝试记）——表里查到一条记录，拿 task_id 即可在日志文件中按 attempt 定位每次执行的细节。~~run_id~~ **取消（2026-09-07）**：job_runs 是「一个 task_id 一行、重试覆盖更新 attempts」的模型，不存在独立 run 行，run_id 无从定义；尝试区分由 attempt 字段承担；
-- **日志级别约定（2026-09-07）**：任务成功 = `Info`；失败但还将重试 = `Warn`；死信 / 重试耗尽 / 载荷损坏丢弃 / 组件启动失败 = `Error`；cron 到点触发、API 写操作归因 = `Info`。ES 告警规则按此建立（Error 出现即告警）；
+- **日志级别约定（2026-09-07；09-08 补 4xx 终败）**：任务成功 = `Info`；失败但还将重试 = `Warn`；**终败（4xx 不重试）= `Error`**；死信 / 重试耗尽 / 载荷损坏丢弃 / 组件启动失败 = `Error`；cron 到点触发、API 写操作归因 = `Info`。ES 告警规则按此建立（Error 出现即告警）；
 - **脱敏与截断边界（2026-09-07）**：过程日志中的 params 与回调报文**当前全量记录**（仅内网、文件留存）；错误响应片段截断 1KB 后进 `job_runs.error`，成功响应不落正文。脱敏策略后置（触发条件：日志将出内网 / 接入 ES 时启动；落点 = C1 访问日志中间件已预留的脱敏钩子 + callback 日志一处，不散改）；
-- **应用日志文件保留参数（2026-09-07）**：轮转参数走 config（utils logger：MaxSize / MaxBackups / MaxAge）。**MaxAge 必须显式配置**——lumberjack 零值为不限天数，而文件日志含工号 / IP 等个人信息，保留天数建议与 `job_runs` 保留期同档（随 M4 一并定值）；
+- **应用日志文件保留参数（2026-09-07；09-08 落地默认值）**：轮转参数走 config（utils logger：MaxSize / MaxBackups / MaxAge，env `TASKRUNNER_LOG_MAX_SIZE_MB / _MAX_BACKUPS / _MAX_AGE_DAYS`）。**MaxAge 必须显式配置**——lumberjack 零值为不限天数，而文件日志含工号 / IP 等个人信息；✅ 已实现默认 **90 天**（MaxSize 100MB / MaxBackups 不限，由天数控），M4 定 `job_runs` 保留期时可一并调整；
 - **双写路径**：utils logger 同时写文件与 stdout——容器 stdout 天然被 Docker 采集，是未来接入日志平台的第二条现成通道（与文件 shipper 二选一或并用）。
 - **ES 演进路径（2026-09-03 确认：当前无日志平台，先落文件）**：过程日志即 slog **JSON Lines**——一行一条结构化记录，字段即索引结构，上 ES 时只需加 Filebeat / Vector 等 shipper tail 日志文件（处理轮转）→ ES / Loki，**taskrunner 应用代码零改动**；前提是打点字段保持稳定命名（`request_id` / `task_id` / `action` / `attempt`），M1 起即按此约束写打点。
 
@@ -362,6 +364,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-04 | **回调消息体约定 + 统一 body schema**（§4 回调契约补充）：业务参数 `params` 统一走回调 body（唯一业务负载通道、进 AK/SK 签名）；路由标识走路径、链路标识走 header、鉴权走签名层——各归其位；统一回调 schema `{task_id, request_id, params}` 为执行端 SDK 入口约定，加能力 = 注册 code + 写 Handler 回调入口零改动；params 存储（Asynq payload + job_runs）与传输（body）分离 |
 | 2026-09-07 | 目标架构注记入档（§2/§4）：zhuzhao 演进为 **API 网关 + IAM**（薄网关，不持业务能力），业务数据/能力下沉各服务；动作归属泛化为「能力属主服务」——各服务挂自己的动作端点，taskrunner 统一调度（xxl-job 一调度中心 + N 执行器形态），handler 随数据迁移、taskrunner 仅改路由指向；多服务时代启用 owner_service / 多调用方 credential 预留；与「能力目录」方案（端点自注册）互为表里 |
 | 2026-09-07 | **日志描述全面性整理**（§6/§7）：① run_id 取消——job_runs 一行一任务、attempts 覆盖更新，无独立 run 行；打点定为四件套 `request_id / task_id / action / attempt`（对齐实现），ES 演进字段清单同步；② 新增日志级别约定（成功 Info / 将重试 Warn / 死信·丢弃·启动失败 Error，告警按此建立）；③ 脱敏与截断边界（params/报文当前全量、错误片段截 1KB 入 job_runs.error，脱敏后置：日志出内网/入 ES 时启动，落点 C1 钩子）；④ 应用日志 MaxAge 必须显式配置（lumberjack 零值不限天数，含个人信息，建议与 job_runs 保留期同档随 M4 定值）；⑤ §7 补「访问日志（技术层）」行成四层全景；双写路径（文件+stdout）入档；⑥ 复审补漏：§6 status 枚举补 `canceled`（API 取消终态，M2 引入时漏同步） |
+| 2026-09-08 | **外部评审验证与修复**：① 高·回调 body 字段勘误——实现两侧均为 `action`（zhuzhao jobs_handler / taskrunner client 一致，契约通），§4 SSOT 误写 action_id 已修订（不改实现，避免打挂已上线 E-②）；② 中·RetryTask 竞态防护——ResetPending 改条件更新（WHERE failed/dead），0 行 → 409，防终态被覆盖回 pending；③ 中·4xx 终败日志 Warn→Error（§6 级别约定同步）；④ 中·日志轮转参数落地（config 三字段 + MaxAge 默认 90 天）；⑤ 低·命名口径入档（载荷/回调域 action、定义域 action_id、目录 action_code）；⑥ 后置项确认维持（cron 分布式锁 / overlap_policy / /monitor / wire 生成器） |
 | 2026-09-07 | 执行模型与扩展后置项入档（§5/§8/§10）：§5 新增「执行模型」（固定协程池、重试=延迟重投递非自循环、租约崩溃恢复、多副本队列安全 + cronloop 分布式锁配套，§8 同步）；§10 后置项三则：优先级队列（加权防饥饿、场景触发）、一次性延迟任务（ProcessAt）、编排（红线=不做通用流程引擎；首选外部 DAG 调 API、最小替代=on_success 钩子+result 列） |
 | 2026-09-07 | §4 能力目录补「演进平滑性」：手填 → 目录为纯增量三步（建表自注册 / 解析切换 / 可选清理），执行链路零改动、无停机无迁移、每步可回滚；唯一摩擦（双真相来源）以快照可追溯 + 使用纪律化解 |
 | 2026-09-07 | **回调端点 C10 约定化 + dept 快照列 + 口径同步**（§4/§5/§6）：① 回调端点改 `POST /internal/jobs/callback` + body.action（方案 A 拍板；~~路径 /internal/jobs/:action_id~~ 废弃；统一 body schema 补 action_id；zhuzhao 16 号 E-② 同步定案）；② C11 runs dept 过滤改 **`runs.dept` 快照列**（提交时从 job/请求带入、一次性任务由 zhuzhao 携带、不 JOIN jobs——堵一次性任务/删 job/转派三缺口；§6 schema 同步）；③ dept 过滤边界明示（信任前提=zhuzhao 唯一入口 / fail-closed 契约 / 部门继承扩展点）；④ 回调超时措辞同步 §10（30s + env）；⑤ 能力目录术语统一为 `action_id`；⑥ zhuzhao-integration §2.2 更新为已定案（不做前置校验，可选增强） |

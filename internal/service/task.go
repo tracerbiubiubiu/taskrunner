@@ -293,7 +293,16 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID string) error {
 		}
 		return err
 	}
-	return s.repo.ResetPending(ctx, taskID)
+	// RunTask 后 worker 可能已瞬间完成并写入终态——条件更新 0 行即状态已变，
+	// 返回冲突而非覆盖（与 CancelTask 同类的竞态防护；此时任务在真实执行中，以 job_runs 后续终态为准）
+	ok, err := s.repo.ResetPendingIfTerminal(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return conflict("任务状态已变化（可能已被重新执行），请刷新后查看")
+	}
+	return nil
 }
 
 // ---- 任务定义 ----

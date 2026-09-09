@@ -76,7 +76,7 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		if ferr := d.Store.Finish(ctx, p.TaskID, repository.StatusFailed, err.Error(), attempt, now, time.Now()); ferr != nil {
 			logger.Error("persist failed(4xx) failed", slog.Any("err", ferr))
 		}
-		logger.Warn("task failed (non-retryable), giving up", slog.Int("attempt", attempt), slog.Any("err", err))
+		logger.Error("task failed terminally (non-retryable 4xx)", slog.Int("attempt", attempt), slog.Any("err", err))
 		return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 
 	default:

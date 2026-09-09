@@ -106,6 +106,22 @@ func TestPGFullLifecycle(t *testing.T) {
 		t.Fatal("advanced next_run should not be due")
 	}
 
+	// NullTime 空值往返（manual 任务：next_run NULL）——pgx stdlib Valuer 链路
+	if err := s.CreateJob(ctx, Job{
+		JobID: "j-manual", ActionID: "audit_archive", TriggerType: TriggerManual,
+		CallbackURL: "http://zhu.internal/internal/jobs/callback", Enabled: true,
+		CreatedAt: now, UpdatedAt: now, // NextRun 零值 → NULL
+	}); err != nil {
+		t.Fatalf("create manual job: %v", err)
+	}
+	j, err := s.GetJob(ctx, "j-manual")
+	if err != nil {
+		t.Fatalf("get manual job: %v", err)
+	}
+	if j.NextRun.Valid {
+		t.Fatal("manual job next_run should be NULL")
+	}
+
 	// 分页 + dept 多值过滤
 	runs, total, err := s.ListRuns(ctx, RunFilter{Depts: []string{"audit"}, Status: StatusSucceeded, Page: 1, PageSize: 10})
 	if err != nil {

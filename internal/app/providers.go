@@ -30,9 +30,14 @@ func provideLogger(cfg *config.Config) *slog.Logger {
 	})
 }
 
-// provideStore 仓储（C7 双驱动：sqlite 开发/单测零依赖；pg 走 utils postgres 构造 DSN，
-// database/sql + pgx stdlib 接口无感切换）。
+// provideStore 仓储（委托 OpenStore——serve 与 CLI enqueue 共用同一开库逻辑）。
 func provideStore(cfg *config.Config) (*repository.Store, func(), error) {
+	return OpenStore(cfg)
+}
+
+// OpenStore 按配置双驱动开库（C7：sqlite 开发/单测零依赖；pg 走 utils postgres 构造 DSN，
+// database/sql + pgx stdlib 接口无感切换）。导出供 cmd CLI 复用，避免开库逻辑分叉。
+func OpenStore(cfg *config.Config) (*repository.Store, func(), error) {
 	var st *repository.Store
 	var err error
 	if cfg.DB.Driver == repository.DriverPG {

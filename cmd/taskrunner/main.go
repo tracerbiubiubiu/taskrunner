@@ -19,7 +19,6 @@ import (
 
 	"github.com/tracerbiubiubiu/taskrunner/internal/app"
 	"github.com/tracerbiubiubiu/taskrunner/internal/config"
-	"github.com/tracerbiubiubiu/taskrunner/internal/repository"
 	"github.com/tracerbiubiubiu/taskrunner/internal/service"
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
@@ -90,11 +89,11 @@ func enqueueCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	st, err := repository.Open(cfg.DB.Path)
+	st, cleanup, err := app.OpenStore(cfg)
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	defer cleanup()
 	client := asynq.NewClient(asynq.RedisClientOpt{
 		Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
 	defer client.Close()

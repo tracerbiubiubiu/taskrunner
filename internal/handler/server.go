@@ -211,6 +211,10 @@ func (d *Deps) createJob(c *gin.Context) {
 		response.BadRequest(c, "action_id / callback_url / trigger_type 必填")
 		return
 	}
+	if !validTimeoutSecs(req.TimeoutSecs) {
+		response.BadRequest(c, "timeout_secs 须在 0–86400 秒")
+		return
+	}
 	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
 	if len(req.Params) > 64<<10 {
 		response.BadRequest(c, "params 超过上限（64KB）")
@@ -259,6 +263,10 @@ func (d *Deps) patchJob(c *gin.Context) {
 	var req patchJobReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "job_id 必填")
+		return
+	}
+	if req.TimeoutSecs != nil && !validTimeoutSecs(*req.TimeoutSecs) {
+		response.BadRequest(c, "timeout_secs 须在 0–86400 秒")
 		return
 	}
 	if len(req.Params) > 64<<10 {
@@ -368,3 +376,7 @@ func atoi(s string, def int) int {
 	}
 	return def
 }
+
+// validTimeoutSecs 回调/任务超时上界（审计 M2）：0 = 沿用默认 30s；
+// 正值上限 1 天——无上界的 timeout 会经 asynq 占死 worker 槽位并阻塞优雅停机。
+func validTimeoutSecs(secs int) bool { return secs >= 0 && secs <= 86400 }

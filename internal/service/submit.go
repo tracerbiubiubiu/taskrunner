@@ -43,12 +43,22 @@ func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, wa
 	if err != nil {
 		return false, nil, err
 	}
-	if _, err := s.Client.Enqueue(
-		asynq.NewTask(task.TypeCallback, payload),
+	task := asynq.NewTask(task.TypeCallback, payload)
+	opts := []asynq.Option{
 		asynq.TaskID(p.TaskID),
 		asynq.MaxRetry(s.MaxRetry),
 		asynq.Queue(s.Queue),
-	); err != nil {
+	}
+	// 任务级 deadline（审计 M2 双保险）：无 Timeout 的 handler goroutine 可被
+	// 超长 timeout_secs 占死全部并发槽位并阻塞优雅停机；0 = asynq 默认（无限制）
+	if p.TimeoutSecs > 0 {
+		capSecs := p.TimeoutSecs
+		if capSecs > 86400 {
+			capSecs = 86400
+		}
+		opts = append(opts, asynq.Timeout(time.Duration(capSecs)*time.Second))
+	}
+	if _, err := s.Client.Enqueue(task, opts...); err != nil {
 		if errors.Is(err, asynq.ErrTaskIDConflict) {
 			return false, nil, nil // 并发同提的兜底
 		}

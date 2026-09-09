@@ -4,6 +4,7 @@ package middleware
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"encoding/hex"
 	"io"
 	"log/slog"
@@ -77,9 +78,22 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 func AKSKAuth(keys map[string][]byte) gin.HandlerFunc {
 	verifier := &aksk.Verifier{Keys: keys}
 	return func(c *gin.Context) {
+		// 预鉴权读体上限 8MB（b11ef0a④——commit 声称已修实际未落地，本次补交付；
+		// 对齐 utils aksk.GinMiddleware 默认）：未认证请求不得以超大 body 占用内存
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 8<<20)
 		var body []byte
+		var err error
 		if c.Request.Body != nil {
-			body, _ = io.ReadAll(c.Request.Body)
+			if body, err = io.ReadAll(c.Request.Body); err != nil {
+				var mbe *http.MaxBytesError
+				status := http.StatusBadRequest
+				if errors.As(err, &mbe) {
+					status = http.StatusRequestEntityTooLarge
+				}
+				response.Fail(c, status, 10001, "请求体读取失败或超过 8MB 上限")
+				c.Abort()
+				return
+			}
 			c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
 		}
 		if err := verifier.Verify(c.Request, body); err != nil {

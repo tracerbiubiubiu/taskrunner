@@ -85,7 +85,9 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 
 	default:
-		final := attempt >= maxRetry // maxRetry=0（显式不重试）时首败即 dead
+		// asynq 语义 = 第 maxRetry+1 次失败才归档：attempt > maxRetry 才是真终态；
+		// `>=` 会把非末次失败提前判 dead，随后 MarkRunning 又复活为 running（M1）
+		final := maxRetry < 0 || attempt > maxRetry // maxRetry=0（显式不重试）时首败即 dead
 		status := repository.StatusFailed
 		if final {
 			status = repository.StatusDead

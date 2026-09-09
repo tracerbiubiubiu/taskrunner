@@ -37,7 +37,9 @@ func New(d Deps) *gin.Engine {
 	r.GET("/readyz", func(c *gin.Context) {
 		if d.Ready != nil {
 			if err := d.Ready(); err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unready", "err": err.Error()})
+				// 探针免鉴权：不回传内部错误细节（避免泄露拓扑），详情进日志
+				d.Logger.Error("readyz: dependency unavailable", "err", err)
+				c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unready"})
 				return
 			}
 		}
@@ -88,6 +90,10 @@ func (d *Deps) submitTask(c *gin.Context) {
 	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
 	if len(req.Params) > 64<<10 {
 		response.BadRequest(c, "params 超过上限（64KB）")
+		return
+	}
+	if len(req.Params) > 0 && !json.Valid(req.Params) {
+		response.BadRequest(c, "params 不是合法 JSON")
 		return
 	}
 	out, err := d.Tasks.Submit(c.Request.Context(), service.SubmitInput{
@@ -210,6 +216,10 @@ func (d *Deps) createJob(c *gin.Context) {
 		response.BadRequest(c, "params 超过上限（64KB）")
 		return
 	}
+	if len(req.Params) > 0 && !json.Valid(req.Params) {
+		response.BadRequest(c, "params 不是合法 JSON")
+		return
+	}
 	v, err := d.Tasks.CreateJob(c.Request.Context(), service.JobInput{
 		ActionID: req.ActionID, CallbackURL: req.CallbackURL, TriggerType: req.TriggerType,
 		CronSpec: req.CronSpec, Params: req.Params, Dept: req.Dept, Enabled: req.Enabled,
@@ -253,6 +263,10 @@ func (d *Deps) patchJob(c *gin.Context) {
 	}
 	if len(req.Params) > 64<<10 {
 		response.BadRequest(c, "params 超过上限（64KB）")
+		return
+	}
+	if len(req.Params) > 0 && !json.Valid(req.Params) {
+		response.BadRequest(c, "params 不是合法 JSON")
 		return
 	}
 	v, err := d.Tasks.UpdateJob(c.Request.Context(), req.JobID, service.JobPatch{

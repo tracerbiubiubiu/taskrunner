@@ -91,9 +91,16 @@ func (l *Loop) FireDue(ctx context.Context) {
 		}
 		next, ok := NextRun(j.CronSpec, true, now)
 		if !ok {
-			// spec 已失效（不该发生，创建/更新时已校验）：停用并告警
-			l.Logger.Error("cronloop: invalid spec, disabling job", slog.String("job_id", j.JobID), slog.String("spec", j.CronSpec))
-			next, ok = time.Time{}, false
+			// spec 已失效（不该发生，创建/更新时已校验）：真正落库停用（enabled=false +
+			// next_run=NULL）并告警——仅清 next_run 会因零值时间戳仍命中到期扫描，每 tick 重触发
+			if derr := l.Store.DisableJob(ctx, j.JobID, l.now()); derr != nil {
+				l.Logger.Error("cronloop: disable job failed, will retry disable next tick",
+					slog.String("job_id", j.JobID), slog.Any("err", derr))
+				continue
+			}
+			l.Logger.Error("cronloop: invalid spec, job disabled",
+				slog.String("job_id", j.JobID), slog.String("spec", j.CronSpec))
+			continue
 		}
 		if uerr := l.Store.UpdateJobNextRun(ctx, j.JobID, next); uerr != nil {
 			// 推进失败 → 下个 tick 以新 task_id 重触发同一动作（task_id 幂等拦不住），

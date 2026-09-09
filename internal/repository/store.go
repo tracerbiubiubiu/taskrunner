@@ -406,7 +406,11 @@ UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = '' WHERE t
 	if err != nil {
 		return fmt.Errorf("store: mark running: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: mark running rows: %w", err)
+	}
+	if n == 0 {
 		return fmt.Errorf("store: mark running: job_runs row missing (task_id=%s)", taskID)
 	}
 	return nil
@@ -427,7 +431,11 @@ WHERE task_id = ?`,
 	if err != nil {
 		return fmt.Errorf("store: finish job_run: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: finish job_run rows: %w", err)
+	}
+	if n == 0 {
 		return fmt.Errorf("store: finish job_run: job_runs row missing (task_id=%s)", taskID)
 	}
 	return nil

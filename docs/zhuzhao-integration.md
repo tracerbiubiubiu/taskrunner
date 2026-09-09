@@ -89,6 +89,19 @@ var registry = map[string]JobHandler{
 
 `POST /internal/notifications/task-dead` 接收死信通知——仅当 taskrunner 侧启用终败通知（taskrunner.md §4，触发条件：无人盯守的周期任务需业务方知情）时需要，当前不做。
 
+## 2.7 部署联调注意事项（M3，2026-09-08 全面验证后沉淀）
+
+**SK 配对表**（配错的表现：回调 401 → 4xx 不可重试直接终败；API 全量 401。两侧无自动校验机制，靠人工核对）：
+
+| taskrunner 侧 env | zhuzhao 侧 env | 用途 |
+|---|---|---|
+| `TASKRUNNER_SELF_SK` | `INTERNAL_JOBS_SK`（`internal_jobs` 段，且 **`enabled: true`**——默认 false，不开则回调全 404） | taskrunner 签回调 / zhuzhao 验签 |
+| `TASKRUNNER_CALLER_ZHUZHAO_SK` | `TASKRUNNER_SK`（zhuzhao 出站 client） | zhuzhao 签 API / taskrunner 验签 |
+
+**audit_archive 任务定义务必配 `timeout_secs`**：首次积压的导出+删除可能超默认 30s 超时（超时→500→可重试，zhuzhao 侧分批 fsync+同批删除保证重入安全，但重试预算 5×30s 耗尽即进死信）。
+
+**其余**：PG 集成测试的 scratch 库（`TASKRUNNER_TEST_PG_DSN` 指向 `taskrunner_test`）联调环境可复用。
+
 ## 3. 里程碑对齐建议
 
 | taskrunner 里程碑 | zhuzhao 侧需要就绪 |

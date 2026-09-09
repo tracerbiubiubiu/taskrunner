@@ -96,6 +96,13 @@ func Load(path string) (*Config, error) {
 	bind("cron_tick", "TASKRUNNER_CRON_TICK", "30s")
 	bind("log.level", "TASKRUNNER_LOG_LEVEL", "info")
 	bind("log.dir", "TASKRUNNER_LOG_DIR", "logs")
+	// 日志轮转（§6：MaxAge 必须显式——lumberjack 零值不限天数，文件含个人信息）
+	viper.BindEnv("log.max_size_mb", "TASKRUNNER_LOG_MAX_SIZE_MB")
+	viper.SetDefault("log.max_size_mb", 100)
+	viper.BindEnv("log.max_backups", "TASKRUNNER_LOG_MAX_BACKUPS")
+	viper.SetDefault("log.max_backups", 0)   // 不限份数，由天数控
+	viper.SetDefault("log.max_age_days", 90) // 显式默认 90 天（M4 定 job_runs 保留期时可一并调整）
+	viper.BindEnv("log.max_age_days", "TASKRUNNER_LOG_MAX_AGE_DAYS")
 	bind("security.self_ak", "TASKRUNNER_SELF_AK", "taskrunner")
 	bind("security.self_sk", "TASKRUNNER_SELF_SK", "")
 	viper.BindEnv("security.callers.zhuzhao", "TASKRUNNER_CALLER_ZHUZHAO_SK")

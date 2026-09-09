@@ -89,7 +89,7 @@ const jobsCols = `job_id, action_id, trigger_type, callback_url, cron_spec, para
 	timeout_secs, description, created_by, owner_service, next_run, created_at, updated_at`
 
 func init() {
-	extraSchemas[DriverSQLite] = append(extraSchemas[DriverSQLite], sqliteJobsSchema)
+	extraSchemas[DriverSQLite] = append(extraSchemas[DriverSQLite], sqliteJobsSchema, jobsIndexes)
 	extraSchemas[DriverPG] = append(extraSchemas[DriverPG], pgJobsSchema, jobsIndexes)
 }
 
@@ -208,6 +208,20 @@ WHERE enabled AND trigger_type = 'cron' AND next_run IS NOT NULL AND next_run <=
 		out = append(out, j)
 	}
 	return out, rows.Err()
+}
+
+// DisableJob 停用任务定义并清空 next_run（cronloop 对无效 spec 的防御路径：
+// 必须真正落库停用，仅清 next_run 会因零值时间戳仍命中到期扫描而每 tick 重触发）。
+func (s *Store) DisableJob(ctx context.Context, jobID string, updatedAt time.Time) error {
+	res, err := s.exec(ctx, `UPDATE jobs SET enabled = FALSE, next_run = NULL, updated_at = ? WHERE job_id = ?`,
+		updatedAt, jobID)
+	if err != nil {
+		return fmt.Errorf("store: disable job: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // UpdateJobNextRun 推进下次触发时间。

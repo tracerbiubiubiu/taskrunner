@@ -16,9 +16,14 @@ import (
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
+// CallbackClient 回调能力（*callback.Client 即满足；接口化便于单测注入）。
+type CallbackClient interface {
+	Do(ctx context.Context, p task.Payload) error
+}
+
 type Deps struct {
 	Store    *repository.Store
-	Callback *callback.Client
+	Callback CallbackClient
 	Logger   *slog.Logger
 }
 
@@ -52,7 +57,7 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 	if n, ok := asynq.GetRetryCount(ctx); ok {
 		attempt = n + 1
 	}
-	maxRetry := 0
+	maxRetry := -1 // 未知（不在 asynq 处理上下文）按终败处理——失败必须留终态记录
 	if n, ok := asynq.GetMaxRetry(ctx); ok {
 		maxRetry = n
 	}
@@ -80,7 +85,7 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 
 	default:
-		final := maxRetry > 0 && attempt >= maxRetry
+		final := attempt >= maxRetry // maxRetry=0（显式不重试）时首败即 dead
 		status := repository.StatusFailed
 		if final {
 			status = repository.StatusDead

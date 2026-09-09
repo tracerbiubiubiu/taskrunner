@@ -289,7 +289,7 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID string) error {
 	}
 	if err := s.inspector.RunTask(s.queue, taskID); err != nil {
 		if errors.Is(err, asynq.ErrTaskNotFound) {
-			return conflict("队列中已无该任务（可能已被清理），无法重试")
+			return conflict("队列中已无该任务，无法重试（4xx 终败任务已被清理，如需重跑请修正参数后重新提交）")
 		}
 		return err
 	}
@@ -482,13 +482,18 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 		return nil, conflict("任务定义已停用")
 	}
 	taskID := uuid.NewString()
-	accepted, _, err := s.submitter.Submit(ctx, task.Payload{
+	accepted, warning, err := s.submitter.Submit(ctx, task.Payload{
 		TaskID: taskID, RequestID: in.RequestID, Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
 		CallbackURL: j.CallbackURL, Params: []byte(j.Params),
 		SubmittedBy: in.Actor, SourceIP: in.SourceIP, TimeoutSecs: j.TimeoutSecs,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if warning != nil {
+		// 与 Submit 同一隐形任务场景：已入队但 job_runs 落库失败，必须留痕
+		s.logger.Warn("trigger: enqueued but job_runs insert failed, task invisible in queries",
+			slog.String("task_id", taskID), slog.String("job_id", j.JobID), slog.Any("err", warning))
 	}
 	return &SubmitOutput{TaskID: taskID, Accepted: accepted}, nil
 }

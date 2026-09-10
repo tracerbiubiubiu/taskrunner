@@ -4,8 +4,8 @@ package middleware
 import (
 	"bytes"
 	"crypto/rand"
-	"errors"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"

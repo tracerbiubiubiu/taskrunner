@@ -28,8 +28,8 @@ func (f *fakeInspector) GetTaskInfo(_, _ string) (*asynq.TaskInfo, error) {
 	}
 	return &asynq.TaskInfo{State: f.state}, nil
 }
-func (f *fakeInspector) DeleteTask(_, _ string) error  { return f.delErr }
-func (f *fakeInspector) RunTask(_, _ string) error     { return f.runErr }
+func (f *fakeInspector) DeleteTask(_, _ string) error { return f.delErr }
+func (f *fakeInspector) RunTask(_, _ string) error    { return f.runErr }
 func (f *fakeInspector) ListArchivedTasks(string, ...asynq.ListOption) ([]*asynq.TaskInfo, error) {
 	return nil, nil
 }

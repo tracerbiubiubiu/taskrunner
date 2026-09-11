@@ -107,7 +107,7 @@
 
 - **触发链路**：cron 到点 / `trigger` / `POST /v1/tasks` → taskrunner 按 job 定义组装回调（action + params + request_id）→ zhuzhao 查注册表执行 handler → 结果记 `job_runs`；
 - **前端入口**（若有）：执行 / 加定时 / 启停的页面在 zhuzhao，链路 = 前端 → 网关（鉴权 + 业务审计）→ taskrunner API；cron 自动触发无用户参与，只记 `job_runs`；
-- **调用人上下文透传（2026-09-03 补充）**：zhuzhao 调写接口（提交 / 建改定义 / 触发）时显式携带 `actor`（工号）与 `source_ip` 等原始信息，taskrunner **原样存档**（job 定义记 `created_by`；执行记录记 `submitted_by` / `source_ip`，cron 触发为空）并随 slog 打点（caller + actor + IP + request_id）——仅作审计归因，taskrunner 不校验、不据其做权限判断（信任边界在网关）；
+- **调用人上下文透传（2026-09-03 补充；2026-09-11 归因口径修订）**：身份通道统一为验签头 `X-Operator`（入签名覆盖，缺失兜底 `system`，中间件入 ctx）；持久化归因 = 提交/触发的 `job_runs.submitted_by/source_ip`（body 业务字段）+ job 定义 `created_by`（**body 缺省由服务端取 X-Operator 兜底落库**，显式传值优先）——并随 slog 打点（caller + operator + IP + request_id）；取消/重试/更新的归因走访问日志 + request_id 跨查 zhuzhao `audit_logs`（审计正本在 zhuzhao，信任边界在网关，taskrunner 不校验、不据其做权限判断）；`canceled_by` 触发驱动；
 - **归属过滤（2026-09-03 补充）**：job 定义的归属标签（如 `dept`）对 taskrunner 是不透明字符串，`GET /v1/jobs?dept=…` 按值过滤，实现「不同部门看到不同预置任务」；部门语义与「能看 / 能管哪些」的权限全归 zhuzhao（策略存 zhuzhao 自有 DB，见 §11 配套清单），taskrunner 不建组织模型；跨部门**写保护**随多调用方时代再启用（同 §5 `created_by` 口径）；
 - **新增一个可调度动作**：① zhuzhao 新增 handler 并注册进注册表（发版一次）；② 调 `POST /v1/jobs` 建任务定义（运行时，无需再动 taskrunner）；
 - 内置例外（后置，按需再启）：与业务无关的通用动作（如 ping URL、清理自身数据）可在 taskrunner 内实现同款「接口 + id 注册表」，进程内直接执行、不回调 zhuzhao；
@@ -372,3 +372,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-07 | §4 能力目录补「演进平滑性」：手填 → 目录为纯增量三步（建表自注册 / 解析切换 / 可选清理），执行链路零改动、无停机无迁移、每步可回滚；唯一摩擦（双真相来源）以快照可追溯 + 使用纪律化解 |
 | 2026-09-07 | **回调端点 C10 约定化 + dept 快照列 + 口径同步**（§4/§5/§6）：① 回调端点改 `POST /internal/jobs/callback` + body.action（方案 A 拍板；~~路径 /internal/jobs/:action_id~~ 废弃；统一 body schema 补 action_id；zhuzhao 16 号 E-② 同步定案）；② C11 runs dept 过滤改 **`runs.dept` 快照列**（提交时从 job/请求带入、一次性任务由 zhuzhao 携带、不 JOIN jobs——堵一次性任务/删 job/转派三缺口；§6 schema 同步）；③ dept 过滤边界明示（信任前提=zhuzhao 唯一入口 / fail-closed 契约 / 部门继承扩展点）；④ 回调超时措辞同步 §10（30s + env）；⑤ 能力目录术语统一为 `action_id`；⑥ zhuzhao-integration §2.2 更新为已定案（不做前置校验，可选增强） |
 | 2026-09-11 | **批次 5b 修复**（zhuzhao 四仓对账审计驱动）：① 终态落库改脱离取消链 ctx（任务超时瞬间 Finish 不再失败——job_runs 不再永久卡 running）；② asynq 显式 `shutdown_timeout`（默认 30s，可配）——超时在途任务 requeue 重投（at-least-once），终态由下次执行补写；③ `MarkRunning/Finish` 增状态/attempts 谓词——租约失效双执行的过期写者被拒（终态不可覆写、succeeded/canceled 不可复活；failed→running 重试周期不受影响）；④ `POST /v1/tasks` 补 `timeout_secs` 0–86400 校验（三入口对齐） |
+| 2026-09-11 | **归因口径修订**（四仓对账审计的拍板项落地）：废止「全部写接口 body 显式携带 actor/source_ip 原样存档」的过宽承诺——身份通道统一为验签头 `X-Operator`（中间件入 ctx）；`jobs.created_by` body 缺省由服务端取 X-Operator 兜底落库（显式传值优先，回归 TestCreateJobCreatedByFallback）；取消/重试/更新归因=访问日志 + request_id 跨查 zhuzhao audit_logs（审计正本在 zhuzhao，基线 §9）；`canceled_by` 触发驱动。zhuzhao-integration §2.7 同步 |

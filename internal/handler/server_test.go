@@ -391,6 +391,35 @@ func TestC11DeptFilterNegative(t *testing.T) {
 	}
 }
 
+// 归因口径（2026-09-11）回归：created_by 服务端兜底——body 缺省取验签头
+// X-Operator（fixture 签名固定 Operator=10086），显式传值优先。
+func TestCreateJobCreatedByFallback(t *testing.T) {
+	f := newFixture(t)
+	w := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
+		"action_id": "audit_archive", "callback_url": "http://x",
+		"trigger_type": "cron", "cron_spec": "0 3 * * *",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	_, m := decode(t, w)
+	job := m["data"].(map[string]any)
+	if job["created_by"] != "10086" {
+		t.Fatalf("body 缺省应取 X-Operator 兜底: %v", job["created_by"])
+	}
+
+	w2 := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
+		"action_id": "audit_archive", "callback_url": "http://x",
+		"trigger_type": "cron", "cron_spec": "0 4 * * *",
+		"created_by": "bob",
+	})
+	_, m2 := decode(t, w2)
+	job2 := m2["data"].(map[string]any)
+	if job2["created_by"] != "bob" {
+		t.Fatalf("body 显式传值应优先于头: %v", job2["created_by"])
+	}
+}
+
 func TestCancelAndRetry(t *testing.T) {
 	f := newFixture(t)
 	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "c1", "action": "a", "callback_url": "http://x"})

@@ -49,11 +49,15 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 			return
 		}
 		start := time.Now()
-		c.Next()
+		// operator 提前读取并入 ctx（归因口径 2026-09-11）：handler 据此兜底业务
+		// 归因字段（如 jobs.created_by）——X-Operator 入签名覆盖不可伪造，缺失
+		// 兜底 "system"（对齐 activelist COALESCE 惯例）
 		operator := c.GetHeader("X-Operator")
 		if operator == "" {
 			operator = "system"
 		}
+		c.Set("operator", operator)
+		c.Next()
 		q := c.Request.URL.RawQuery
 		if len(q) > 4096 {
 			q = q[:4096]

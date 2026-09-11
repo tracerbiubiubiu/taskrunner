@@ -36,7 +36,7 @@ zhuzhao 查执行结果：GET /v1/tasks/{id} / GET /v1/runs?request_id=…（拉
 
 **API 设计约定（2026-09-04 所有者拍板，SSOT = zhuzhao 16 号 §9）**：方法仅 GET/POST；POST URL 不携带业务信息（标识/参数全在 body；GET path/query 不受限）。~~上表 C10 改造随 M3 联调前实施，C11 随 zhuzhao E-⑤ 实施。~~ **C10/C11 ✅ 已实施（2026-09-07，taskrunner 99003bd + zhuzhao 5151e86/c20b73b——哈希为 zhuzhao 历史重写后现行值，对齐 16 号 E-⑦ 行）**。
 
-所有请求带 **AK/SK HMAC 签名**（zhuzhao client 以自身 SK 签名，taskrunner 验签——2026-09-03 基线修订，覆盖当日早前「零认证/静态 Bearer 过渡」口径；utils `aksk`，基线 SSOT = zhuzhao 16 号 §9）；**写接口**（提交 / 建改定义 / 触发 / 取消 / 重试）显式携带 `actor`（调用人工号）与 `source_ip`——taskrunner 原样存档仅作审计归因（actor 入签名覆盖，不可伪造）。
+所有请求带 **AK/SK HMAC 签名**（zhuzhao client 以自身 SK 签名，taskrunner 验签——2026-09-03 基线修订，覆盖当日早前「零认证/静态 Bearer 过渡」口径；utils `aksk`，基线 SSOT = zhuzhao 16 号 §9）；**写接口归因口径（2026-09-11 修订，废止原「全部写接口 body 显式携带 actor/source_ip 原样存档」的过宽承诺）**：身份通道统一为验签头 **`X-Operator`**（入签名覆盖，不可伪造，全部写接口）+ `request_id` 关联键。持久化归因仅三处：提交/触发的 `job_runs.submitted_by/source_ip`（body 业务字段）、job 定义 `created_by`（**body 缺省由 taskrunner 服务端取 X-Operator 兜底落库**，显式传值优先）；取消/重试/更新的归因 = 访问日志（operator + request_id 跨查 zhuzhao `audit_logs`）——审计正本在 zhuzhao（基线 §9），taskrunner 库内字段定位为看板便利而非责任正本；取消审计硬需求出现时再加 `canceled_by`（触发驱动）。
 
 ## 2. 需求清单
 

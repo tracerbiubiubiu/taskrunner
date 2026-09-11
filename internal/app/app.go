@@ -46,7 +46,15 @@ func (a *App) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	a.server = &http.Server{Addr: a.cfg.Server.Addr, Handler: a.engine}
+	// F-8 四超时对齐 zhuzhao：防慢速连接耗尽资源（内网暴露面亦不裸奔）
+	a.server = &http.Server{
+		Addr:              a.cfg.Server.Addr,
+		Handler:           a.engine,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	serverErr := make(chan error, 1)
 	go func() {

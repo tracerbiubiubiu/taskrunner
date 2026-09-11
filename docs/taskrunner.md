@@ -92,7 +92,7 @@
 
 | 层 | 是什么 | 归属 | 变更方式 |
 |---|---|---|---|
-| **动作（action）** | 业务 handler，全局唯一 `action_id` | **能力属主服务**：回调端点 `POST /internal/jobs/callback`（body 带 `action_id` 查表分发——C10 约定化，2026-09-07 拍板；~~路径 `/internal/jobs/<action_id>`~~ 废弃）+ handler 注册表（当前 = zhuzhao；目标架构下 = 各业务服务，见下方「目标架构注记」） | 改代码发版（在属主服务） |
+| **动作（action）** | 业务 handler，全局唯一 `action_id` | **能力属主服务**：回调端点 `POST /internal/jobs/callback`（body 带 `action` 查表分发——C10 约定化，2026-09-07 拍板；~~路径 `/internal/jobs/<action_id>`~~ 废弃）+ handler 注册表（当前 = zhuzhao；目标架构下 = 各业务服务，见下方「目标架构注记」） | 改代码发版（在属主服务） |
 | **任务定义（job）** | `action_id + 触发方式（cron / 手动）+ params + enabled + 归属标签（如 dept，zhuzhao 写入）` | taskrunner **DB**（定稿：API 管理，不再用配置文件） | 运行时调 API（前端经网关操作） |
 | **执行实例（run）** | 每次实际执行（含每次重试） | taskrunner `job_runs`（§6） | 自动产生 |
 
@@ -124,11 +124,11 @@
 - **L1 边界**：回调执行产生的业务事件（如 SLA 违约）仍由 zhuzhao 侧 handler 落 L1 `ticket_events`；taskrunner 只触发回调、**不写业务事实**；
 - **安全边界**：独立部署下需明确内网可达性（如同 VPC）。~~回调鉴权~~ ✅ **基线修订定案（2026-09-03，覆盖当日早前「不做独立回调鉴权」拍板）**：回调请求带 **AK/SK HMAC 签名**（C9：callback client 以 taskrunner 自身 SK 签名，覆盖 X-Request-ID / X-Operator / body；zhuzhao `/internal` 端点验签）；~~capability URL 增强~~ 随之作废；专用 network 为第二道防线。
 - **消息体约定（2026-09-04 补充）**：业务参数（`params`）**统一走回调请求 body**——唯一业务负载通道、任意 JSON、进 AK/SK 签名覆盖范围；各字段各归其位，业务参数不散落到 query / header / 路径：
-  - 路由标识 `action_id` → **回调 body**（执行端统一入口 `POST /internal/jobs/callback`，按 body 内 `action_id` 查表分发——C10 约定化，2026-09-07 拍板；~~URL 路径 `/internal/jobs/:action_id`~~ 废弃）；
+  - 路由标识 `action_id` → **回调 body**（执行端统一入口 `POST /internal/jobs/callback`，按 body 内 `action` 查表分发——C10 约定化，2026-09-07 拍板；~~URL 路径 `/internal/jobs/:action_id`~~ 废弃）；
   - 链路标识 `request_id` → Header `X-Request-ID`（body 内冗余携带兜底，与 header 一致）；
   - 鉴权 → 签名层（AK/SK HMAC 覆盖 body + 关键头）；
   - **业务参数 `params` → Body（唯一业务通道）**。
-- **统一回调 body schema（执行端 SDK 的入口约定）**：`{ "task_id": …, "request_id": …, "action": …, "params": … }`——执行端 SDK 解包统一 schema → 校验 → **按 `action` 查本服务 `jobs.Registry`** → 取 `params` 传 Handler；~~action_id~~ **2026-09-08 勘误**：C10 实现两侧均为 `action`（zhuzhao jobs_handler binding required / taskrunner client），此前 SSOT 误写为 action_id；**加能力 = 注册 code + 写 Handler，回调入口零改动**；幂等（task_id）、链路（request_id）、错误映射（2xx/4xx/5xx）在 SDK 层统一处理，业务 handler 只关心 `params` 与返回值；
+- **统一回调 body schema（执行端 SDK 的入口约定）**：`{ "task_id": …, "request_id": …, "action": …, "params": …, "actor": …, "source_ip": … }`（actor/source_ip 为可选审计归因字段）——执行端 SDK 解包统一 schema → 校验 → **按 `action` 查本服务 `jobs.Registry`** → 取 `params` 传 Handler；~~action_id~~ **2026-09-08 勘误**：C10 实现两侧均为 `action`（zhuzhao jobs_handler binding required / taskrunner client），此前 SSOT 误写为 action_id；**加能力 = 注册 code + 写 Handler，回调入口零改动**；幂等（task_id）、链路（request_id）、错误映射（2xx/4xx/5xx）在 SDK 层统一处理，业务 handler 只关心 `params` 与返回值；
 - **params 存储与传输分离**：存储 = 入队时 Asynq payload + 执行记录 job_runs（taskrunner 内部持久化）；传输 = 回调 body（给执行端的唯一业务通道）——两者不混。
 
 ### 能力目录（capability_registry）【方案待定 · 2026-09-04 记录，未拍板】
@@ -182,17 +182,17 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 | 端点 | 用途 |
 |---|---|
-| `POST /v1/tasks` | 提交任务；**受理语义**：校验通过 + 写入队列（Redis AOF）即返回 task_id，「受理 ≠ 执行成功」；**幂等**：接受调用方生成的 `task_id`，重复提交去重 |
+| `POST /v1/tasks` | 提交任务；**受理语义**：校验通过 + 写入队列（Redis AOF）即返回 task_id，「受理 ≠ 执行成功」；**幂等**：接受调用方生成的 `task_id`，重复提交去重；`timeout_secs` 0–86400（0=默认 30s） |
 | `GET /v1/tasks/{id}` | 查任务状态（**C11：响应补 `dept` 字段**——zhuzhao E-⑤ 可见性校验前提） |
 | `GET /v1/runs?request_id=&action=&status=&job_id=&dept=&from=&to=&page=&page_size=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；**C11：加 `dept` 多值过滤，按 `runs.dept` 快照列**——提交时从 job 定义或请求带入、一次性任务由 zhuzhao 携带，**不 JOIN jobs**（job 删除后历史可查、改 dept=转派不改历史归属）；zhuzhao E-⑤ 按可见标签集组装传入，修复「job 定义隔离但执行记录全量可见」旁路） |
-| `GET /v1/jobs?dept=&action_id=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签，§4） |
+| `GET /v1/jobs?dept=&action_id=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签 + `timeout_secs` 0–86400，§4） |
 | `POST /v1/jobs/update`（原 `PATCH /v1/jobs/{id}`） | 修改任务定义：body 带 job_id + cron / params / 启停 |
 | `POST /v1/jobs/trigger`（原 `POST /v1/jobs/{id}/trigger`） | 手动执行一次：body 带 job_id（按定义提交任务，前端「立即执行」按钮） |
 | `POST /v1/tasks/cancel`（原 `POST /v1/tasks/{id}/cancel`） | 取消未开始的任务：body 带 task_id |
 | `POST /v1/tasks/retry`（原 `POST /v1/tasks/{id}/retry`） | 重试失败/死信任务：body 带 task_id |
 | `GET /v1/dead-letters` | 死信列表（配合 Asynq Inspector 重放，死信处理闭环） |
 | `GET /healthz` | 健康检查（存活） |
-| `GET /readyz` | 就绪探针（检 Redis ping + SQLite；C4；迁 PG 后改检 PG，C7） |
+| `GET /readyz` | 就绪探针（检 Redis ping + DB 按所选驱动探活——SQLite/PG 双驱动，C7） |
 
 - **dept 过滤边界（2026-09-07 确认）**：① **信任前提** = zhuzhao 网关唯一入口（Trusted Proxy 模式：策略在 zhuzhao、过滤在 taskrunner）——多调用方时代升级 per-caller dept 约束（密钥环条目带允许 dept 集），当前单调用方不实现；② **fail-closed 契约**：带部门语义的用户查询必须携带 `dept` 参数（zhuzhao 侧保证，空集 fail-closed），taskrunner 不强制是刻意设计（无状态执行者）；③ **部门层级可见性**（父看子）扩展点 = zhuzhao 策略层可见集计算（本部门 + 子树），taskrunner 无感。
 
@@ -261,18 +261,18 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 目录 | 职责 |
 |---|---|
 | `cmd/taskrunner` | 薄入口：`serve`（常驻服务，默认 `configs/config.yaml`，纯 env 亦可）/ `enqueue`（CLI 调试入队，**手工装配不走 Wire**） |
-| `internal/app` | **装配与生命周期**：`wire.go`（Wire 注入描述）/ `wire_gen.go`（生成物）/ `providers.go`（12 个 provider 构造函数）/ `app.go`（Run 优雅启停） |
+| `internal/app` | **装配与生命周期**：`wire_gen.go`（**唯一装配源**，注入集合以文件头注释维护）/ `providers.go`（12 个 provider 构造函数）/ `app.go`（Run 优雅启停）——`wire.go` 已删除 |
 | `internal/config` | 配置加载（C6：yaml + `${VAR}` 展开 + 全 env 兼容；密钥环空 / self_sk 缺失 fail-closed） |
 | `internal/handler` | 薄 HTTP 层：绑定/映射 + service 错误→HTTP 映射；业务在 service |
 | `internal/service` | 业务下沉：`TaskService`（提交/查询/取消/重试/jobs 定义）+ `submit`（统一受理，终身幂等）+ `cron`（分钟级 tick 扫 DB） |
-| `internal/repository` | job_runs / jobs 持久化（`database/sql`，SQLite 起步 → PG 无感切换） |
+| `internal/repository` | job_runs / jobs 持久化（`database/sql`，SQLite/PG 双驱动已落地——C7） |
 | `internal/middleware` | C1 访问日志 + C2 AK/SK 验签 |
 | `internal/worker` | Asynq worker：统一 `taskrunner:callback` 处理器（终态判定） |
 | `internal/callback` | 回调客户端（C9：自身 SK 签名 + rid 透传 + 2xx/4xx/5xx 判定） |
 | `internal/task` | Asynq 载荷类型（跨进程契约，字段命名保持稳定） |
 
 **Wire 装配**（`internal/app`）：
-- `wire.go`（`//go:build wireinject`）声明注入集合：`wire.Build(NewApp, provideLogger, provideStore, provideRedisOpt, provideSubmitter, provideInspector, provideTaskService, provideCron, provideAsynqServer, provideCallback, provideKeys, provideReadyz, provideEngine)`；`wire_gen.go`（`//go:build !wireinject`）为生成物——**生成器依赖暂未入 go.sum，改动 `wire.go` 后按 Wire 语义手工同步 `wire_gen.go`**（与 zhuzhao wire_gen 风格对齐）；
+- `wire.go` 已删除（生成器依赖未入 go.sum）；`wire_gen.go`（`//go:build !wireinject`）为**唯一装配源**，注入集合（`provideLogger / provideStore / provideRedisOpt / provideSubmitter / provideInspector / provideTaskService / provideCron / provideAsynqServer / provideCallback / provideKeys / provideReadyz / provideEngine`）以文件头注释维护——改动装配后按 Wire 语义手工同步（zhuzhao / activelist 同款）；
 - `providers.go` 提供全部构造函数，依赖由 Wire 解析——显式依赖图 + **编译期校验**（provider 缺失 / 类型不匹配编译即失败，非运行时 panic）；
 - 装配期单例：Store / Redis client / Inspector / readyz-redis 各建一次；`InitializeApp` 统一返回 cleanup（client / inspector / readyz-redis Close、store Close）。
 

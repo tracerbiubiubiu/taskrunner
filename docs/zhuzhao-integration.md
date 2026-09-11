@@ -100,7 +100,7 @@ var registry = map[string]JobHandler{
 
 **audit_archive 任务定义务必配 `timeout_secs`**：首次积压的导出+删除可能超默认 30s 超时（超时→500→可重试，zhuzhao 侧分批 fsync+同批删除保证重入安全，但重试预算 5×30s 耗尽即进死信）。
 
-**其余**：PG 集成测试的 scratch 库（`TASKRUNNER_TEST_PG_DSN` 指向 `taskrunner_test`）联调环境可复用。
+**其余**：PG 集成测试的 scratch 库（`TASKRUNNER_TEST_PG_DSN` 指向 `taskrunner_test`）联调环境可复用。**PG 部署 env（C7 双驱动；缺 dbname 拒启）**：`TASKRUNNER_DB_DRIVER=pg` + `TASKRUNNER_DB_HOST/PORT/USER/PASSWORD/NAME/SSLMODE`；SQLite 部署保持 `TASKRUNNER_DB_PATH` 即可。
 
 ## 3. 里程碑对齐建议
 

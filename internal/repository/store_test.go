@@ -164,3 +164,21 @@ func TestMissingRowVisible(t *testing.T) {
 		t.Fatal("Finish on missing row must error")
 	}
 }
+
+// pgq 占位符转换钉住测试（C7）：? → $n 顺序编号；非 pg 驱动原样返回。
+// 已知限制（文档化约定）：SQL 字面量中的 '?' 同样被替换——SQL 字符串常量禁用 '?'。
+func TestPGQueryPlaceholderConversion(t *testing.T) {
+	s := &Store{pg: true}
+	if got := s.pgq("INSERT INTO t (a, b) VALUES (?, ?)"); got != "INSERT INTO t (a, b) VALUES ($1, $2)" {
+		t.Fatalf("got %q", got)
+	}
+	if got := s.pgq("SELECT * FROM t WHERE a = ? AND b IN (?, ?)"); got != "SELECT * FROM t WHERE a = $1 AND b IN ($2, $3)" {
+		t.Fatalf("got %q", got)
+	}
+	if got := (&Store{}).pgq("SELECT ?"); got != "SELECT ?" {
+		t.Fatalf("非 pg 驱动应原样返回: %q", got)
+	}
+	if got := s.pgq("SELECT 'a?b'"); got != "SELECT 'a$1b'" {
+		t.Fatalf("got %q", got)
+	}
+}

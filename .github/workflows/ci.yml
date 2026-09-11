@@ -1,0 +1,35 @@
+name: ci
+on:
+  push:
+    branches: [main, develop, "feat/**", "fix/**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: taskrunner_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: go vet ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: unit (race)
+        run: go test -race ./...
+      - name: integration (PG, race)
+        env:
+          TASKRUNNER_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/taskrunner_test?sslmode=disable
+        run: go test -race -count=1 ./...

@@ -8,7 +8,15 @@ redis:
   db: 0                   # env TASKRUNNER_REDIS_DB
 
 db:
-  path: "data/taskrunner.db"  # env TASKRUNNER_DB_PATH（B3：SQLite 既有实现，迁移 PG 待 C7）
+  path: "data/taskrunner.db"  # env TASKRUNNER_DB_PATH（SQLite 驱动；PG 部署改用下方 driver/host 等键）
+  # PG（C7 双驱动；env TASKRUNNER_DB_DRIVER/HOST/PORT/USER/PASSWORD/NAME/SSLMODE）：
+  # driver: pg
+  # host: 127.0.0.1
+  # port: 5432
+  # user: taskrunner
+  # password: ""
+  # dbname: taskrunner
+  # sslmode: disable
 
 queue: "jobs"             # env TASKRUNNER_QUEUE
 concurrency: 10           # env TASKRUNNER_CONCURRENCY
@@ -20,6 +28,9 @@ cron_tick: 30s            # env TASKRUNNER_CRON_TICK
 log:
   level: info             # env TASKRUNNER_LOG_LEVEL
   dir: logs               # env TASKRUNNER_LOG_DIR
+  max_size_mb: 100        # 单文件上限 MB（env TASKRUNNER_LOG_MAX_SIZE_MB）
+  max_backups: 0          # 保留历史文件数（0=不限；env TASKRUNNER_LOG_MAX_BACKUPS）
+  max_age_days: 90        # 保留天数（访问/执行日志含工号与 IP，勿无界累积；env TASKRUNNER_LOG_MAX_AGE_DAYS）
 
 security:
   # 验签密钥环（C2）：预期调用方 AK→SK；当前唯一调用方 zhuzhao

@@ -12,6 +12,7 @@ db:
 
 queue: "jobs"             # env TASKRUNNER_QUEUE
 concurrency: 10           # env TASKRUNNER_CONCURRENCY
+shutdown_timeout: 30s     # asynq 停机排空上限（默认 30s）；超时在途任务 requeue 重投（at-least-once）
 max_retry: 5              # env TASKRUNNER_MAX_RETRY
 callback_timeout: 30s     # env TASKRUNNER_CALLBACK_TIMEOUT
 cron_tick: 30s            # env TASKRUNNER_CRON_TICK

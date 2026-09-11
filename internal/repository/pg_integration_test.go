@@ -131,3 +131,68 @@ func TestPGFullLifecycle(t *testing.T) {
 		t.Fatalf("filter result: total=%d len=%d", total, len(runs))
 	}
 }
+
+// C6 回归（判定测试转正）：终态覆写/复活谓词——
+// ① 过期 attempt 的 Finish 被拒（租约失效双执行的后到写者）
+// ② succeeded 行不可被 MarkRunning 复活
+func TestPGFinishPredicateRejectsStaleWriter(t *testing.T) {
+	if os.Getenv("TASKRUNNER_TEST_PG_DSN") == "" {
+		t.Skip("TASKRUNNER_TEST_PG_DSN 未设置")
+	}
+	s := openTestStorePG(t)
+	ctx := context.Background()
+	now := time.Now()
+	id := "pg-pred-1"
+
+	must := func(err error, what string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	must(s.InsertPending(ctx, Run{TaskID: id, RequestID: "r", Action: "a", EnqueuedAt: now}), "insert")
+	must(s.MarkRunning(ctx, id, 1, now), "mark running 1")
+	must(s.MarkRunning(ctx, id, 2, now), "mark running 2（模拟重投递的新执行推进 attempts）")
+
+	// 过期写者（attempt=1）：等值谓词拒绝
+	if err := s.Finish(ctx, id, StatusSucceeded, "stale", 1, now, now); err == nil {
+		t.Fatal("过期 attempt 的 Finish 应被拒绝")
+	}
+	// 新执行终态（attempt=2）正常落库
+	must(s.Finish(ctx, id, StatusSucceeded, "", 2, now, now), "finish attempt 2")
+	// 终态后再次 Finish 亦被拒（status 已非 running）
+	if err := s.Finish(ctx, id, StatusFailed, "late", 2, now, now); err == nil {
+		t.Fatal("终态后的重复 Finish 应被拒绝")
+	}
+}
+
+func TestPGMarkRunningRejectsSucceededResurrection(t *testing.T) {
+	if os.Getenv("TASKRUNNER_TEST_PG_DSN") == "" {
+		t.Skip("TASKRUNNER_TEST_PG_DSN 未设置")
+	}
+	s := openTestStorePG(t)
+	ctx := context.Background()
+	now := time.Now()
+	id := "pg-pred-2"
+
+	must := func(err error, what string) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	must(s.InsertPending(ctx, Run{TaskID: id, RequestID: "r", Action: "a", EnqueuedAt: now}), "insert")
+	must(s.MarkRunning(ctx, id, 1, now), "mark running")
+	must(s.Finish(ctx, id, StatusSucceeded, "", 1, now, now), "finish succeeded")
+
+	// succeeded 行不可被 MarkRunning 复活（failed→running 为重试周期正常路径，
+	// 由 asynq 重投递驱动；手动 RetryTask 走 ResetPendingIfTerminal 先归 pending）
+	if err := s.MarkRunning(ctx, id, 2, now); err == nil {
+		t.Fatal("succeeded 行被 MarkRunning 复活——C6 防线失效")
+	}
+	got, err := s.GetByTaskID(ctx, id)
+	must(err, "get")
+	if got.Status != StatusSucceeded || got.Attempts != 1 {
+		t.Fatalf("终态应保持不变: %+v", got)
+	}
+}

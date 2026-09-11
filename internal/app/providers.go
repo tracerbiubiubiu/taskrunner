@@ -88,10 +88,15 @@ func provideCron(cfg *config.Config, st *repository.Store, sub *service.Service,
 
 // provideAsynqServer worker 进程（并发/队列/退避重试）。
 func provideAsynqServer(cfg *config.Config, opt asynq.RedisClientOpt, logger *slog.Logger) (*asynq.Server, func(), error) {
+	shutdownTimeout := cfg.ShutdownTimeout
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 30 * time.Second // C5：默认 30s；更长的在途任务被 requeue 重投（at-least-once）
+	}
 	srv := asynq.NewServer(opt, asynq.Config{
-		Concurrency:    cfg.Concurrency,
-		Queues:         map[string]int{cfg.Queue: 1},
-		RetryDelayFunc: asynq.DefaultRetryDelayFunc,
+		Concurrency:     cfg.Concurrency,
+		ShutdownTimeout: shutdownTimeout,
+		Queues:          map[string]int{cfg.Queue: 1},
+		RetryDelayFunc:  asynq.DefaultRetryDelayFunc,
 		ErrorHandler: asynq.ErrorHandlerFunc(func(ctx context.Context, t *asynq.Task, err error) {
 			var p task.Payload
 			fields := []any{"type", t.Type(), "err", err}

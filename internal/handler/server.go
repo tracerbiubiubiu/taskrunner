@@ -96,6 +96,10 @@ func (d *Deps) submitTask(c *gin.Context) {
 		response.BadRequest(c, "params 不是合法 JSON")
 		return
 	}
+	if !validTimeoutSecs(req.TimeoutSecs) {
+		response.BadRequest(c, "timeout_secs 须为 0 或 1–86400")
+		return
+	}
 	out, err := d.Tasks.Submit(c.Request.Context(), service.SubmitInput{
 		Dept:   req.Dept,
 		TaskID: req.TaskID, RequestID: req.RequestID, Action: req.Action,

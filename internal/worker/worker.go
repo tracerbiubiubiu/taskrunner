@@ -34,6 +34,24 @@ func NewMux(d Deps) *asynq.ServeMux {
 	return mux
 }
 
+// finishCtx 终态落库专用 ctx：asynq 在任务超时/停机窗口会 cancel handler ctx——
+// 若用原 ctx，超时瞬间的 Finish 直接报 context canceled，job_runs 永久停留 running
+// 且 RetryTask 不受理 running（无法自愈）。终态必须落库，故脱离取消链，仅保留
+// 有限时长防 DB 挂起泄漏（C4）。
+func finishCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+}
+
+// finish 终态落库：落库失败仅记日志（job_runs 终态尽力而为，但 ctx 取消不再是失败原因）。
+// store 侧 status/attempts 谓词拒绝过期写者（租约双执行）——0 行命中同样走此日志。
+func (d Deps) finish(ctx context.Context, logger *slog.Logger, taskID, status, errMsg string, attempt int, startedAt time.Time) {
+	fctx, cancel := finishCtx(ctx)
+	defer cancel()
+	if ferr := d.Store.Finish(fctx, taskID, status, errMsg, attempt, startedAt, time.Now()); ferr != nil {
+		logger.Error("persist terminal state failed", slog.String("status", status), slog.Any("err", ferr))
+	}
+}
+
 // handleCallback 单次尝试的执行流程：running → 回调 → succeeded / failed / dead。
 // 终态判定（设计文档 §4）：
 //   - 回调成功 → succeeded；
@@ -71,16 +89,12 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 	err := d.Callback.Do(ctx, p)
 	switch {
 	case err == nil:
-		if ferr := d.Store.Finish(ctx, p.TaskID, repository.StatusSucceeded, "", attempt, now, time.Now()); ferr != nil {
-			logger.Error("persist succeeded failed", slog.Any("err", ferr))
-		}
+		d.finish(ctx, logger, p.TaskID, repository.StatusSucceeded, "", attempt, now)
 		logger.Info("task succeeded", slog.Int("attempt", attempt))
 		return nil
 
 	case errors.Is(err, callback.ErrNonRetryable):
-		if ferr := d.Store.Finish(ctx, p.TaskID, repository.StatusFailed, err.Error(), attempt, now, time.Now()); ferr != nil {
-			logger.Error("persist failed(4xx) failed", slog.Any("err", ferr))
-		}
+		d.finish(ctx, logger, p.TaskID, repository.StatusFailed, err.Error(), attempt, now)
 		logger.Error("task failed terminally (non-retryable 4xx)", slog.Int("attempt", attempt), slog.Any("err", err))
 		return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 
@@ -92,9 +106,7 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		if final {
 			status = repository.StatusDead
 		}
-		if ferr := d.Store.Finish(ctx, p.TaskID, status, err.Error(), attempt, now, time.Now()); ferr != nil {
-			logger.Error("persist failure state failed", slog.Any("err", ferr))
-		}
+		d.finish(ctx, logger, p.TaskID, status, err.Error(), attempt, now)
 		if final {
 			logger.Error("task dead (retries exhausted)", slog.Int("attempt", attempt), slog.Any("err", err))
 		} else {

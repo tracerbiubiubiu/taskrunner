@@ -401,8 +401,9 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 // 避免任务执行全程无任何 job_runs 记录的「隐形任务」静默发生。
 func (s *Store) MarkRunning(ctx context.Context, taskID string, attempt int, startedAt time.Time) error {
 	res, err := s.exec(ctx, `
-UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = '' WHERE task_id = ?`,
-		StatusRunning, attempt, startedAt, taskID)
+UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = ''
+WHERE task_id = ? AND status NOT IN (?, ?)`,
+		StatusRunning, attempt, startedAt, taskID, StatusSucceeded, StatusCanceled)
 	if err != nil {
 		return fmt.Errorf("store: mark running: %w", err)
 	}
@@ -411,7 +412,9 @@ UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = '' WHERE t
 		return fmt.Errorf("store: mark running rows: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("store: mark running: job_runs row missing (task_id=%s)", taskID)
+		// 0 行 = 行缺失或 succeeded/canceled 复活被拒（C6：有意的终态不可被过期写者
+		// 推翻；failed→running 为 asynq 重试周期正常路径，dead→running 仅供手动重置后）
+		return fmt.Errorf("store: mark running: job_runs succeeded/canceled resurrection rejected or missing (task_id=%s)", taskID)
 	}
 	return nil
 }
@@ -426,8 +429,8 @@ func (s *Store) Finish(ctx context.Context, taskID, status, errMsg string, attem
 	res, err := s.exec(ctx, `
 UPDATE job_runs
 SET status = ?, attempts = ?, error = ?, finished_at = ?, duration_ms = ?
-WHERE task_id = ?`,
-		status, attempts, errMsg, finishedAt, durationMS, taskID)
+WHERE task_id = ? AND status = ? AND attempts = ?`,
+		status, attempts, errMsg, finishedAt, durationMS, taskID, StatusRunning, attempts)
 	if err != nil {
 		return fmt.Errorf("store: finish job_run: %w", err)
 	}
@@ -436,7 +439,9 @@ WHERE task_id = ?`,
 		return fmt.Errorf("store: finish job_run rows: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("store: finish job_run: job_runs row missing (task_id=%s)", taskID)
+		// 0 行 = 过期写者（C6：租约失效重投递后，新执行已推进 status/attempts，
+		// 旧 goroutine 的终态写入被等值谓词拒绝）或行缺失
+		return fmt.Errorf("store: finish job_run: no running row with matching attempt (task_id=%s)", taskID)
 	}
 	return nil
 }

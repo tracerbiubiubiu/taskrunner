@@ -31,6 +31,7 @@ type Config struct {
 	}
 	Queue           string        `mapstructure:"queue"`
 	Concurrency     int           `mapstructure:"concurrency"`
+	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"` // asynq 停机排空上限；<=0 → 30s（C5）
 	MaxRetry        int           `mapstructure:"max_retry"`
 	CallbackTimeout time.Duration `mapstructure:"callback_timeout"`
 	CronTick        time.Duration `mapstructure:"cron_tick"`

@@ -79,9 +79,15 @@ func (a *App) Run() error {
 		a.logger.Info("shutting down")
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 排空对称（批次8）：HTTP 排空与 asynq 收尾共用 shutdown_timeout 上限——
+	// 总停机 ≈ 2×shutdown_timeout，编排侧 terminationGracePeriod 须 ≥ 该值；
+	// 排空超时不再静默（此前 `_ =` 吞掉，在途请求被无痕丢弃——HTTP 侧无
+	// requeue 兜底，与任务侧 at-least-once 不同）
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
 	defer cancel()
-	_ = a.server.Shutdown(shutdownCtx)
+	if err := a.server.Shutdown(shutdownCtx); err != nil {
+		a.logger.Warn("http drain timeout/skipped, in-flight requests dropped", "err", err)
+	}
 	a.asynqSrv.Shutdown() // 等在跑任务收尾
 	return nil
 }

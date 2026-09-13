@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -50,6 +51,25 @@ func serve(configPath string) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	// R5：启动期可写探测 fail-closed——非 root 镜像 + 宿主 bind mount 时，目录
+	// 属主不受镜像 chown 控制；lumberjack/sqlite 写失败均为静默（仅 stdout，
+	// 而 stdout 正是排障通道），必须在起服务前暴露
+	probeDir := func(dir, what string) {
+		if dir == "" {
+			return
+		}
+		probe := filepath.Join(dir, ".write-probe")
+		f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.Fatalf("%s 目录不可写（%s）：%v——检查挂载目录属主（容器用户 uid 100）或改用可写目录", what, dir, err)
+		}
+		f.Close()
+		_ = os.Remove(probe)
+	}
+	probeDir(cfg.Log.Dir, "log")
+	if cfg.DB.Driver != "pg" {
+		probeDir(filepath.Dir(cfg.DB.Path), "sqlite 数据")
 	}
 	a, cleanup, err := app.InitializeApp(cfg)
 	if err != nil {

@@ -4,6 +4,8 @@
 package handler
 
 import (
+	"strings"
+
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -229,7 +231,13 @@ func (d *Deps) createJob(c *gin.Context) {
 		return
 	}
 	// created_by 服务端兜底（归因口径 2026-09-11）：body 缺省取验签头 X-Operator
-	//（中间件已入 ctx）——调用方无关，杜绝「创建人落空」；显式传值优先
+	//（中间件已入 ctx）——调用方无关，杜绝「创建人落空」；显式传值优先。
+	// 卫生约束：去空白防纯空格串；64 上限对齐 activelist operator 列
+	req.CreatedBy = strings.TrimSpace(req.CreatedBy)
+	if len(req.CreatedBy) > 64 {
+		response.BadRequest(c, "created_by 超过上限（64）")
+		return
+	}
 	if req.CreatedBy == "" {
 		req.CreatedBy = c.GetString("operator")
 	}

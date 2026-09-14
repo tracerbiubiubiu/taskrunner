@@ -13,3 +13,6 @@ logs/
 .idea/
 .vscode/
 bin/
+
+# 部署态本地密钥
+.env

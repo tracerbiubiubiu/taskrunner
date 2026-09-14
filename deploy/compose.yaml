@@ -1,0 +1,103 @@
+# taskrunner 部署态 compose（M3/D 阶段交付物；开发态 = 仓库根 configs/config.yaml + 宿主进程）。
+#
+# 拓扑（C3 网络隔离，对齐 activelist D5 双 network 模式）：taskrunner 跨双网——
+# taskrunner_internal（PG/Redis 仅内网可达）与 zhuzhao_to_taskrunner（external，
+# 由部署侧预建：docker network create zhuzhao_to_taskrunner；zhuzhao app 容器须加入
+# 同一网络并以 http://taskrunner:8080 寻址本服务）。本栈全部服务【不对宿主发布端口】，
+# zhuzhao 经共享网反代式调用；回调由本服务主动拨 zhuzhao（callback URL 由 zhuzhao 下发）。
+#
+# 环境变量（.env 或 export）：
+#   TASKRUNNER_PG_PASSWORD      taskrunner 专用 PG 口令（必需，缺失拒建）
+#   TASKRUNNER_CALLER_ZHUZHAO_SK  zhuzhao 出站签名 SK（须与 zhuzhao 侧 TASKRUNNER_SK 同值）。
+#                                 compose 缺省 dev-taskrunner-sk（=zhuzhao dev 同值）仅供
+#                                 本地起栈；应用对空 SK fail-closed 拒启
+#   TASKRUNNER_SELF_SK          回调签名 SK（须与 zhuzhao 侧 INTERNAL_JOBS_SK 同值）；
+#                                 缺省 dev-callback-sk 同上
+#
+# 存储：job_runs/jobs 落专用 PG（C7 拍板，联调只用 PG）；asynq 队列落本栈 Redis。
+# 备份口径未定（job_runs 保留期 M4 一并拍）——pgbackup 侧车暂缺位。
+name: taskrunner
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: taskrunner
+      POSTGRES_PASSWORD: ${TASKRUNNER_PG_PASSWORD:?需注入 TASKRUNNER_PG_PASSWORD}
+      POSTGRES_DB: taskrunner
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - taskrunner_internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskrunner -d taskrunner"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:6.2-alpine
+    environment:
+      REDIS_PASSWORD: ${TASKRUNNER_REDIS_PASSWORD:-taskrunner-dev}
+    command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redisdata:/data
+    networks:
+      - taskrunner_internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  taskrunner:
+    build: ..
+    image: taskrunner:latest
+    environment:
+      # 存储（C7）：PG 形态，表结构由应用启动自建（CREATE TABLE IF NOT EXISTS）
+      TASKRUNNER_DB_DRIVER: pg
+      TASKRUNNER_DB_HOST: postgres
+      TASKRUNNER_DB_PORT: "5432"
+      TASKRUNNER_DB_USER: taskrunner
+      TASKRUNNER_DB_PASSWORD: ${TASKRUNNER_PG_PASSWORD}
+      TASKRUNNER_DB_NAME: taskrunner
+      TASKRUNNER_DB_SSLMODE: disable
+      # asynq 队列（本栈 Redis，独立键空间归属本服务）
+      TASKRUNNER_REDIS_ADDR: redis:6379
+      TASKRUNNER_REDIS_PASSWORD: ${TASKRUNNER_REDIS_PASSWORD:-taskrunner-dev}
+      TASKRUNNER_REDIS_DB: "0"
+      # AK/SK 密钥环（与 zhuzhao 侧对值：TASKRUNNER_SK / INTERNAL_JOBS_SK）
+      TASKRUNNER_CALLER_ZHUZHAO_SK: ${TASKRUNNER_CALLER_ZHUZHAO_SK:-dev-taskrunner-sk}
+      TASKRUNNER_SELF_AK: taskrunner
+      TASKRUNNER_SELF_SK: ${TASKRUNNER_SELF_SK:-dev-callback-sk}
+    networks:
+      taskrunner_internal: {}
+      zhuzhao_to_taskrunner:
+        aliases:
+          - taskrunner # 供 zhuzhao 以 http://taskrunner:8080 稳定寻址
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # 无 ports 段——8080 不对宿主发布（C3）；R5 可写探测在镜像内 /data /logs
+    # 已预授权（named volume 首挂继承镜像属主 app），bind mount 改挂时依赖
+    # 启动探针 fail-closed 暴露属主问题。
+
+networks:
+  taskrunner_internal: {}
+  zhuzhao_to_taskrunner:
+    external: true
+
+volumes:
+  pgdata:
+  redisdata:

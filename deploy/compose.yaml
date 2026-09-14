@@ -73,6 +73,8 @@ services:
       TASKRUNNER_CALLER_ZHUZHAO_SK: ${TASKRUNNER_CALLER_ZHUZHAO_SK:-dev-taskrunner-sk}
       TASKRUNNER_SELF_AK: taskrunner
       TASKRUNNER_SELF_SK: ${TASKRUNNER_SELF_SK:-dev-callback-sk}
+      # 重试上限（默认 5；E 阶段演练曾临时置 0 快速造 dead 靶标）
+      TASKRUNNER_MAX_RETRY: ${TASKRUNNER_MAX_RETRY:-5}
     networks:
       taskrunner_internal: {}
       zhuzhao_to_taskrunner:

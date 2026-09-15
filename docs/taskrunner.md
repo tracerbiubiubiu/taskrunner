@@ -302,6 +302,26 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 模块内顺序 **M1 → M2 → M3**，M4 可与 M3 并行。
 
+### 后置项触发条件总表（2026-09-15 沉淀；评审时逐行过一遍触发状态）
+
+检测逻辑：触发信号 = 开始有人在现有机制外打补丁。各后置项详见上方 ⚠️ 列表与对应章节。
+
+| 后置项 | 触发条件 | 不触发的代价 |
+|---|---|---|
+| cron 分布式锁 | 多副本部署**前必须**（硬前置） | 多实例每 tick 重复触发 |
+| overlap_policy | 周期任务出现上轮未完下轮又触发的重叠（建议 M3 联调顺手落地，audit_archive 配 skip_if_running） | 重叠双跑，靠幂等兜底 |
+| M4 运维完善（asynqmon/指标/死信告警/保留清理） | phase3 收尾或 phase4 初；**保留清理含个人信息，不宜久拖** | 异常无告警、死信无人知、记录无界增长 |
+| E-⑤ 可见性策略表 | 跨部门隔离管控需求 / 任务参数敏感化 | 全员可见+dept 筛选，无泄漏面 |
+| E-⑥ 终败通知回调 | 无人盯守的周期任务、失败需业务方知情 | 靠死信告警 + /monitor 人工 |
+| 优先级队列 | 任务抢并发（如通知插队归档） | 低优任务排队变慢 |
+| 一次性延迟任务 | 「N 分钟后 / 指定时刻跑一次」需求 | 暂无 |
+| 编排（链式/外部 DAG） | 真实「A 完成触发 B」链式需求（红线：不做通用流程引擎） | 复杂依赖人工串 |
+| 能力服务（新建承接通用动作） | 通用动作批量涌现 / 多服务注册动作成负担 | 通用动作走内置例外或手填 |
+| 能力目录（已定稿，实现后置） | 第二执行端接入 / zhuzhao 薄化启动 / 手填 URL 成负担（三者其一） | 提交方手填 URL |
+| 日志平台（ES/Loki + shipper） | 跨服务检索需求 / 日志量令 grep 吃力 | 人工 grep 文件 |
+| 日志脱敏 | 日志出内网 / 接入 ES（落点 C1 钩子） | 内网文件留存阶段可接受 |
+| PG schema 演进机制 | PG 首次结构变更前 | 新列缺失 → INSERT 全量失败 |
+
 ⚠️ 随 M2/M3 落地细化（M2 已定案部分随实现入档）：
 - ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；
 - ~~credential 具体形式~~ ✅ M2 定案：静态 Bearer token（`TASKRUNNER_API_TOKEN`）——**2026-09-03 被 AK/SK 基线修订覆盖：Bearer → AK/SK HMAC 验签**（utils `aksk`，C2/C8）；
@@ -311,7 +331,9 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - ~~action 校验方式~~ ✅ M2 定案：**不做前置校验**——不存在 / 未注册的 action 经回调 4xx 快速失败（non-retryable，failed 可见）；zhuzhao 清单端点方案保留为可选增强；
 - 回调超时默认值：实现取 30s（env `TASKRUNNER_CALLBACK_TIMEOUT` 可改，载荷可按任务覆盖）——随 M3 验证后转正式口径；
 - **同一 job 重叠执行策略（2026-09-03 登记，随 M3/M4 落地）**：现状 cron 到点即触发新 task_id，上次未完成也再触发一份（重叠允许，仅幂等兜底）。job 定义缺 overlap 策略字段——建议增 `overlap_policy: allow | skip_if_running`（默认 allow；audit_archive 等周期批任务配 skip_if_running，对齐 zhuzhao 13 号 M-E「阻塞策略按任务拍板」）；
-- `job_runs` 保留期：仍待定（M4 随清理任务落地）。
+- `job_runs` 保留期：仍待定（M4 随清理任务落地）；
+- **PG schema 演进机制缺失（2026-09-15 排查发现，PG 首次结构变更前落地）**：轻量列迁移（migrateColumns）仅 SQLite 路径，PG 全新建库即最终形态——但未来 PG 加列时 CREATE TABLE IF NOT EXISTS 不会补列，INSERT 将全量失败。方案：仿 SQLite 加 information_schema 判存补列，或引入 golang-migrate；此前 PG 结构变更走手工迁移 SQL 并在本节登记；
+- **运行时边界口径（2026-09-15 排查沉淀）**：① **重试风暴**——zhuzhao 部署窗口内到期的 cron 任务全部失败，恢复后集中重试（退避 + MaxRetry 5 有界）；缓解=部署窗口避开 cron 点；② **时钟跳变**（NTP 校正/VM 迁移）——cronloop 依赖本机时钟，now 突进按「错失补一次」语义有界收敛，不无界追账；③ **callback_url SSRF 面**——回调目标由提交方指定，信任模型=提交方可信（AK/SK）+ 内网隔离；多调用方时代收敛手段即能力目录（code→白名单地址）；④ **任务定义不提供 DELETE**——仅停用（保护 job_runs 的 job_id 历史引用与审计追溯）；⑤ **切 PG 时存量 SQLite 数据不迁移**（当前均为联调数据，零迁移负担）。
 - **优先级队列（后置，2026-09-07）**：asynq 原生多队列加权（如 critical/default/low = 6/3/1）；预留设计 = job 定义加可选 `priority` 字段 + worker 队列权重配置化，回调链路零改动。**饥饿风险**：用加权不用严格优先、最多三档。触发条件：出现任务抢并发的场景（如通知要插队归档）；
 - **一次性延迟任务（后置，2026-09-07）**：asynq `ProcessAt` 原生支持（重试退避内部即此机制）；暴露成 API = 提交路径加可选参数（「N 分钟后 / 指定时刻跑一次」）；
 - **编排（后置，红线先行，2026-09-07）**：**taskrunner 不做通用流程引擎**（DAG 状态机 / 持久化工作流实例——ADR-002 铁律，跨线即成 Temporal 类产品）。两种形态：① **首选 = 外部 DAG 引擎**（Airflow / Dagster / 自研）逐节点调 `POST /v1/tasks`、轮询 `GET /v1/runs` 拿完成态（完成通知启用后可免轮询）——taskrunner 零改动、编排状态全归 DAG；② 无 DAG 时的最小替代 = job 定义加 `on_success` 字段 + worker 终态钩子 + `job_runs` 加 `result` 摘要列（该列不论编排都值得加，查询接口可返回任务产出）。触发条件：真实链式需求出现。
@@ -377,4 +399,5 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-11 | **归因口径修订**（四仓对账审计的拍板项落地）：废止「全部写接口 body 显式携带 actor/source_ip 原样存档」的过宽承诺——身份通道统一为验签头 `X-Operator`（中间件入 ctx）；`jobs.created_by` body 缺省由服务端取 X-Operator 兜底落库（显式传值优先，回归 TestCreateJobCreatedByFallback）；取消/重试/更新归因=访问日志 + request_id 跨查 zhuzhao audit_logs（审计正本在 zhuzhao，基线 §9）；`canceled_by` 触发驱动。zhuzhao-integration §2.7 同步 |
 | 2026-09-12 | **二轮复审验证与修复**：上轮 10 项修复全部在位确认。修复 5 项：① 死信列表分页（`page/page_size` 透传 asynq.Page/PageSize，响应回显页信息）② UpdateJobNextRun 时间参数化（updated_at 与 cronloop now 同源，可注入测试）③ DisableJob 布尔参数化（FALSE 字面量 → 占位符，方言一致）④ pgq 约束注释强化（字面量问号禁用 + 转义指引）⑤ middleware 单测从零到 7 例（RequestID / AccessLog / AKSK 验签 / 8MB 超限 / credentialOf） |
 | 2026-09-12 | **三轮复审（相似问题模式排查）**：① UpdateJob/DisableJob 的 RowsAffected 吞错修复（与 MarkRunning/Finish 同族）② TaskService 时钟可注入（Now 字段，4 处内联 time.Now 收口）③ config fail-closed 回归测试落地（空密钥环/空 SK/self_sk 缺失/空 queue/pg 缺 dbname 五路径 + 轮转默认值断言，锁住「90 天承诺」防复发）④ 中间件审查与测试已于上轮补齐（MaxBytesReader 已带 413 映射）。响应形状差异（OKPage vs 死信手工 map）系 asynq 无 total 所限，注释说明维持 |
+| 2026-09-15 | **后置项触发条件总表入档（§10）** + 排查新识别场景：PG schema 演进机制缺失（首次结构变更前落地，方案二选一入档）；运行时边界口径沉淀（重试风暴/时钟跳变/callback_url SSRF 信任模型/定义无 DELETE/切 PG 不迁存量） |
 | 2026-09-15 | **能力目录定稿（原五开放点关闭，实现后置）**：注册表=taskrunner DB；自注册为主+管理兜底；提交时快照；显式 callback_url 保留；与密钥环分表+服务级 owner_ak 引用；粒度按能力/扁平 code/跨 AK 抢注 409/无 TTL 心跳；SDK 抽 zhuzhao-utils。实现触发条件=第二执行端 / zhuzhao 薄化 / 手填负担（满足其一立独立批次，1–2 天） |

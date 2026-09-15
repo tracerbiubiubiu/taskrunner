@@ -104,7 +104,11 @@ func enqueueCmd(args []string) error {
 		return fmt.Errorf("--action 与 --callback-url 必填")
 	}
 	if !json.Valid([]byte(*params)) {
-		return fmt.Errorf("--params 不是合法 JSON")
+		return fmt.Errorf("--params 不是合法 JSON，请检查后重试")
+	}
+	// 与 HTTP 入口同口径：CLI 原先超界会被入队层静默截断为 86400（用户意图被悄悄改写），显式报错
+	if *timeoutSecs < 0 || *timeoutSecs > 86400 {
+		return fmt.Errorf("--timeout-secs 取值须为 0（用默认 30 秒）或 1–86400 之间的整数秒")
 	}
 	if *taskID == "" {
 		*taskID = uuid.NewString()

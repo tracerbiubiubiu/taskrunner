@@ -90,18 +90,19 @@ func AKSKAuth(keys map[string][]byte) gin.HandlerFunc {
 		if c.Request.Body != nil {
 			if body, err = io.ReadAll(c.Request.Body); err != nil {
 				var mbe *http.MaxBytesError
-				status := http.StatusBadRequest
+				// 区分两种状态：超限 = 调用方可自行修正（缩小 body）；读取失败 = 连接层问题
 				if errors.As(err, &mbe) {
-					status = http.StatusRequestEntityTooLarge
+					response.Fail(c, http.StatusRequestEntityTooLarge, 10001, "请求体超过 8MB 上限，请缩小后重试")
+				} else {
+					response.BadRequest(c, "请求体读取失败，请检查连接后重试")
 				}
-				response.Fail(c, status, 10001, "请求体读取失败或超过 8MB 上限")
 				c.Abort()
 				return
 			}
 			c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
 		}
 		if err := verifier.Verify(c.Request, body); err != nil {
-			response.Unauthorized(c, err.Error())
+			response.Unauthorized(c, authErrMsg(err))
 			c.Abort()
 			return
 		}
@@ -109,6 +110,26 @@ func AKSKAuth(keys map[string][]byte) gin.HandlerFunc {
 			c.Set("caller", ak)
 		}
 		c.Next()
+	}
+}
+
+// authErrMsg 把 aksk 验签错误映射为中文可读消息：调用方按失败原因即可自查
+// （漏带头 / 头格式错 / AK 未开通 / 时钟偏移 / SK 不匹配），不必对照英文库错误排查。
+// 注意安全边界：不回显任何签名串或密钥信息。
+func authErrMsg(err error) string {
+	switch {
+	case errors.Is(err, aksk.ErrMissingHeader):
+		return "缺少 Authorization 认证头，请使用 AK/SK 签名后重试"
+	case errors.Is(err, aksk.ErrBadHeader):
+		return "Authorization 头格式错误，应为：HMAC Credential=<AK>,Ts=<RFC3339时间>,Sig=<签名>"
+	case errors.Is(err, aksk.ErrUnknownCredential):
+		return "访问凭证（AK）未登记或已停用，请联系管理员开通"
+	case errors.Is(err, aksk.ErrExpired):
+		return "请求时间戳超出允许时间窗口，请校准本机时钟后重试"
+	case errors.Is(err, aksk.ErrBadSignature):
+		return "签名校验失败，请检查 SK、请求体及 X-Request-ID/X-Operator 头是否与签名一致"
+	default:
+		return "鉴权失败，请检查 AK/SK 签名后重试"
 	}
 }
 

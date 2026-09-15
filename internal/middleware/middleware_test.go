@@ -3,6 +3,8 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -154,5 +156,28 @@ func TestCredentialOf(t *testing.T) {
 	req2 := httptest.NewRequest("POST", "/", nil)
 	if got := credentialOf(req2); got != "" {
 		t.Fatalf("no header: %q", got)
+	}
+}
+
+// TestAuthErrMsg 验签失败的不同状态各给明确中文提示（库错误均以 %w 包装，errors.Is 须可穿透）。
+func TestAuthErrMsg(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"missing", aksk.ErrMissingHeader, "缺少 Authorization"},
+		{"bad header", fmt.Errorf("%w: bad ts %q", aksk.ErrBadHeader, "xxx"), "格式错误"},
+		{"unknown ak", fmt.Errorf("%w: %s", aksk.ErrUnknownCredential, "ak-x"), "未登记"},
+		{"expired", fmt.Errorf("%w: %s", aksk.ErrExpired, "2020-01-01T00:00:00Z"), "时间窗口"},
+		{"bad sig", aksk.ErrBadSignature, "签名校验失败"},
+		{"other", errors.New("something else"), "鉴权失败"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := authErrMsg(tc.err); !strings.Contains(got, tc.want) {
+				t.Fatalf("authErrMsg(%v) = %q, want contains %q", tc.err, got, tc.want)
+			}
+		})
 	}
 }

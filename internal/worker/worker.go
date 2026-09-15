@@ -55,7 +55,7 @@ func (d Deps) finish(ctx context.Context, logger *slog.Logger, taskID, status, e
 // handleCallback 单次尝试的执行流程：running → 回调 → succeeded / failed / dead。
 // 终态判定（设计文档 §4）：
 //   - 回调成功 → succeeded；
-//   - 4xx（ErrNonRetryable）→ failed 终态，SkipRetry；
+//   - 不可重试错误（ErrNonRetryable：4xx / callback_url 非法等本地构造错误）→ failed 终态，SkipRetry；
 //   - 5xx / 超时，重试未耗尽 → failed（等 Asynq 退避重试）；
 //   - 5xx / 超时，本次已是最后一次 → dead（死信）。
 func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
@@ -95,7 +95,7 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 
 	case errors.Is(err, callback.ErrNonRetryable):
 		d.finish(ctx, logger, p.TaskID, repository.StatusFailed, err.Error(), attempt, now)
-		logger.Error("task failed terminally (non-retryable 4xx)", slog.Int("attempt", attempt), slog.Any("err", err))
+		logger.Error("task failed terminally (non-retryable: 4xx or malformed request)", slog.Int("attempt", attempt), slog.Any("err", err))
 		return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 
 	default:

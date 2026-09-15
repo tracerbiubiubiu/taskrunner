@@ -17,8 +17,10 @@ import (
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
-// ErrNonRetryable 4xx 类失败：worker 应跳过重试直接判失败。
-var ErrNonRetryable = errors.New("callback: non-retryable failure")
+// ErrNonRetryable 不可重试失败：4xx（对端明确拒绝，重试不会改变结果）
+// 或重试无法恢复的本地构造错误（如 callback_url 非法）。worker 跳过重试直接判终败。
+// 错误文本会落 job_runs.error 并经查询接口回显，故用中文写明分类与定位要素。
+var ErrNonRetryable = errors.New("回调失败（不可重试）")
 
 // Config 回调客户端参数。
 type Config struct {
@@ -60,7 +62,8 @@ func (p paramJSON) MarshalJSON() ([]byte, error) {
 	return p, nil
 }
 
-// Do 执行一次回调。nil = 成功；ErrNonRetryable = 4xx；其他 error = 可重试。
+// Do 执行一次回调。nil = 成功；包装 ErrNonRetryable = 不可重试（4xx / 本地构造错误）；
+// 其他 error = 可重试（5xx / 网络错误 / 超时）。
 func (c *Client) Do(ctx context.Context, p task.Payload) error {
 	timeout := c.cfg.Timeout
 	if p.TimeoutSecs > 0 {
@@ -78,12 +81,14 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 		SourceIP:  p.SourceIP,
 	})
 	if err != nil {
-		return fmt.Errorf("callback: marshal: %w", err)
+		// 入参已在提交侧校验，正常不可达；一旦发生属载荷本身缺陷，重试无法恢复
+		return fmt.Errorf("%w：请求体序列化失败（请检查 params）: %v", ErrNonRetryable, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.CallbackURL, bytes.NewReader(b))
 	if err != nil {
-		return fmt.Errorf("callback: build request: %w", err)
+		// callback_url 非法：配置错误，重试不会改变结果——直接终败并指明排查对象
+		return fmt.Errorf("%w：回调地址非法（请检查 callback_url=%s）: %v", ErrNonRetryable, p.CallbackURL, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// C9（基线 §9）：回调请求以自身 SK 签名（覆盖 body/X-Request-ID/X-Operator），
@@ -96,7 +101,8 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("callback: do: %w", err) // 含 context 超时，可重试
+		// 网络错误 / 连接重置 / context 超时：对端可能恢复，Asynq 退避重试
+		return fmt.Errorf("回调失败（可重试，网络错误或超时），动作 %s，地址 %s: %w", p.Action, p.CallbackURL, err)
 	}
 	defer resp.Body.Close()
 
@@ -107,9 +113,13 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		return fmt.Errorf("%w: status=%d action=%s body=%q", ErrNonRetryable, resp.StatusCode, p.Action, readSnippet(resp.Body))
+		// 4xx = 对端明确拒绝（动作不存在/参数错误/鉴权失败）：重试不改变结果，终败
+		return fmt.Errorf("%w：对端返回 HTTP %d（客户端错误），动作 %s，响应片段: %q",
+			ErrNonRetryable, resp.StatusCode, p.Action, readSnippet(resp.Body))
 	default:
-		return fmt.Errorf("callback: retryable: status=%d action=%s body=%q", resp.StatusCode, p.Action, readSnippet(resp.Body))
+		// 5xx 及其他 = 对端暂时异常：退避重试
+		return fmt.Errorf("回调失败（可重试）：对端返回 HTTP %d（服务端错误），动作 %s，响应片段: %q",
+			resp.StatusCode, p.Action, readSnippet(resp.Body))
 	}
 }
 

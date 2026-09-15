@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,11 @@ func Test4xxNonRetryable(t *testing.T) {
 	if !errors.Is(err, ErrNonRetryable) {
 		t.Fatalf("want ErrNonRetryable, got %v", err)
 	}
+	// 错误消息落 job_runs.error：须带分类、HTTP 状态码与动作，运维扫列即可定位
+	if got := err.Error(); !strings.Contains(got, "不可重试") || !strings.Contains(got, "HTTP 400") ||
+		!strings.Contains(got, "audit_archive") {
+		t.Fatalf("4xx error message lacks category/status/action: %q", got)
+	}
 }
 
 func Test5xxRetryable(t *testing.T) {
@@ -65,6 +71,9 @@ func Test5xxRetryable(t *testing.T) {
 	err := New(Config{Timeout: time.Second}).Do(context.Background(), payload(srv.URL))
 	if err == nil || errors.Is(err, ErrNonRetryable) {
 		t.Fatalf("want retryable error, got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "可重试") || !strings.Contains(got, "HTTP 500") {
+		t.Fatalf("5xx error message lacks category/status: %q", got)
 	}
 }
 
@@ -78,6 +87,21 @@ func TestTimeoutRetryable(t *testing.T) {
 	err := New(Config{Timeout: 50 * time.Millisecond}).Do(context.Background(), payload(srv.URL))
 	if err == nil || errors.Is(err, ErrNonRetryable) {
 		t.Fatalf("want timeout (retryable) error, got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "可重试") {
+		t.Fatalf("timeout error message should be marked retryable: %q", got)
+	}
+}
+
+func TestBadCallbackURLNonRetryable(t *testing.T) {
+	// callback_url 非法属配置错误：重试无法恢复，须直接终败并指出排查对象
+	err := New(Config{Timeout: time.Second}).Do(context.Background(),
+		payload("http://[missing-bracket"))
+	if !errors.Is(err, ErrNonRetryable) {
+		t.Fatalf("want ErrNonRetryable for bad url, got %v", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "回调地址非法") || !strings.Contains(got, "callback_url") {
+		t.Fatalf("bad-url message should point to callback_url: %q", got)
 	}
 }
 

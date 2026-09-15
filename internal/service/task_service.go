@@ -29,11 +29,21 @@ type TaskInspector interface {
 }
 
 // 业务错误（handler 映射 HTTP；不携带 HTTP 语义）。
-var (
-	ErrTaskNotFound  = errors.New("service: task not found")
-	ErrJobNotFound   = errors.New("service: job not found")
-	ErrStateConflict = errors.New("service: state conflict")
-)
+var ErrStateConflict = errors.New("service: state conflict")
+
+// NotFoundError 资源不存在（→ 404）：携带资源中文名与标识，
+// handler 直接回显——调用方能区分「任务 task_id 不存在」还是「任务定义 job_id 不存在」。
+type NotFoundError struct {
+	Resource string // 任务 | 任务定义
+	ID       string
+}
+
+func (e *NotFoundError) Error() string {
+	return fmt.Sprintf("%s不存在: %s", e.Resource, e.ID)
+}
+
+func taskNotFound(id string) error { return &NotFoundError{Resource: "任务", ID: id} }
+func jobNotFound(id string) error  { return &NotFoundError{Resource: "任务定义", ID: id} }
 
 // InvalidError 参数/校验错误（→ 400）。
 type InvalidError struct{ Msg string }
@@ -48,6 +58,23 @@ type ConflictError struct{ Msg string }
 func (e *ConflictError) Error() string { return e.Msg }
 
 func conflict(format string, a ...any) error { return &ConflictError{Msg: fmt.Sprintf(format, a...)} }
+
+// stateText 状态码 → 「中文状态（英文机读码）」展示串：
+// 冲突消息让调用方既看懂当前状态，又能拿括号里的机读值去对照查询接口返回。
+func stateText(status string) string {
+	labels := map[string]string{
+		repository.StatusPending:   "等待执行",
+		repository.StatusRunning:   "执行中",
+		repository.StatusSucceeded: "已成功",
+		repository.StatusFailed:    "执行失败",
+		repository.StatusDead:      "死信（重试耗尽）",
+		repository.StatusCanceled:  "已取消",
+	}
+	if label, ok := labels[status]; ok {
+		return fmt.Sprintf("%s（%s）", label, status)
+	}
+	return status
+}
 
 // TaskService 任务域服务。
 type TaskService struct {
@@ -175,7 +202,7 @@ func nullTime(t sql.NullTime) *time.Time {
 func (s *TaskService) GetTask(ctx context.Context, taskID string) (*TaskView, error) {
 	run, err := s.repo.GetByTaskID(ctx, taskID)
 	if errors.Is(err, repository.ErrNotFound) {
-		return nil, ErrTaskNotFound
+		return nil, taskNotFound(taskID)
 	}
 	if err != nil {
 		return nil, err
@@ -258,17 +285,17 @@ func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) (
 func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 	run, err := s.repo.GetByTaskID(ctx, taskID)
 	if errors.Is(err, repository.ErrNotFound) {
-		return ErrTaskNotFound
+		return taskNotFound(taskID)
 	}
 	if err != nil {
 		return err
 	}
 	if run.Status != repository.StatusPending {
-		return conflict("仅未开始的任务可取消，当前状态: %s", run.Status)
+		return conflict("仅「等待执行」状态的任务可取消，当前状态：%s", stateText(run.Status))
 	}
 	if info, err := s.inspector.GetTaskInfo(s.queue, taskID); err == nil {
 		if info.State == asynq.TaskStateActive {
-			return conflict("任务正在执行，无法取消")
+			return conflict("任务已开始执行，无法取消（仅等待执行的任务可取消）")
 		}
 	} else if !errors.Is(err, asynq.ErrTaskNotFound) {
 		return err
@@ -276,7 +303,7 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 	// ErrTaskNotFound：DB 为 pending 但队列已无此任务（提交后入队失败的残留），直接标 canceled
 	if err := s.inspector.DeleteTask(s.queue, taskID); err != nil && !errors.Is(err, asynq.ErrTaskNotFound) {
 		if strings.Contains(err.Error(), "active state") { // 检查后瞬间被 worker 取走
-			return conflict("任务正在执行，无法取消")
+			return conflict("任务已开始执行，无法取消（仅等待执行的任务可取消）")
 		}
 		return err
 	}
@@ -294,13 +321,13 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 func (s *TaskService) RetryTask(ctx context.Context, taskID string) error {
 	run, err := s.repo.GetByTaskID(ctx, taskID)
 	if errors.Is(err, repository.ErrNotFound) {
-		return ErrTaskNotFound
+		return taskNotFound(taskID)
 	}
 	if err != nil {
 		return err
 	}
 	if run.Status != repository.StatusFailed && run.Status != repository.StatusDead {
-		return conflict("仅失败/死信任务可重试，当前状态: %s", run.Status)
+		return conflict("仅「执行失败」或「死信」状态的任务可重试，当前状态：%s", stateText(run.Status))
 	}
 	if err := s.inspector.RunTask(s.queue, taskID); err != nil {
 		if errors.Is(err, asynq.ErrTaskNotFound) {
@@ -435,7 +462,7 @@ func (s *TaskService) ListJobs(ctx context.Context, f repository.JobFilter) ([]J
 func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (*JobView, error) {
 	j, err := s.repo.GetJob(ctx, jobID)
 	if errors.Is(err, repository.ErrNotFound) {
-		return nil, ErrJobNotFound
+		return nil, jobNotFound(jobID)
 	}
 	if err != nil {
 		return nil, err
@@ -445,7 +472,7 @@ func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (
 	}
 	if p.CronSpec != nil {
 		if j.TriggerType != repository.TriggerCron {
-			return nil, invalid("仅 cron 类型定义可改 cron_spec")
+			return nil, invalid("仅 cron 触发类型的任务定义可修改 cron_spec，当前触发类型：%s", j.TriggerType)
 		}
 		if _, err := ParseSpec(*p.CronSpec); err != nil {
 			return nil, invalid("cron_spec 非法: %s", err.Error())
@@ -488,13 +515,13 @@ type TriggerInput struct {
 func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerInput) (*SubmitOutput, error) {
 	j, err := s.repo.GetJob(ctx, jobID)
 	if errors.Is(err, repository.ErrNotFound) {
-		return nil, ErrJobNotFound
+		return nil, jobNotFound(jobID)
 	}
 	if err != nil {
 		return nil, err
 	}
 	if !j.Enabled {
-		return nil, conflict("任务定义已停用")
+		return nil, conflict("任务定义已停用（enabled=false），请先启用后再触发")
 	}
 	taskID := uuid.NewString()
 	accepted, warning, err := s.submitter.Submit(ctx, task.Payload{

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +119,12 @@ func (f *fixture) do(t *testing.T, method, path string, body any) *httptest.Resp
 	if body != nil {
 		raw, _ = json.Marshal(body)
 	}
+	return f.doRaw(t, method, path, raw)
+}
+
+// doRaw 发送原始字节（含签名），用于构造非法 JSON 等无法经 json.Marshal 得到的请求体。
+func (f *fixture) doRaw(t *testing.T, method, path string, raw []byte) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(method, path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	aksk.Sign(req, raw, aksk.SignOptions{AK: callerAK, SK: []byte(callerSK),
@@ -546,5 +553,71 @@ func TestDeadLetters(t *testing.T) {
 	data = m["data"].(map[string]any)
 	if data["page"].(float64) != 1 || data["page_size"].(float64) != 50 {
 		t.Fatalf("clamp echo: %v", data)
+	}
+}
+
+// TestErrorMessageDistinguishesState 错误消息按状态区分：
+// 缺字段 vs JSON 损坏给不同提示；404 带资源类型与标识，调用方可直接定位。
+func TestErrorMessageDistinguishesState(t *testing.T) {
+	f := newFixture(t)
+
+	// 合法 JSON 但缺必填 → 报「必填」而非 JSON 格式错误
+	wMissing := f.doRaw(t, http.MethodPost, "/v1/tasks", []byte(`{}`))
+	if wMissing.Code != http.StatusBadRequest {
+		t.Fatalf("missing fields want 400, got %d", wMissing.Code)
+	}
+	_, m := decode(t, wMissing)
+	if msg, _ := m["message"].(string); !strings.Contains(msg, "必填") {
+		t.Fatalf("missing-field message = %q", msg)
+	}
+
+	// 截断的 JSON → 明确报 JSON 非法（解码错误是 io.ErrUnexpectedEOF，须与缺字段区分）
+	wTruncated := f.doRaw(t, http.MethodPost, "/v1/tasks", []byte(`{"action":`))
+	if wTruncated.Code != http.StatusBadRequest {
+		t.Fatalf("truncated json want 400, got %d", wTruncated.Code)
+	}
+	_, m = decode(t, wTruncated)
+	if msg, _ := m["message"].(string); !strings.Contains(msg, "合法 JSON") {
+		t.Fatalf("truncated-json message = %q", msg)
+	}
+
+	// 语法错误 JSON 同样报 JSON 非法
+	wSyntax := f.doRaw(t, http.MethodPost, "/v1/tasks", []byte(`{not-json`))
+	if wSyntax.Code != http.StatusBadRequest {
+		t.Fatalf("bad syntax want 400, got %d", wSyntax.Code)
+	}
+	_, m = decode(t, wSyntax)
+	if msg, _ := m["message"].(string); !strings.Contains(msg, "合法 JSON") {
+		t.Fatalf("syntax-error message = %q", msg)
+	}
+
+	// 404 消息含资源类型 + 具体 ID（不再是笼统的「对象不存在」）
+	w404 := f.do(t, http.MethodGet, "/v1/tasks/tk-missing", nil)
+	if w404.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", w404.Code)
+	}
+	_, m = decode(t, w404)
+	msg, _ := m["message"].(string)
+	if !strings.Contains(msg, "任务") || !strings.Contains(msg, "tk-missing") {
+		t.Fatalf("404 message should name resource and id, got %q", msg)
+	}
+
+	// 取消成功态任务 → 409 消息带中文当前状态
+	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
+		"task_id": "tk-done", "action": "a", "callback_url": "http://x"})
+	now := time.Now()
+	if err := f.st.MarkRunning(context.Background(), "tk-done", 1, now); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if err := f.st.Finish(context.Background(), "tk-done", repository.StatusSucceeded, "", 1, now, now); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	wConflict := f.do(t, http.MethodPost, "/v1/tasks/cancel", map[string]any{"task_id": "tk-done"})
+	if wConflict.Code != http.StatusConflict {
+		t.Fatalf("cancel succeeded want 409, got %d", wConflict.Code)
+	}
+	_, m = decode(t, wConflict)
+	if msg, _ := m["message"].(string); !strings.Contains(msg, "已成功") || !strings.Contains(msg, "succeeded") {
+		t.Fatalf("conflict message should show chinese+raw state, got %q", msg)
 	}
 }

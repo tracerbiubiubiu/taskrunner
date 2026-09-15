@@ -4,6 +4,7 @@
 package handler
 
 import (
+	"io"
 	"strings"
 
 	"encoding/json"
@@ -80,8 +81,7 @@ type submitReq struct {
 
 func (d *Deps) submitTask(c *gin.Context) {
 	var req submitReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "action 与 callback_url 必填")
+	if !bindBody(c, &req, "action 与 callback_url 必填") {
 		return
 	}
 	// request_id 兜底：zhuzhao client 签名头携带 X-Request-ID，body 可不带——
@@ -91,15 +91,15 @@ func (d *Deps) submitTask(c *gin.Context) {
 	}
 	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
 	if len(req.Params) > 64<<10 {
-		response.BadRequest(c, "params 超过上限（64KB）")
+		response.BadRequest(c, "params 超过上限（64KB），请精简后重试")
 		return
 	}
 	if len(req.Params) > 0 && !json.Valid(req.Params) {
-		response.BadRequest(c, "params 不是合法 JSON")
+		response.BadRequest(c, "params 不是合法 JSON，请检查后重试")
 		return
 	}
 	if !validTimeoutSecs(req.TimeoutSecs) {
-		response.BadRequest(c, "timeout_secs 须为 0 或 1–86400")
+		response.BadRequest(c, msgTimeoutSecs)
 		return
 	}
 	out, err := d.Tasks.Submit(c.Request.Context(), service.SubmitInput{
@@ -137,7 +137,7 @@ func (d *Deps) listRuns(c *gin.Context) {
 		if v := c.Query(k); v != "" {
 			t, err := time.Parse(time.RFC3339, v)
 			if err != nil {
-				response.BadRequest(c, k+" 需为 RFC3339 时间")
+				response.BadRequest(c, "查询参数 "+k+" 需为 RFC3339 格式时间（例：2026-09-15T08:00:00Z）")
 				return
 			}
 			*dest = &t
@@ -171,8 +171,7 @@ type taskIDReq struct {
 
 func (d *Deps) cancelTask(c *gin.Context) {
 	var req taskIDReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "task_id 必填")
+	if !bindBody(c, &req, "task_id 必填") {
 		return
 	}
 	if err := d.Tasks.CancelTask(c.Request.Context(), req.TaskID); err != nil {
@@ -185,8 +184,7 @@ func (d *Deps) cancelTask(c *gin.Context) {
 
 func (d *Deps) retryTask(c *gin.Context) {
 	var req taskIDReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "task_id 必填")
+	if !bindBody(c, &req, "task_id 必填") {
 		return
 	}
 	if err := d.Tasks.RetryTask(c.Request.Context(), req.TaskID); err != nil {
@@ -215,21 +213,20 @@ type createJobReq struct {
 
 func (d *Deps) createJob(c *gin.Context) {
 	var req createJobReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "action_id / callback_url / trigger_type 必填")
+	if !bindBody(c, &req, "action_id / callback_url / trigger_type 必填") {
 		return
 	}
 	if !validTimeoutSecs(req.TimeoutSecs) {
-		response.BadRequest(c, "timeout_secs 须在 0–86400 秒")
+		response.BadRequest(c, msgTimeoutSecs)
 		return
 	}
 	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
 	if len(req.Params) > 64<<10 {
-		response.BadRequest(c, "params 超过上限（64KB）")
+		response.BadRequest(c, "params 超过上限（64KB），请精简后重试")
 		return
 	}
 	if len(req.Params) > 0 && !json.Valid(req.Params) {
-		response.BadRequest(c, "params 不是合法 JSON")
+		response.BadRequest(c, "params 不是合法 JSON，请检查后重试")
 		return
 	}
 	// created_by 服务端兜底（归因口径 2026-09-11）：body 缺省取验签头 X-Operator
@@ -280,20 +277,19 @@ type patchJobReq struct {
 
 func (d *Deps) patchJob(c *gin.Context) {
 	var req patchJobReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "job_id 必填")
+	if !bindBody(c, &req, "job_id 必填") {
 		return
 	}
 	if req.TimeoutSecs != nil && !validTimeoutSecs(*req.TimeoutSecs) {
-		response.BadRequest(c, "timeout_secs 须在 0–86400 秒")
+		response.BadRequest(c, msgTimeoutSecs)
 		return
 	}
 	if len(req.Params) > 64<<10 {
-		response.BadRequest(c, "params 超过上限（64KB）")
+		response.BadRequest(c, "params 超过上限（64KB），请精简后重试")
 		return
 	}
 	if len(req.Params) > 0 && !json.Valid(req.Params) {
-		response.BadRequest(c, "params 不是合法 JSON")
+		response.BadRequest(c, "params 不是合法 JSON，请检查后重试")
 		return
 	}
 	v, err := d.Tasks.UpdateJob(c.Request.Context(), req.JobID, service.JobPatch{
@@ -317,8 +313,7 @@ type triggerReq struct {
 
 func (d *Deps) triggerJob(c *gin.Context) {
 	var req triggerReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "job_id 必填")
+	if !bindBody(c, &req, "job_id 必填") {
 		return
 	}
 	if req.RequestID == "" {
@@ -337,20 +332,44 @@ func (d *Deps) triggerJob(c *gin.Context) {
 
 // ---- 工具 ----
 
+// msgTimeoutSecs timeout_secs 统一校验文案（提交/建定义/改定义三处同一规则同一说法）。
+const msgTimeoutSecs = "timeout_secs 取值须为 0（沿用默认 30 秒）或 1–86400 之间的整数秒"
+
+// bindBody 绑定 JSON 请求体并区分失败原因：
+// JSON 语法/类型错误 → 明确提示「请求体不是合法 JSON」（而非笼统报字段必填，
+// 让调用方在「漏字段」和「格式坏」两种状态间少走弯路）；其余（缺必填、空体等）→ requiredMsg。
+func bindBody(c *gin.Context, dst any, requiredMsg string) bool {
+	if err := c.ShouldBindJSON(dst); err != nil {
+		var se *json.SyntaxError
+		var ute *json.UnmarshalTypeError
+		// 截断 JSON 解码报 io.ErrUnexpectedEOF（非 SyntaxError），需单独识别；
+		// 空体报 io.EOF，属「缺必填」走 requiredMsg
+		if errors.As(err, &se) || errors.As(err, &ute) || errors.Is(err, io.ErrUnexpectedEOF) {
+			response.BadRequest(c, "请求体不是合法 JSON，请检查格式后重试")
+		} else {
+			response.BadRequest(c, requiredMsg)
+		}
+		return false
+	}
+	return true
+}
+
 // fail service 错误 → HTTP 映射：NotFound→404 / Invalid→400 / Conflict→409 / 其他→500。
 func (d *Deps) fail(c *gin.Context, err error, internalMsg string) {
 	var inv *service.InvalidError
 	var con *service.ConflictError
+	var nf *service.NotFoundError
 	switch {
-	case errors.Is(err, service.ErrTaskNotFound), errors.Is(err, service.ErrJobNotFound):
-		response.NotFound(c, "对象不存在")
+	case errors.As(err, &nf):
+		response.NotFound(c, nf.Error())
 	case errors.As(err, &inv):
 		response.BadRequest(c, inv.Msg)
 	case errors.As(err, &con):
 		response.Fail(c, http.StatusConflict, errcode.ErrConflict.Code, con.Msg)
 	default:
 		d.Logger.Error("handler: service error", "err", err, "op", c.Request.Method+" "+c.Request.URL.Path)
-		response.InternalError(c, internalMsg)
+		// 内部细节只进日志；对调用方给操作指引（request_id 已随响应体回显，便于报障定位）
+		response.InternalError(c, internalMsg+"，请稍后重试；若持续失败请携带 request_id 联系管理员")
 	}
 }
 

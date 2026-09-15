@@ -1,4 +1,5 @@
-// Package app 应用装配（providers——Wire 依赖的构造函数；wire.go 为注入描述）。
+// Package app 应用装配（providers——Wire 依赖的构造函数；注入关系见 wire_gen.go，
+// 其为手工维护的唯一装配源——生成器依赖未入 go.sum，见该文件头注）。
 package app
 
 import (

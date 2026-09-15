@@ -1,4 +1,5 @@
-// Package store 维护 job_runs（taskrunner 自有存储，设计文档 §6；C7：SQLite / PostgreSQL 双驱动）。
+// Package repository 维护 job_runs / jobs（taskrunner 自有存储，设计文档 §6；C7：SQLite / PostgreSQL 双驱动）。
+// 包名 repository 为 2026-09-04 微服务结构重构所改（原 store），对齐 handler/service/repository 分层。
 // 查询统一 `?` 占位符编写，PG 路径执行前机械转换为 $n（两条驱动共用一套 SQL）。
 // 一行 = 一个任务的完整生命周期：入队 pending → running → succeeded / failed（可重试）/ dead（重试耗尽）。
 package repository

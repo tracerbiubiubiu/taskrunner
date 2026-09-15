@@ -59,6 +59,11 @@ func serve(configPath string) {
 		if dir == "" {
 			return
 		}
+		// 先补齐目录：首启时目录可能尚不存在——缺失 ≠ 不可写，直接探测会把
+		// 首次部署误判为 fail（MkdirAll 失败才是真不可写）
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("%s 目录无法创建（%s）：%v", what, dir, err)
+		}
 		probe := filepath.Join(dir, ".write-probe")
 		f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {

@@ -213,8 +213,8 @@ WHERE enabled AND trigger_type = 'cron' AND next_run IS NOT NULL AND next_run <=
 // DisableJob 停用任务定义并清空 next_run（cronloop 对无效 spec 的防御路径：
 // 必须真正落库停用，仅清 next_run 会因零值时间戳仍命中到期扫描而每 tick 重触发）。
 func (s *Store) DisableJob(ctx context.Context, jobID string, updatedAt time.Time) error {
-	res, err := s.exec(ctx, `UPDATE jobs SET enabled = FALSE, next_run = NULL, updated_at = ? WHERE job_id = ?`,
-		updatedAt, jobID)
+	res, err := s.exec(ctx, `UPDATE jobs SET enabled = ?, next_run = NULL, updated_at = ? WHERE job_id = ?`,
+		false, updatedAt, jobID)
 	if err != nil {
 		return fmt.Errorf("store: disable job: %w", err)
 	}
@@ -225,9 +225,11 @@ func (s *Store) DisableJob(ctx context.Context, jobID string, updatedAt time.Tim
 }
 
 // UpdateJobNextRun 推进下次触发时间。
-func (s *Store) UpdateJobNextRun(ctx context.Context, jobID string, next time.Time) error {
+// UpdateJobNextRun 推进下次触发时间；updatedAt 由调用方传入（与 cronloop 的 now
+// 同源，避免两处取时的微小偏差，时间确定性测试也可注入）。
+func (s *Store) UpdateJobNextRun(ctx context.Context, jobID string, next, updatedAt time.Time) error {
 	_, err := s.exec(ctx, `UPDATE jobs SET next_run = ?, updated_at = ? WHERE job_id = ?`,
-		next, time.Now(), jobID)
+		next, updatedAt, jobID)
 	if err != nil {
 		return fmt.Errorf("store: update next_run: %w", err)
 	}

@@ -217,11 +217,16 @@ type DeadLetterView struct {
 	LastFailedAt time.Time `json:"last_failed_at"`
 }
 
-func (s *TaskService) ListDeadLetters(ctx context.Context, pageSize int) ([]DeadLetterView, error) {
+// ListDeadLetters 死信分页（asynq 游标分页无 total，page 从 1 起）。
+func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) ([]DeadLetterView, error) {
 	if pageSize <= 0 {
 		pageSize = 50
 	}
-	tasks, err := s.inspector.ListArchivedTasks(s.queue, asynq.PageSize(pageSize))
+	opts := []asynq.ListOption{asynq.PageSize(pageSize)}
+	if page > 1 {
+		opts = append(opts, asynq.Page(page))
+	}
+	tasks, err := s.inspector.ListArchivedTasks(s.queue, opts...)
 	if err != nil {
 		return nil, err
 	}

@@ -152,12 +152,13 @@ func (d *Deps) listRuns(c *gin.Context) {
 }
 
 func (d *Deps) listDeadLetters(c *gin.Context) {
-	list, err := d.Tasks.ListDeadLetters(c.Request.Context(), atoi(c.Query("page_size"), 50))
+	page, pageSize := atoi(c.Query("page"), 1), atoi(c.Query("page_size"), 50)
+	list, err := d.Tasks.ListDeadLetters(c.Request.Context(), page, pageSize)
 	if err != nil {
 		d.fail(c, err, "查询失败")
 		return
 	}
-	response.OK(c, list)
+	response.OK(c, gin.H{"list": list, "page": page, "page_size": pageSize})
 }
 
 // ---- 干预 ----

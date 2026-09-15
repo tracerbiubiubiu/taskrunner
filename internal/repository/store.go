@@ -182,7 +182,10 @@ CREATE TABLE IF NOT EXISTS job_runs (
 }
 
 // pgq PG 路径把 `?` 占位符顺序转换为 $1..$n（SQL 中无字面量 `?`，机械替换安全；
-// SQLite 原生支持 `?`，原样返回）。单查询内含字符串字面量 `?` 时不可用——当前无此场景。
+// SQLite 原生支持 `?`，原样返回）。
+// ⚠️ 约束：本机制要求 SQL 语句的字符串字面量中不得出现 `?`（会被误转为 $n 静默损坏）。
+// 新增查询若需字面量问号：SQLite 用 `??` 转义、PG 用 position/chr(63) 表达，或改走
+// 各自方言 DDL——评审时 grep 双检。当前全仓无此场景。
 func (s *Store) pgq(query string) string {
 	if !s.pg {
 		return query

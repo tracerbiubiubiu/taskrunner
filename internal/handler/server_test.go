@@ -523,13 +523,17 @@ func TestJobsCRUDAndTrigger(t *testing.T) {
 func TestDeadLetters(t *testing.T) {
 	f := newFixture(t)
 	f.insp.list = []*asynq.TaskInfo{{ID: "dead-1", State: asynq.TaskStateArchived, LastErr: "boom"}}
-	w := f.do(t, http.MethodGet, "/v1/dead-letters", nil)
+	w := f.do(t, http.MethodGet, "/v1/dead-letters?page=2&page_size=50", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", w.Code)
 	}
 	_, m := decode(t, w)
-	list := m["data"].([]any)
+	data := m["data"].(map[string]any)
+	list := data["list"].([]any)
 	if list[0].(map[string]any)["task_id"] != "dead-1" {
 		t.Fatalf("dead letters: %v", list)
+	}
+	if data["page"].(float64) != 2 || data["page_size"].(float64) != 50 {
+		t.Fatalf("pagination echo: %v", data)
 	}
 }

@@ -98,7 +98,7 @@ func TestPGFullLifecycle(t *testing.T) {
 	if len(due) != 1 {
 		t.Fatalf("due jobs: %d", len(due))
 	}
-	if err := s.UpdateJobNextRun(ctx, "j-pg", now.Add(24*time.Hour)); err != nil {
+	if err := s.UpdateJobNextRun(ctx, "j-pg", now.Add(24*time.Hour), now); err != nil {
 		t.Fatalf("advance: %v", err)
 	}
 	due, _ = s.ListDueCronJobs(ctx, now)

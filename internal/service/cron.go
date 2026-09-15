@@ -102,7 +102,7 @@ func (l *Loop) FireDue(ctx context.Context) {
 				slog.String("job_id", j.JobID), slog.String("spec", j.CronSpec))
 			continue
 		}
-		if uerr := l.Store.UpdateJobNextRun(ctx, j.JobID, next); uerr != nil {
+		if uerr := l.Store.UpdateJobNextRun(ctx, j.JobID, next, l.now()); uerr != nil {
 			// 推进失败 → 下个 tick 以新 task_id 重触发同一动作（task_id 幂等拦不住），
 			// 显式告警供运维介入
 			l.Logger.Error("cronloop: advance next_run failed, duplicate fire risk",

@@ -332,7 +332,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - 回调超时默认值：实现取 30s（env `TASKRUNNER_CALLBACK_TIMEOUT` 可改，载荷可按任务覆盖）——随 M3 验证后转正式口径；
 - **同一 job 重叠执行策略（2026-09-03 登记，随 M3/M4 落地）**：现状 cron 到点即触发新 task_id，上次未完成也再触发一份（重叠允许，仅幂等兜底）。job 定义缺 overlap 策略字段——建议增 `overlap_policy: allow | skip_if_running`（默认 allow；audit_archive 等周期批任务配 skip_if_running，对齐 zhuzhao 13 号 M-E「阻塞策略按任务拍板」）；
 - `job_runs` 保留期：仍待定（M4 随清理任务落地）；
-- **PG schema 演进机制缺失（2026-09-15 排查发现，PG 首次结构变更前落地）**：轻量列迁移（migrateColumns）仅 SQLite 路径，PG 全新建库即最终形态——但未来 PG 加列时 CREATE TABLE IF NOT EXISTS 不会补列，INSERT 将全量失败。方案：仿 SQLite 加 information_schema 判存补列，或引入 golang-migrate；此前 PG 结构变更走手工迁移 SQL 并在本节登记；
+- ~~PG schema 演进机制缺失~~ ✅ **已落地（2026-09-15）**：migrateColumns 扩展双驱动——SQLite 走 pragma_table_info、PG 走 information_schema 判存，ALTER 补列语句两驱动通用；旧库升级回归测试双侧覆盖（SQLite legacy + PG legacy）。若结构演进频率上升，再评估升级 golang-migrate 版本化迁移；
 - **运行时边界口径（2026-09-15 排查沉淀）**：① **重试风暴**——zhuzhao 部署窗口内到期的 cron 任务全部失败，恢复后集中重试（退避 + MaxRetry 5 有界）；缓解=部署窗口避开 cron 点；② **时钟跳变**（NTP 校正/VM 迁移）——cronloop 依赖本机时钟，now 突进按「错失补一次」语义有界收敛，不无界追账；③ **callback_url SSRF 面**——回调目标由提交方指定，信任模型=提交方可信（AK/SK）+ 内网隔离；多调用方时代收敛手段即能力目录（code→白名单地址）；④ **任务定义不提供 DELETE**——仅停用（保护 job_runs 的 job_id 历史引用与审计追溯）；⑤ **切 PG 时存量 SQLite 数据不迁移**（当前均为联调数据，零迁移负担）。
 - **优先级队列（后置，2026-09-07）**：asynq 原生多队列加权（如 critical/default/low = 6/3/1）；预留设计 = job 定义加可选 `priority` 字段 + worker 队列权重配置化，回调链路零改动。**饥饿风险**：用加权不用严格优先、最多三档。触发条件：出现任务抢并发的场景（如通知要插队归档）；
 - **一次性延迟任务（后置，2026-09-07）**：asynq `ProcessAt` 原生支持（重试退避内部即此机制）；暴露成 API = 提交路径加可选参数（「N 分钟后 / 指定时刻跑一次」）；
@@ -401,3 +401,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-12 | **三轮复审（相似问题模式排查）**：① UpdateJob/DisableJob 的 RowsAffected 吞错修复（与 MarkRunning/Finish 同族）② TaskService 时钟可注入（Now 字段，4 处内联 time.Now 收口）③ config fail-closed 回归测试落地（空密钥环/空 SK/self_sk 缺失/空 queue/pg 缺 dbname 五路径 + 轮转默认值断言，锁住「90 天承诺」防复发）④ 中间件审查与测试已于上轮补齐（MaxBytesReader 已带 413 映射）。响应形状差异（OKPage vs 死信手工 map）系 asynq 无 total 所限，注释说明维持 |
 | 2026-09-15 | **后置项触发条件总表入档（§10）** + 排查新识别场景：PG schema 演进机制缺失（首次结构变更前落地，方案二选一入档）；运行时边界口径沉淀（重试风暴/时钟跳变/callback_url SSRF 信任模型/定义无 DELETE/切 PG 不迁存量） |
 | 2026-09-15 | **能力目录定稿（原五开放点关闭，实现后置）**：注册表=taskrunner DB；自注册为主+管理兜底；提交时快照；显式 callback_url 保留；与密钥环分表+服务级 owner_ak 引用；粒度按能力/扁平 code/跨 AK 抢注 409/无 TTL 心跳；SDK 抽 zhuzhao-utils。实现触发条件=第二执行端 / zhuzhao 薄化 / 手填负担（满足其一立独立批次，1–2 天） |
+| 2026-09-15 | **PG 列迁移对称落地（migrateColumns 双驱动）**：SQLite pragma_table_info / PG information_schema 判存补列，ALTER 通用；修复 PG 存在性查询占位符（?→$1/$2）；旧库升级回归测试 SQLite+PG 双侧覆盖——消除「PG 部署后首次加字段升级即计划外停机」缺口（对应场景：C11 式加列在 PG 旧库上报 column not exist 全量失败） |

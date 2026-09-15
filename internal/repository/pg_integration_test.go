@@ -196,3 +196,53 @@ func TestPGMarkRunningRejectsSucceededResurrection(t *testing.T) {
 		t.Fatalf("终态应保持不变: %+v", got)
 	}
 }
+
+// 旧库列迁移（PG 路径，C7 补齐的对称能力）：旧库缺新列 → Open 补列 → 新列读写。
+func TestPGLegacyColumnMigration(t *testing.T) {
+	dsn := os.Getenv("TASKRUNNER_TEST_PG_DSN")
+	if dsn == "" {
+		t.Skip("TASKRUNNER_TEST_PG_DSN 未设置")
+	}
+	raw, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`DROP TABLE IF EXISTS job_runs; DROP TABLE IF EXISTS jobs;
+CREATE TABLE job_runs (
+	id           BIGSERIAL PRIMARY KEY,
+	task_id      TEXT NOT NULL UNIQUE,
+	request_id   TEXT NOT NULL DEFAULT '',
+	action       TEXT NOT NULL,
+	callback_url TEXT NOT NULL DEFAULT '',
+	status       TEXT NOT NULL DEFAULT 'pending',
+	attempts     INTEGER NOT NULL DEFAULT 0,
+	error        TEXT NOT NULL DEFAULT '',
+	duration_ms  BIGINT NOT NULL DEFAULT 0,
+	submitted_by TEXT NOT NULL DEFAULT '',
+	source_ip    TEXT NOT NULL DEFAULT '',
+	started_at   TIMESTAMPTZ,
+	finished_at  TIMESTAMPTZ,
+	enqueued_at  TIMESTAMPTZ NOT NULL
+);`); err != nil {
+		raw.Close()
+		t.Fatalf("create legacy pg table: %v", err)
+	}
+	raw.Close()
+
+	s, err := OpenPG(dsn)
+	if err != nil {
+		t.Fatalf("OpenPG on legacy db: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	if err := s.InsertPending(ctx, Run{
+		TaskID: "pg-lg", Action: "a", JobID: "j", Dept: "audit",
+		Params: `{"k":1}`, CallbackURL: "http://x", EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("insert with new columns: %v", err)
+	}
+	if r, err := s.GetByTaskID(ctx, "pg-lg"); err != nil || r.Dept != "audit" || r.JobID != "j" {
+		t.Fatalf("pg migrated columns round-trip: %+v %v", r, err)
+	}
+}

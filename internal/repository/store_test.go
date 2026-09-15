@@ -182,3 +182,55 @@ func TestPGQueryPlaceholderConversion(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// 旧库列迁移（SQLite 路径）：模拟 C11 之前的旧库（无 job_id/dept/params 列），
+// Open 后自动补列且读写含新列的完整行。
+func TestLegacySQLiteColumnMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := `
+CREATE TABLE job_runs (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	task_id      TEXT NOT NULL UNIQUE,
+	request_id   TEXT NOT NULL DEFAULT '',
+	action       TEXT NOT NULL,
+	callback_url TEXT NOT NULL DEFAULT '',
+	status       TEXT NOT NULL DEFAULT 'pending',
+	attempts     INTEGER NOT NULL DEFAULT 0,
+	error        TEXT NOT NULL DEFAULT '',
+	duration_ms  INTEGER NOT NULL DEFAULT 0,
+	submitted_by TEXT NOT NULL DEFAULT '',
+	source_ip    TEXT NOT NULL DEFAULT '',
+	started_at   TIMESTAMP,
+	finished_at  TIMESTAMP,
+	enqueued_at  TIMESTAMP NOT NULL
+);`
+	if _, err := raw.Exec(legacy); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	raw.Close()
+
+	s, err := Open(path) // Open 应补齐 job_id/dept/params 三列
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	if err := s.InsertPending(ctx, Run{
+		TaskID: "lg-1", RequestID: "lr", Action: "a", JobID: "j1", Dept: "audit",
+		Params: `{"k":1}`, CallbackURL: "http://x", EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("insert with new columns: %v", err)
+	}
+	r, err := s.GetByTaskID(ctx, "lg-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if r.JobID != "j1" || r.Dept != "audit" || r.Params != `{"k":1}` {
+		t.Fatalf("migrated columns round-trip: %+v", r)
+	}
+}

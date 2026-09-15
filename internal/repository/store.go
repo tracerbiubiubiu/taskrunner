@@ -139,12 +139,12 @@ func open(driver, target string) (*Store, error) {
 			return nil, fmt.Errorf("store: migrate extra(%s): %w", driver, err)
 		}
 	}
-	// 轻量列迁移仅 SQLite 存在（旧库升级）；PG 全新建库即最终形态
-	if driver == DriverSQLite {
-		if err := migrateColumns(db); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("store: migrate columns: %w", err)
-		}
+	// 轻量列迁移（双驱动，C7 补齐 PG 路径）：CREATE TABLE IF NOT EXISTS 对已存在的
+	// 旧库空转——新列（job_id/dept/params）必须判存补齐，否则升级后 INSERT/SELECT
+	// 报 no column 全量失败。新增列在此登记（ALTER 语句两驱动通用）。
+	if err := migrateColumns(db, driver); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: migrate columns: %w", err)
 	}
 	// 索引最后建：引用新列的索引（如 idx_job_runs_job_id）在旧库补列前会失败
 	if _, err := db.Exec(indexes); err != nil {
@@ -216,10 +216,13 @@ func (s *Store) queryRow(ctx context.Context, q string, args ...any) *sql.Row {
 	return s.db.QueryRowContext(ctx, s.pgq(q), args...)
 }
 
-// migrateColumns 按列判存补齐旧库缺失列（幂等：新库全部命中跳过）。
-// 依赖 SQLite ALTER TABLE ADD COLUMN 不带默认值时对 NOT NULL 约束的限制，
-// 故新列均先加可空再回填默认值——本表默认均为 ”/'{}' 文本，直接带 DEFAULT 即可。
-func migrateColumns(db *sql.DB) error {
+// migrateColumns 按列判存补齐旧库缺失列（幂等：新库全部命中跳过；双驱动——
+// SQLite 走 pragma_table_info，PG 走 information_schema；ALTER 语句两驱动通用）。
+func migrateColumns(db *sql.DB, driver string) error {
+	existsQuery := map[string]string{
+		DriverSQLite: "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+		DriverPG:     "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
+	}
 	type colDef struct {
 		table string
 		col   string
@@ -230,7 +233,7 @@ func migrateColumns(db *sql.DB) error {
 		{"job_runs", "dept", "ALTER TABLE job_runs ADD COLUMN dept TEXT NOT NULL DEFAULT ''"},
 		{"job_runs", "params", "ALTER TABLE job_runs ADD COLUMN params TEXT NOT NULL DEFAULT '{}'"},
 	} {
-		rows, err := db.Query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", c.table, c.col)
+		rows, err := db.Query(existsQuery[driver], c.table, c.col)
 		if err != nil {
 			return err
 		}

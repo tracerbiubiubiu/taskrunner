@@ -1,5 +1,6 @@
-// Package config 配置加载（C6：yaml + `${VAR}` 环境变量展开，对齐 zhuzhao 模式；
-// 原全 env 的 TASKRUNNER_* 变量继续生效——BindEnv 显式绑定，无 yaml 也可纯 env 运行）。
+// Package config 配置加载（C6：viper 读 yaml 字面值 + TASKRUNNER_* env BindEnv 覆盖
+// ——对齐 zhuzhao 实际模式，yaml 不做 ${VAR} 插值；
+// 无 yaml 也可纯 env 运行）。
 package config
 
 import (

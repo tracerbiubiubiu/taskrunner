@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
+	"github.com/tracerbiubiubiu/zhuzhao-utils/errcode"
 	"github.com/tracerbiubiubiu/zhuzhao-utils/response"
 )
 
@@ -67,7 +68,7 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 			"path", c.Request.URL.Path,
 			"query", q,
 			"status", c.Writer.Status(),
-			"cost_ms", time.Since(start).Milliseconds(),
+			"duration_ms", time.Since(start).Milliseconds(),
 			"request_id", c.GetString("request_id"),
 			"operator", operator,
 			"caller", c.GetString("caller"),
@@ -92,7 +93,7 @@ func AKSKAuth(keys map[string][]byte) gin.HandlerFunc {
 				var mbe *http.MaxBytesError
 				// 区分两种状态：超限 = 调用方可自行修正（缩小 body）；读取失败 = 连接层问题
 				if errors.As(err, &mbe) {
-					response.Fail(c, http.StatusRequestEntityTooLarge, 10001, "请求体超过 8MB 上限，请缩小后重试")
+					response.Fail(c, http.StatusRequestEntityTooLarge, errcode.ErrInvalidParams.Code, "请求体超过 8MB 上限，请缩小后重试")
 				} else {
 					response.BadRequest(c, "请求体读取失败，请检查连接后重试")
 				}

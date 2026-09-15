@@ -69,7 +69,7 @@ func TestAccessLogFieldsAndProbeSkip(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
 		t.Fatalf("log line: %v (%s)", err, buf.String())
 	}
-	for _, k := range []string{"method", "path", "status", "cost_ms", "request_id", "operator", "caller", "ip"} {
+	for _, k := range []string{"method", "path", "status", "duration_ms", "request_id", "operator", "caller", "ip"} {
 		if _, ok := line[k]; !ok {
 			t.Fatalf("missing field %q in %v", k, line)
 		}

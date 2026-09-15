@@ -152,7 +152,8 @@ func (d *Deps) listRuns(c *gin.Context) {
 }
 
 func (d *Deps) listDeadLetters(c *gin.Context) {
-	page, pageSize := atoi(c.Query("page"), 1), atoi(c.Query("page_size"), 50)
+	// 钳制后回显生效值（与 runs/jobs 端点同款——调用方无需猜测实际页大小）
+	page, pageSize := clampPage(atoi(c.Query("page"), 1)), clampSize(atoi(c.Query("page_size"), 50), 50)
 	list, err := d.Tasks.ListDeadLetters(c.Request.Context(), page, pageSize)
 	if err != nil {
 		d.fail(c, err, "查询失败")

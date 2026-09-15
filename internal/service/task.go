@@ -218,8 +218,9 @@ type DeadLetterView struct {
 }
 
 // ListDeadLetters 死信分页（asynq 游标分页无 total，page 从 1 起）。
+// pageSize 钳制 [1,200] 越界回落 50——对齐 store 层 ListRuns 同款防御（直调方兜底）。
 func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) ([]DeadLetterView, error) {
-	if pageSize <= 0 {
+	if pageSize <= 0 || pageSize > 200 {
 		pageSize = 50
 	}
 	opts := []asynq.ListOption{asynq.PageSize(pageSize)}

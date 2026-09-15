@@ -536,4 +536,15 @@ func TestDeadLetters(t *testing.T) {
 	if data["page"].(float64) != 2 || data["page_size"].(float64) != 50 {
 		t.Fatalf("pagination echo: %v", data)
 	}
+
+	// 越界钳制并回显生效值（page_size>200 回落默认；page<1 回落 1）
+	w = f.do(t, http.MethodGet, "/v1/dead-letters?page=-3&page_size=100000", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+	_, m = decode(t, w)
+	data = m["data"].(map[string]any)
+	if data["page"].(float64) != 1 || data["page_size"].(float64) != 50 {
+		t.Fatalf("clamp echo: %v", data)
+	}
 }

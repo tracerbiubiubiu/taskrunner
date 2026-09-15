@@ -56,6 +56,15 @@ type TaskService struct {
 	inspector TaskInspector
 	queue     string
 	logger    *slog.Logger
+	// Now 可注入时钟（时间确定性测试）；零值回退 time.Now。
+	Now func() time.Time
+}
+
+func (s *TaskService) now() time.Time {
+	if s.Now != nil {
+		return s.Now()
+	}
+	return time.Now()
 }
 
 func NewTaskService(repo *repository.Store, submitter Submitter,
@@ -271,7 +280,7 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 		}
 		return err
 	}
-	ok, err := s.repo.MarkCanceledIfPending(ctx, taskID, "canceled via API", time.Now())
+	ok, err := s.repo.MarkCanceledIfPending(ctx, taskID, "canceled via API", s.now())
 	if err != nil {
 		return err
 	}
@@ -393,7 +402,7 @@ func (s *TaskService) CreateJob(ctx context.Context, in JobInput) (*JobView, err
 	if in.OwnerService == "" {
 		in.OwnerService = "zhuzhao"
 	}
-	now := time.Now()
+	now := s.now()
 	next, hasNext := NextRun(in.CronSpec, enabled && in.TriggerType == repository.TriggerCron, now)
 	j := repository.Job{
 		JobID: uuid.NewString(), ActionID: in.ActionID, TriggerType: in.TriggerType,
@@ -458,7 +467,7 @@ func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (
 	if p.Description != nil {
 		j.Description = *p.Description
 	}
-	j.UpdatedAt = time.Now()
+	j.UpdatedAt = s.now()
 	next, hasNext := NextRun(j.CronSpec, j.Enabled && j.TriggerType == repository.TriggerCron, j.UpdatedAt)
 	j.NextRun.Valid, j.NextRun.Time = hasNext, next
 	if err := s.repo.UpdateJob(ctx, *j); err != nil {

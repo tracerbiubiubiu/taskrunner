@@ -135,7 +135,11 @@ UPDATE jobs SET action_id=?, trigger_type=?, callback_url=?, cron_spec=?, params
 	if err != nil {
 		return fmt.Errorf("store: update job: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: rows: %w", err)
+	}
+	if n == 0 {
 		return ErrNotFound
 	}
 	return nil
@@ -218,7 +222,11 @@ func (s *Store) DisableJob(ctx context.Context, jobID string, updatedAt time.Tim
 	if err != nil {
 		return fmt.Errorf("store: disable job: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: rows: %w", err)
+	}
+	if n == 0 {
 		return ErrNotFound
 	}
 	return nil

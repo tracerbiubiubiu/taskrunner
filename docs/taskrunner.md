@@ -151,14 +151,16 @@
 - 执行端「启动自注册」client → zhuzhao-utils（执行端 SDK 内，多执行端复用，调注册 API + AK/SK 签名）；
 - 可选 `RegistryClient` 接口契约（Register / Resolve / Heartbeat）→ zhuzhao-utils 放**接口定义**，DB 实现在 taskrunner——为将来换 etcd / k8s 实现留平滑迁移口（业务零改动，实现方只换实现不换契约）。
 
-⚠️ **方案待定**（2026-09-04，机制方向已确认有价值，具体点未拍板、待讨论）：
-- 注册表归属：taskrunner DB（唯一查询方，倾向）vs 独立注册中心；
-- 注册方式：自注册 vs 配置录入 vs 两者并存；
-- 解析时机：提交时快照（倾向）vs 每次回调实时查；
-- 显式 `callback_url` 覆盖是否保留；
-- 与「密钥环多对端」合并为同一张表，还是分表。
+✅ **方案定稿（2026-09-15 拍板，原五开放点全部关闭；实现后置，触发条件见下）**：
+- 注册表归属：**taskrunner DB 同库一张表**（唯一查询方；不引 etcd/consul，表简单可迁）；
+- 注册方式：**执行端启动自注册为主 + 管理/配置兜底并存**（upsert 幂等；兜底解决启动顺序与应急）；
+- 解析时机：**提交时快照入 job 行**（运行期不依赖目录在线、可追溯"当时调了谁"；cron 每次触发重新解析，地址变更下次触发生效）；
+- 显式 `callback_url` 覆盖：**保留**（调试/直连/过渡；调用方本就 AK/SK 可信，job 行存实际解析结果可审计）；
+- 与密钥环关系：**分表 + 引用**（capability 条目带 `owner_ak` 服务级身份引用；密钥轮换与能力注册是两个生命周期，一个服务多能力共享一把 SK）；
+- 补充拍板：注册粒度**按能力一条**（含 owner_ak）；code **扁平命名** + 同 AK 可 upsert、跨 AK 抢注 409；注册 AK/SK **人工/env 发放**（对齐现有 aksk 口径）；**不做 TTL/心跳**（地址漂移靠启动自注册刷新，废弃=管理接口停用）；
+- 执行端 SDK（自注册 client + 统一 body 解包）：抽进 **zhuzhao-utils**（多执行端复用）。
 
-落地前需定稿。
+**实现触发条件（满足其一即立独立批次实现，预计 1–2 天；在此之前维持手填 `callback_url` 模式）**：① 第二个执行端服务接入动作体系；② zhuzhao 薄化（网关+IAM）启动、动作地址随部署动态化；③ 提交方手填/维护 URL 成为实际运维负担。
 
 **命名口径（2026-09-08）**：载荷/回调/一次性提交域统一用 **`action`**（task.Payload、回调 body、/v1/tasks 入参）；任务定义域用 **`action_id`**（jobs 表字段、/v1/jobs 入参、Registry 键）——前者是"运行时标识"，后者是"定义字段"，历史形成、语义可区分，不作强行统一（API 已有消费方）；能力目录（未实现）将用 `action_code`，拍板时一并对齐。
 
@@ -375,3 +377,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-11 | **归因口径修订**（四仓对账审计的拍板项落地）：废止「全部写接口 body 显式携带 actor/source_ip 原样存档」的过宽承诺——身份通道统一为验签头 `X-Operator`（中间件入 ctx）；`jobs.created_by` body 缺省由服务端取 X-Operator 兜底落库（显式传值优先，回归 TestCreateJobCreatedByFallback）；取消/重试/更新归因=访问日志 + request_id 跨查 zhuzhao audit_logs（审计正本在 zhuzhao，基线 §9）；`canceled_by` 触发驱动。zhuzhao-integration §2.7 同步 |
 | 2026-09-12 | **二轮复审验证与修复**：上轮 10 项修复全部在位确认。修复 5 项：① 死信列表分页（`page/page_size` 透传 asynq.Page/PageSize，响应回显页信息）② UpdateJobNextRun 时间参数化（updated_at 与 cronloop now 同源，可注入测试）③ DisableJob 布尔参数化（FALSE 字面量 → 占位符，方言一致）④ pgq 约束注释强化（字面量问号禁用 + 转义指引）⑤ middleware 单测从零到 7 例（RequestID / AccessLog / AKSK 验签 / 8MB 超限 / credentialOf） |
 | 2026-09-12 | **三轮复审（相似问题模式排查）**：① UpdateJob/DisableJob 的 RowsAffected 吞错修复（与 MarkRunning/Finish 同族）② TaskService 时钟可注入（Now 字段，4 处内联 time.Now 收口）③ config fail-closed 回归测试落地（空密钥环/空 SK/self_sk 缺失/空 queue/pg 缺 dbname 五路径 + 轮转默认值断言，锁住「90 天承诺」防复发）④ 中间件审查与测试已于上轮补齐（MaxBytesReader 已带 413 映射）。响应形状差异（OKPage vs 死信手工 map）系 asynq 无 total 所限，注释说明维持 |
+| 2026-09-15 | **能力目录定稿（原五开放点关闭，实现后置）**：注册表=taskrunner DB；自注册为主+管理兜底；提交时快照；显式 callback_url 保留；与密钥环分表+服务级 owner_ak 引用；粒度按能力/扁平 code/跨 AK 抢注 409/无 TTL 心跳；SDK 抽 zhuzhao-utils。实现触发条件=第二执行端 / zhuzhao 薄化 / 手填负担（满足其一立独立批次，1–2 天） |

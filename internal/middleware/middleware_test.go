@@ -99,7 +99,7 @@ func akskRouter(caller *string) *gin.Engine {
 	r := gin.New()
 	r.Use(aksk.GinMiddleware(&aksk.Verifier{Keys: map[string][]byte{"zhuzhao": []byte(testSK)}}, response.AKSKFail()))
 	r.POST("/echo", func(c *gin.Context) {
-		s := c.GetString("caller")
+		s := c.GetString(aksk.ContextKeyCaller)
 		if caller != nil {
 			*caller = s
 		}

@@ -242,7 +242,7 @@ func (d *Deps) createJob(c *gin.Context) {
 		return
 	}
 	if req.CreatedBy == "" {
-		req.CreatedBy = c.GetString("operator")
+		req.CreatedBy = c.GetString(aksk.ContextKeyOperator)
 	}
 	v, err := d.Tasks.CreateJob(c.Request.Context(), service.JobInput{
 		ActionID: req.ActionID, CallbackURL: req.CallbackURL, TriggerType: req.TriggerType,
@@ -380,7 +380,7 @@ func (d *Deps) fail(c *gin.Context, err error, internalMsg string) {
 // logOp 写操作归因打点（C1 访问日志之外的定向补充：op + 对象 + caller + request_id）。
 func (d *Deps) logOp(c *gin.Context, op, object string) {
 	d.Logger.Info("api op", "op", op, "object", object,
-		"caller", c.GetString("caller"), "request_id", c.GetString("request_id"))
+		"caller", c.GetString(aksk.ContextKeyCaller), "request_id", c.GetString("request_id"))
 }
 
 func jobFilterOf(c *gin.Context) repository.JobFilter {

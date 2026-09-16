@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
 )
 
 // RequestID 读入站 X-Request-ID（taskrunner→zhuzhao 回调 / zhuzhao client 均携带），
@@ -51,7 +53,7 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 		if len(q) > 4096 {
 			q = q[:4096]
 		}
-		operator := c.GetString("operator")
+		operator := c.GetString(aksk.ContextKeyOperator)
 		if operator == "" {
 			// ctx 值来自验签后的 GinMiddleware（可信归因）；无验签的挂载场景
 			// 回退读头，最终兜底 "system"（§9 口径）
@@ -67,7 +69,7 @@ func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 			"duration_ms", time.Since(start).Milliseconds(),
 			"request_id", c.GetString("request_id"),
 			"operator", operator,
-			"caller", c.GetString("caller"),
+			"caller", c.GetString(aksk.ContextKeyCaller),
 			"ip", c.ClientIP(),
 		)
 	}

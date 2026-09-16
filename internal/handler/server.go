@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
 	"github.com/tracerbiubiubiu/zhuzhao-utils/errcode"
 	"github.com/tracerbiubiubiu/zhuzhao-utils/response"
 
@@ -49,7 +50,10 @@ func New(d Deps) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
-	v1 := r.Group("/v1", middleware.AKSKAuth(d.Keys))
+	// 服务间验签（2026-09-16 统一批）：utils GinMiddleware + AKSKFail——读体上限
+	// （默认 8MB）/分档中文失败响应/caller·operator 归因写入全部库内承接；
+	// 失败现场经 Logger 落统一日志。密钥环空 = 全部 401（启动级 fail-closed 在 config）。
+	v1 := r.Group("/v1", aksk.GinMiddleware(&aksk.Verifier{Keys: d.Keys, Logger: d.Logger}, response.AKSKFail()))
 	{
 		v1.POST("/tasks", d.submitTask)
 		v1.GET("/tasks/:id", d.getTask)

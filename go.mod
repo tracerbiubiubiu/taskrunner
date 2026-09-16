@@ -10,7 +10,7 @@ require (
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/viper v1.21.0
-	github.com/tracerbiubiubiu/zhuzhao-utils v0.2.0
+	github.com/tracerbiubiubiu/zhuzhao-utils v0.4.0
 	modernc.org/sqlite v1.58.0
 )
 
@@ -68,3 +68,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
+
+replace github.com/tracerbiubiubiu/zhuzhao-utils => ../zhuzhao-utils

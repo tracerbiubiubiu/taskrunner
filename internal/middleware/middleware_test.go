@@ -3,8 +3,6 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
+	"github.com/tracerbiubiubiu/zhuzhao-utils/response"
 )
 
 func testRouter(h gin.HandlerFunc) *gin.Engine {
@@ -98,7 +97,7 @@ func signedRequest(t *testing.T, method, url string, body []byte, sk []byte) *ht
 func akskRouter(caller *string) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(AKSKAuth(map[string][]byte{"zhuzhao": []byte(testSK)}))
+	r.Use(aksk.GinMiddleware(&aksk.Verifier{Keys: map[string][]byte{"zhuzhao": []byte(testSK)}}, response.AKSKFail()))
 	r.POST("/echo", func(c *gin.Context) {
 		s := c.GetString("caller")
 		if caller != nil {
@@ -138,46 +137,12 @@ func TestAKSKAuth(t *testing.T) {
 
 func TestAKSKAuthBodyLimit(t *testing.T) {
 	r := akskRouter(nil)
-	big := strings.Repeat("x", 8<<20+1) // 8MB+1：超过预鉴权读体上限
+	big := []byte(strings.Repeat("x", 8<<20+1)) // 8MB+1：超过默认读体上限
+	// 带有效签名打 413（读体阶段先于验签）；未签名请求在读体前即被 401 廉价拒绝，
+	// 不进入读体路径（utils TestGinMiddleware_MissingHeaderSkipsBodyRead 覆盖）。
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/echo", strings.NewReader(big))
-	r.ServeHTTP(w, req)
+	r.ServeHTTP(w, signedRequest(t, "POST", "http://t/echo", big, []byte(testSK)))
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized body want 413, got %d", w.Code)
-	}
-}
-
-func TestCredentialOf(t *testing.T) {
-	req := httptest.NewRequest("POST", "/", nil)
-	req.Header.Set("Authorization", `HMAC Credential=zhuzhao,Ts=123,Sig=abc`)
-	if got := credentialOf(req); got != "zhuzhao" {
-		t.Fatalf("credentialOf: %q", got)
-	}
-	req2 := httptest.NewRequest("POST", "/", nil)
-	if got := credentialOf(req2); got != "" {
-		t.Fatalf("no header: %q", got)
-	}
-}
-
-// TestAuthErrMsg 验签失败的不同状态各给明确中文提示（库错误均以 %w 包装，errors.Is 须可穿透）。
-func TestAuthErrMsg(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want string
-	}{
-		{"missing", aksk.ErrMissingHeader, "缺少 Authorization"},
-		{"bad header", fmt.Errorf("%w: bad ts %q", aksk.ErrBadHeader, "xxx"), "格式错误"},
-		{"unknown ak", fmt.Errorf("%w: %s", aksk.ErrUnknownCredential, "ak-x"), "未登记"},
-		{"expired", fmt.Errorf("%w: %s", aksk.ErrExpired, "2020-01-01T00:00:00Z"), "时间窗口"},
-		{"bad sig", aksk.ErrBadSignature, "签名校验失败"},
-		{"other", errors.New("something else"), "鉴权失败"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := authErrMsg(tc.err); !strings.Contains(got, tc.want) {
-				t.Fatalf("authErrMsg(%v) = %q, want contains %q", tc.err, got, tc.want)
-			}
-		})
 	}
 }

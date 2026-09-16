@@ -13,7 +13,7 @@
    taskrunner API（AK/SK HMAC 签名；写接口显式带 actor 工号 + source_ip）
      │ cron 到点 / 出队
      ▼
-   taskrunner 回调 zhuzhao：POST /internal/jobs/callback（body：task_id + request_id + action + params——C10 约定化，action_id 不再走 URL 路径，2026-09-07）
+   taskrunner 回调 zhuzhao：POST /internal/jobs/callback（body：task_id + request_id + action + params + actor + source_ip——C10 约定化，action_id 不再走 URL 路径，2026-09-07）
      │ zhuzhao 查注册表执行 handler，HTTP 响应即单次结果
      ▼
    taskrunner 记 job_runs（详细过程只在 taskrunner，不回传）

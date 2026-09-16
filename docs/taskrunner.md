@@ -251,7 +251,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **独立部署**（独立进程/容器，不与 zhuzhao 布一块——zhuzhao 只作网关调用各能力、拉起各任务）；
 - **独立 Redis**（Asynq 队列归属 taskrunner，能力自包含，同 activelist 独立库原则）。口径：指 Redis 命名空间/库独立归属 taskrunner，**不必然新增一套 Redis 部署**，与 ADR-002「复用现有 Redis、不新增基础设施」不冲突，按部署环境落地；
 - **独立 DB**（`job_runs` 归 taskrunner 自有）。✅ **C7 已落地（2026-09-08）**：双驱动（sqlite / pg），PG 经 env `TASKRUNNER_DB_DRIVER=pg + TASKRUNNER_DB_HOST/PORT/USER/PASSWORD/NAME/SSLMODE` 配置；readyz 检 Redis + PG；
-- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + cron 循环同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6 迁 yaml+`${VAR}`）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要；**配套：cronloop 需先加分布式锁**，见 §5 执行模型）；`/monitor` 随容器同端口暴露，仅内网可达；
+- **Docker 部署（2026-09-03 确认）**：单容器单进程（API server + Asynq worker + cron 循环同进程，§5）；挂载卷：日志目录（轮转文件持久在宿主，供排障与后续采集）；配置走环境变量（C6：yaml 字面值 + TASKRUNNER_* env BindEnv 覆盖，无 `${VAR}` 插值）。~~SQLite 单写者 → 单副本部署~~（PG 后解除，多副本按运维需要；**配套：cronloop 需先加分布式锁**，见 §5 执行模型）；~~`/monitor` 随容器同端口暴露，仅内网可达~~（M4 asynqmon 未落地，当前无该路由）；
 - 公共工具统一引自 [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils)：`logger`（应用日志）、`postgres`（迁 PG 时）、`errcode` + `response`（API 统一响应）；`redis` 包用不上（Asynq 走自己的 `RedisClientOpt`）。依赖 utils（独立通用工具库）**不属于**「不反向依赖」的禁止范围。
 
 ### 工程结构与依赖注入（Wire，2026-09-04 确认）
@@ -264,11 +264,11 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 |---|---|
 | `cmd/taskrunner` | 薄入口：`serve`（常驻服务，默认 `configs/config.yaml`，纯 env 亦可）/ `enqueue`（CLI 调试入队，**手工装配不走 Wire**） |
 | `internal/app` | **装配与生命周期**：`wire_gen.go`（**唯一装配源**，注入集合以文件头注释维护）/ `providers.go`（12 个 provider 构造函数）/ `app.go`（Run 优雅启停）——`wire.go` 已删除 |
-| `internal/config` | 配置加载（C6：yaml + `${VAR}` 展开 + 全 env 兼容；密钥环空 / self_sk 缺失 fail-closed） |
+| `internal/config` | 配置加载（C6：viper 读 yaml 字面值 + TASKRUNNER_* env BindEnv 覆盖，无 `${VAR}` 插值——对齐 standards §4 2026-09-15 修正口径；密钥环空 / self_sk 缺失 fail-closed） |
 | `internal/handler` | 薄 HTTP 层：绑定/映射 + service 错误→HTTP 映射；业务在 service |
 | `internal/service` | 业务下沉：`TaskService`（提交/查询/取消/重试/jobs 定义）+ `submit`（统一受理，终身幂等）+ `cron`（分钟级 tick 扫 DB） |
 | `internal/repository` | job_runs / jobs 持久化（`database/sql`，SQLite/PG 双驱动已落地——C7） |
-| `internal/middleware` | C1 访问日志 + C2 AK/SK 验签 |
+| `internal/middleware` | C1 访问日志（C2 验签已迁 handler 层：utils aksk.GinMiddleware + response.AKSKFail()——2026-09-16 验签统一批，自研中间件退役） |
 | `internal/worker` | Asynq worker：统一 `taskrunner:callback` 处理器（终态判定） |
 | `internal/callback` | 回调客户端（C9：自身 SK 签名 + rid 透传 + 2xx/4xx/5xx 判定） |
 | `internal/task` | Asynq 载荷类型（跨进程契约，字段命名保持稳定） |
@@ -320,7 +320,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 能力目录（已定稿，实现后置） | 第二执行端接入 / zhuzhao 薄化启动 / 手填 URL 成负担（三者其一） | 提交方手填 URL |
 | 日志平台（ES/Loki + shipper） | 跨服务检索需求 / 日志量令 grep 吃力 | 人工 grep 文件 |
 | 日志脱敏 | 日志出内网 / 接入 ES（落点 C1 钩子） | 内网文件留存阶段可接受 |
-| PG schema 演进机制 | PG 首次结构变更前 | 新列缺失 → INSERT 全量失败 |
+| ~~PG schema 演进机制~~ ✅ 已落地（2026-09-15，migrateColumns SQLite/PG 双驱动自动补列） | ~~PG 首次结构变更前~~ 已解除 | ~~新列缺失 → INSERT 全量失败~~ 已修复（旧库升级自动补列，双侧回归覆盖） |
 
 ⚠️ 随 M2/M3 落地细化（M2 已定案部分随实现入档）：
 - ~~动态 cron 实现方式~~ ✅ M2 定案：**分钟级 tick 扫 DB**（`cronloop`，默认 30s 轮询）——定义是 DB 数据、增改停启下个 tick 生效；宕机错失的触发重启后至多补一次。未选 asynq Scheduler 热重注册：静态 payload 撑不起「每次触发生成新 task_id + 审计字段」；

@@ -3,9 +3,10 @@
 // 依下方「注入集合」重建 wireinject 文件并运行 wire）。
 //
 // 注入集合（InitializeApp）：
-//	provideLogger / provideStore / provideRedisOpt / provideSubmitter /
-//	provideInspector / provideTaskService / provideCron / provideAsynqServer /
-//	provideCallback / provideKeys / provideReadyz / provideEngine → NewApp
+//	provideLogger / provideStore / provideRedisOpt / provideInspector /
+//	provideSubmitter / provideTaskService / provideCron / provideReclaim /
+//	provideAsynqServer / provideCallback / provideKeys / provideReadyz /
+//	provideEngine → NewApp
 
 //go:build !wireinject
 // +build !wireinject
@@ -23,12 +24,13 @@ func InitializeApp(cfg *config.Config) (*App, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	submitter, cleanup2, err := provideSubmitter(cfg, store, redisOpt)
+	// inspector 先于 submitter：A3 补偿撤销依赖（ADR-003 决策 3）
+	inspector, cleanup2, err := provideInspector(redisOpt)
 	if err != nil {
 		cleanup1()
 		return nil, nil, err
 	}
-	inspector, cleanup3, err := provideInspector(redisOpt)
+	submitter, cleanup3, err := provideSubmitter(cfg, store, redisOpt, inspector)
 	if err != nil {
 		cleanup2()
 		cleanup1()
@@ -36,6 +38,7 @@ func InitializeApp(cfg *config.Config) (*App, func(), error) {
 	}
 	taskService := provideTaskService(cfg, store, submitter, inspector, logger)
 	cronLoop := provideCron(cfg, store, submitter, logger)
+	reclaimLoop := provideReclaim(cfg, store, submitter, inspector, logger)
 	asynqServer, cleanup4, err := provideAsynqServer(cfg, redisOpt, logger)
 	if err != nil {
 		cleanup3()
@@ -54,7 +57,7 @@ func InitializeApp(cfg *config.Config) (*App, func(), error) {
 		return nil, nil, err
 	}
 	engine := provideEngine(taskService, keys, ready, logger)
-	app := NewApp(cfg, logger, engine, asynqServer, cronLoop, store, callbackClient)
+	app := NewApp(cfg, logger, engine, asynqServer, cronLoop, reclaimLoop, store, callbackClient)
 	return app, func() {
 		cleanup5()
 		cleanup4()

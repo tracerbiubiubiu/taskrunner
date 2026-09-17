@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -136,8 +135,9 @@ func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput
 		return nil, fmt.Errorf("submit: %w", err)
 	}
 	if warning != nil {
-		// 已入队但 job_runs 落库失败：任务会执行，但在查询接口中隐形——必须留痕
-		s.logger.Warn("submit: enqueued but job_runs insert failed, task invisible in queries",
+		// DB-first（ADR-003）：行已落库（SSOT）但入队失败——reclaim 扫描器将修复投递，
+		// 200 = 已受理待入队；warning 仅留痕不回传响应体（F8）
+		s.logger.Warn("submit: job_runs persisted but enqueue failed, reclaim loop will retry",
 			slog.String("task_id", in.TaskID), slog.Any("err", warning))
 	}
 	return &SubmitOutput{TaskID: in.TaskID, Accepted: accepted}, nil
@@ -279,9 +279,14 @@ func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) (
 
 // ---- 干预 ----
 
-// CancelTask 取消未开始的任务。竞态防护（A2 三道关卡）：
+// CancelTask 取消未开始的任务。竞态防护（A2 三道关卡 + ADR-003 增补）：
 // ① 删队列前 GetTaskInfo 确认非 active；② DeleteTask 报 active 错误映射冲突（①之后被取走的兜底）；
-// ③ MarkCanceledIfPending 条件更新，状态已变即冲突——保证不出现「回了已取消、实际跑完了」。
+// ③ MarkCanceledIfPending 条件更新收口（权威防线——保证不出现「回了已取消、实际跑完了」）；
+// F35：GetTaskInfo 命中 completed/archived（Retention 留观/已归档）→ 409——删留观并标 canceled
+// 会抹掉「已执行」告警指纹并写 canceled 假终态，需人工介入；
+// F58：queued=0 行（从未交付/交付未知——DB 是唯一事实源）遇 Redis 可用性错误降级为直接标
+// canceled，Redis 键若在由 reclaim 第三域探针收尾（降级窗口的取走竞态由决策 7 终态守卫兜底）；
+// queued=1 行维持返回错误（任务大概率在 Redis，取消必须 Redis 配合）。
 func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 	run, err := s.repo.GetByTaskID(ctx, taskID)
 	if errors.Is(err, repository.ErrNotFound) {
@@ -293,19 +298,45 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 	if run.Status != repository.StatusPending {
 		return conflict("仅「等待执行」状态的任务可取消，当前状态：%s", stateText(run.Status))
 	}
+	queued, err := s.repo.GetQueued(ctx, taskID)
+	if err != nil {
+		return err
+	}
+
+	degraded := false // F58：Redis 可用性错误下 queued=0 行的降级取消
 	if info, err := s.inspector.GetTaskInfo(s.queue, taskID); err == nil {
 		if info.State == asynq.TaskStateActive {
 			return conflict("任务已开始执行，无法取消（仅等待执行的任务可取消）")
 		}
-	} else if !errors.Is(err, asynq.ErrTaskNotFound) {
-		return err
-	}
-	// ErrTaskNotFound：DB 为 pending 但队列已无此任务（提交后入队失败的残留），直接标 canceled
-	if err := s.inspector.DeleteTask(s.queue, taskID); err != nil && !errors.Is(err, asynq.ErrTaskNotFound) {
-		if strings.Contains(err.Error(), "active state") { // 检查后瞬间被 worker 取走
-			return conflict("任务已开始执行，无法取消（仅等待执行的任务可取消）")
+		if info.State == asynq.TaskStateCompleted || info.State == asynq.TaskStateArchived {
+			// F35：任务已执行（回调已发）或 asynq 已放弃，而行仍 pending 属记账异常指纹——
+			// 取消会写 canceled 假终态并抹掉告警指纹，记录异常需人工介入
+			return conflict("任务记录异常（队列态 %s 与 job_runs pending 不符），无法取消，需人工介入排查", info.State)
 		}
-		return err
+	} else if !isKeyGoneErr(err) { // F64：键已消亡（含队列注册集被清）= 任务不在，非可用性错误
+		if !queued {
+			degraded = true // F58：从未交付/交付未知的行，取消不依赖 Redis
+			s.logger.Warn("cancel degraded (redis unavailable, queued=0): marking canceled without redis cleanup",
+				slog.String("task_id", taskID), slog.Any("err", err))
+		} else {
+			return err
+		}
+	}
+	// isKeyGoneErr：DB 为 pending 但队列已无此任务（queued=0 时属常态），直接标 canceled
+	if !degraded {
+		if err := s.inspector.DeleteTask(s.queue, taskID); err != nil {
+			switch {
+			case isKeyGoneErr(err): // F44/F64：键已消亡，照常取消
+			case isDeleteActiveErr(err): // 检查后瞬间被 worker 取走
+				return conflict("任务已开始执行，无法取消（仅等待执行的任务可取消）")
+			case !queued: // F58：交付未知的行降级，第三域探针收尾
+				degraded = true
+				s.logger.Warn("cancel degraded (redis delete failed, queued=0)",
+					slog.String("task_id", taskID), slog.Any("err", err))
+			default:
+				return err
+			}
+		}
 	}
 	ok, err := s.repo.MarkCanceledIfPending(ctx, taskID, "canceled via API", s.now())
 	if err != nil {
@@ -533,8 +564,8 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 		return nil, err
 	}
 	if warning != nil {
-		// 与 Submit 同一隐形任务场景：已入队但 job_runs 落库失败，必须留痕
-		s.logger.Warn("trigger: enqueued but job_runs insert failed, task invisible in queries",
+		// 与 Submit 同口径（ADR-003）：行已落库但入队失败，reclaim 将重试
+		s.logger.Warn("trigger: job_runs persisted but enqueue failed, reclaim loop will retry",
 			slog.String("task_id", taskID), slog.String("job_id", j.JobID), slog.Any("err", warning))
 	}
 	return &SubmitOutput{TaskID: taskID, Accepted: accepted}, nil

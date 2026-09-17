@@ -89,7 +89,8 @@ func (l *Loop) FireDue(ctx context.Context) {
 				slog.String("job_id", j.JobID), slog.String("action", j.ActionID), slog.Any("err", err))
 			continue // 不推进 next_run：下个 tick 重试本次触发
 		} else if warn != nil {
-			l.Logger.Warn("cronloop: submitted but job_runs insert failed",
+			// ADR-003：warning = 行已落库但入队失败（语义较旧世界「落库失败」反转），reclaim 将重试
+			l.Logger.Warn("cronloop: job_runs persisted but enqueue failed, reclaim loop will retry",
 				slog.String("job_id", j.JobID), slog.String("task_id", newID), slog.Any("err", warn))
 		}
 		next, ok := NextRun(j.CronSpec, true, now)

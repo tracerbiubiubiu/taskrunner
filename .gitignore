@@ -16,3 +16,6 @@ bin/
 
 # 部署态本地密钥
 .env
+
+# ai
+.workbuddy/

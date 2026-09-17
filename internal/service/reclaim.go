@@ -38,7 +38,7 @@ type ReclaimLoop struct {
 	Now        func() time.Time
 
 	// ---- 进程内状态（非持久化；游标重启回卷 F46，计数器/集合重启清零 F30）----
-	unmarked       map[string]bool      // 「已投未标记」集合（F3）：写者唯一为本扫描器（F33）
+	unmarked       map[string]time.Time // 「已投未标记」集合（F3）：写者唯一为本扫描器（F33）；值 = 最近检视时间——成员行经其它路径离开 pending（worker 取走/取消）后条目由 TTL 回收（实现记录 §8，评审七·1）
 	enqueueFailCnt map[string]*failStat // 第一轮逐行非冲突失败计数（≥3 → Error，TTL 回收）
 	probeFailCnt   map[string]*failStat // 第三域探针失败计数（F65，TTL 回收）
 	payloadSkipCnt map[string]*failStat // 空/损坏快照跳过计数（≥3 → Error 升级，TTL 回收）
@@ -68,10 +68,11 @@ func (l *ReclaimLoop) Run(ctx context.Context) {
 func (l *ReclaimLoop) ReclaimStalePending(ctx context.Context) {
 	l.defaults()
 	now := l.now()
-	// 计数条目 TTL 回收（实现记录 §6）：行经非成功路径离开域后不再驻留
+	// 计数条目与集合孤儿 TTL 回收（实现记录 §6/§8）：行经非成功路径离开域后不再驻留
 	prune(l.enqueueFailCnt, now)
 	prune(l.probeFailCnt, now)
 	prune(l.payloadSkipCnt, now)
+	pruneSeen(l.unmarked, now)
 	before := now.Add(-l.StaleAfter)
 	l.requeueUnqueued(ctx, before)
 	l.alertStuckPending(ctx, before)
@@ -100,7 +101,7 @@ func (l *ReclaimLoop) defaults() {
 		l.payloadSkipCnt = map[string]*failStat{}
 	}
 	if l.unmarked == nil {
-		l.unmarked = map[string]bool{}
+		l.unmarked = map[string]time.Time{}
 	}
 }
 
@@ -150,6 +151,17 @@ func prune(m map[string]*failStat, now time.Time) {
 	}
 }
 
+// pruneSeen 集合条目回收（实现记录 §8）：成员路径每次检视会重盖时间戳，
+// 超过 TTL 未被检视的条目 = 行已离开域的孤儿（或域内积压挤出批位的极端情形——
+// 后果为该行重投一次撞冲突自愈，在 at-least-once 残余内）。
+func pruneSeen(m map[string]time.Time, now time.Time) {
+	for id, seen := range m {
+		if now.Sub(seen) > failStatTTL {
+			delete(m, id)
+		}
+	}
+}
+
 const reclaimThreshold = 3 // 连续失败升级阈值（一轮/二轮告警与第三域探针共用）
 
 // ---- 第一轮：自动修复（仅 queued=0 AND status='pending' 安全域）----
@@ -171,8 +183,10 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 		payloadBusted []string // 空/损坏快照连续 ≥3 次（聚合 Error 升级，评审五·3）
 	)
 	for _, r := range rows {
-		if l.unmarked[r.TaskID] {
-			// 集合成员：只重试标记、跳过重投（F3——任务已在 Redis，重投纯属制造重复）
+		if _, isMember := l.unmarked[r.TaskID]; isMember {
+			// 集合成员：只重试标记、跳过重投（F3——任务已在 Redis，重投纯属制造重复）；
+			// 检视即重盖时间戳（TTL 回收只针对行已离开域的孤儿条目，实现记录 §8）
+			l.unmarked[r.TaskID] = now
 			n, err := l.Store.MarkQueued(ctx, r.TaskID)
 			if err != nil {
 				markFailed = append(markFailed, r.TaskID)
@@ -209,7 +223,7 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 			n, merr := l.Store.MarkQueued(ctx, r.TaskID)
 			if merr != nil {
 				// 标记执行失败（DB 写故障）→ 入「已投未标记」集合（F3），下轮只重试标记
-				l.unmarked[r.TaskID] = true
+				l.unmarked[r.TaskID] = now
 				markFailed = append(markFailed, r.TaskID)
 				continue
 			}

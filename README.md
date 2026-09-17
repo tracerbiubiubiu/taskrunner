@@ -21,6 +21,7 @@
 - [设计文档](./docs/taskrunner.md) —— SSOT：定位/职责/回调模型/HTTP API/日志边界/部署形态/实施计划
 - [zhuzhao 侧配套需求](./docs/zhuzhao-integration.md) —— 本设计引出的 zhuzhao 侧工作项清单（注册表/任务管理/部门策略等）
 - [ADR-002 契约快照](./docs/ADR-002-asynq-async-task-executor.md) —— Asynq 执行器决策（zhuzhao 侧为 SSOT）
+- [ADR-003 提交 DB-first](./docs/ADR-003-db-first-outbox-reclaim.md) —— job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器 + worker 终态守卫）
 
 ## 快速开始
 
@@ -38,6 +39,14 @@ export TASKRUNNER_DB_USER=taskrunner TASKRUNNER_DB_PASSWORD=... TASKRUNNER_DB_NA
 
 > 注：`enqueue` CLI 同样经 `config.Load`（含验签密钥环 fail-closed 校验）——调试机也需注入两个 SK 环境变量。
 
+## 验证
+
+```bash
+make test                  # 单测
+make e2e                   # E2E 端到端（需 docker；19 断言七场景，cron 场景 E2E_INCLUDE_CRON=1）
+TASKRUNNER_TEST_PG_DSN=... go test ./internal/repository/ -run TestPG   # PG 集成（需 PG）
+```
+
 ## 状态
 
 - 2026-09-03：建仓 + 设计建档（独立仓库/部署/Redis，回调模型，日志边界定稿）；
@@ -48,4 +57,5 @@ export TASKRUNNER_DB_USER=taskrunner TASKRUNNER_DB_PASSWORD=... TASKRUNNER_DB_NA
 - 2026-09-04：代码评审修复（提交幂等扩为终身；cancel 竞态三道防护，fix/idempotency-and-cancel-race）；§1 补「什么算一个任务」判定标准；
 - 首个预置动作：审计归档（B11②，定时回调 zhuzhao 导出 audit_logs JSONL）；
 - 2026-09-08/09：C7 存储双驱动落地（SQLite/PG，CLI enqueue 复用 OpenStore）+ 日志轮转 + 全面验证/二次审计修复批（读体上限/worker 终态 off-by-one/任务级 deadline）；
-- 状态：M1/M2 已完成，C7 已落地；下一步 = M3 部署联调；工作区状态见 git status。
+- 2026-09-17：**ADR-003 落地（feat/outbox-reclaim，PR #1）**——提交改 DB-first（job_runs 兼任 Outbox：queued 标志 + Reclaim 三域扫描器 + worker 终态守卫 + 取消降级），取代「先入队后落库」取舍；单测 + race + PG 集成 + E2E（`scripts/e2e/e2e.sh`，19 断言含 cron）全绿；
+- 状态：M1/M2 已完成，C7 已落地，ADR-003 已落地；下一步 = M3 部署联调；工作区状态见 git status。

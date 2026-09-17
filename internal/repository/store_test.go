@@ -352,6 +352,50 @@ func TestMarkRunningClassification(t *testing.T) {
 	}
 }
 
+// 存量行升级语义（F41/F29 的锚点承诺）：旧库既有行补列后 queued 必须 = 1
+// （「已尝试过投递」——旧世界行存在 ⟺ 入队成功过），第一轮永不触碰。
+func TestLegacyRowsDefaultQueuedOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ADR-003 之前的 schema（无 queued/enqueue_payload），并预置一条「存量行」
+	if _, err := raw.Exec(`CREATE TABLE job_runs (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id      TEXT NOT NULL UNIQUE,
+		request_id   TEXT NOT NULL DEFAULT '',
+		action       TEXT NOT NULL,
+		job_id       TEXT NOT NULL DEFAULT '',
+		dept         TEXT NOT NULL DEFAULT '',
+		params       TEXT NOT NULL DEFAULT '{}',
+		callback_url TEXT NOT NULL DEFAULT '',
+		status       TEXT NOT NULL DEFAULT 'pending',
+		attempts     INTEGER NOT NULL DEFAULT 0,
+		error        TEXT NOT NULL DEFAULT '',
+		duration_ms  INTEGER NOT NULL DEFAULT 0,
+		submitted_by TEXT NOT NULL DEFAULT '',
+		source_ip    TEXT NOT NULL DEFAULT '',
+		enqueued_at  TIMESTAMP NOT NULL,
+		started_at   TIMESTAMP,
+		finished_at  TIMESTAMP
+	);
+	INSERT INTO job_runs (task_id, action, status, enqueued_at) VALUES ('old-1', 'a', 'pending', '2026-01-01 00:00:00');`); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	defer s.Close()
+	q, err := s.GetQueued(context.Background(), "old-1")
+	if err != nil || !q {
+		t.Fatalf("存量行补列后必须 queued=1（第一轮永不触碰）: %v %v", q, err)
+	}
+}
+
 // pgq 占位符转换钉住测试（C7）：? → $n 顺序编号；非 pg 驱动原样返回。
 // 已知限制（文档化约定）：SQL 字面量中的 '?' 同样被替换——SQL 字符串常量禁用 '?'。
 func TestPGQueryPlaceholderConversion(t *testing.T) {

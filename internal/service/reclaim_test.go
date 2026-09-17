@@ -51,19 +51,23 @@ func (h *capHandler) count(level slog.Level, msgContains string) int {
 type reclaimInspector struct {
 	mu      sync.Mutex
 	states  map[string]asynq.TaskState
+	getErrs map[string]error
 	delErr  map[string]error
 	gotInfo []string
 	deleted []string
 }
 
 func newReclaimInspector() *reclaimInspector {
-	return &reclaimInspector{states: map[string]asynq.TaskState{}, delErr: map[string]error{}}
+	return &reclaimInspector{states: map[string]asynq.TaskState{}, getErrs: map[string]error{}, delErr: map[string]error{}}
 }
 
 func (f *reclaimInspector) GetTaskInfo(_, id string) (*asynq.TaskInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gotInfo = append(f.gotInfo, id)
+	if e, ok := f.getErrs[id]; ok {
+		return nil, e
+	}
 	st, ok := f.states[id]
 	if !ok {
 		return nil, asynq.ErrTaskNotFound

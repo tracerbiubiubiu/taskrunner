@@ -100,6 +100,7 @@ func TestSubmitA1Idempotent(t *testing.T) {
 }
 
 // A3 成功 / 冲突：都条件置位 queued=1（冲突是并发同提兜底，行照常标记）。
+// TimeoutSecs>0 走 buildEnqueueOpts 的 Timeout 分支（F61 同参构造的另一半）。
 func TestSubmitA3SuccessAndConflict(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -111,7 +112,9 @@ func TestSubmitA3SuccessAndConflict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, st, fake, del := newSubmitSvc(t)
 			fake.err = tc.enqErr
-			accepted, warning, err := svc.Submit(context.Background(), submitPayload("a3"))
+			p := submitPayload("a3")
+			p.TimeoutSecs = 3600
+			accepted, warning, err := svc.Submit(context.Background(), p)
 			if !accepted || warning != nil || err != nil {
 				t.Fatalf("want (true,nil,nil), got (%v,%v,%v)", accepted, warning, err)
 			}

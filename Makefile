@@ -9,3 +9,6 @@ test:
 
 build:
 	go build -trimpath -o bin/taskrunner ./cmd/taskrunner
+
+e2e:
+	scripts/e2e/e2e.sh

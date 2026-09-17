@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/hibiken/asynq"
@@ -33,7 +34,8 @@ type TaskDelete interface {
 type Service struct {
 	Store     *repository.Store
 	Client    Enqueuer
-	Inspector TaskDelete // A3 补偿撤销（0 行三义处置，F39/F44）；nil 时跳过撤销
+	Inspector TaskDelete   // A3 补偿撤销（0 行三义处置，F39/F44）；nil 时跳过撤销
+	Logger    *slog.Logger // A3 标记失败 Warn（nil 时静默——reclaim 冲突分支兜底）
 	Queue     string
 	MaxRetry  int
 	Retention time.Duration // 入队留观（ADR-003 决策 5：占住 TaskID 挡迟到重投与完成释放竞态）
@@ -109,7 +111,12 @@ func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, wa
 	n, merr := s.Store.MarkQueued(ctx, p.TaskID)
 	if merr != nil {
 		// 标记执行失败（DB 写故障，F33）：行留 queued=0，任务已在 Redis，
-		// 由 reclaim 第一轮的冲突分支收敛补课（F32）
+		// 由 reclaim 第一轮的冲突分支收敛补课（F32）。至少 Warn 留痕——
+		// 与扫描器 markFailed 聚合对称（评审六·2），不能静默吞
+		if s.Logger != nil {
+			s.Logger.Warn("submit: enqueued but mark queued failed, reclaim conflict branch will retry",
+				slog.String("task_id", p.TaskID), slog.Any("err", merr))
+		}
 		return true, nil, nil
 	}
 	if n == 0 {

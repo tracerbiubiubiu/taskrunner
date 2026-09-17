@@ -221,7 +221,8 @@ func TestReclaimFailureCountingAggregated(t *testing.T) {
 	}
 }
 
-// 判空/反序列化失败防御（F7/F66）：跳过 + Warn，不重投。
+// 判空/反序列化失败防御（F7/F66）：跳过按 tick 聚合 Warn；连续 ≥3 升级聚合 Error
+// （评审六·3：防永久逐行刷屏，给出人工修复信号）。
 func TestReclaimEmptyOrCorruptPayloadSkipped(t *testing.T) {
 	l, st, fake, _, cap := newReclaim(t)
 	seedOld(t, st, "empty", "", 0)
@@ -230,8 +231,39 @@ func TestReclaimEmptyOrCorruptPayloadSkipped(t *testing.T) {
 	if fake.count() != 0 {
 		t.Fatal("empty/corrupt snapshot must not be re-enqueued")
 	}
-	if got := cap.count(slog.LevelWarn, "enqueue payload"); got < 2 {
-		t.Fatalf("want skip Warns, got %d", got)
+	if got := cap.count(slog.LevelWarn, "empty/corrupt, skipped"); got != 1 {
+		t.Fatalf("want 1 aggregated Warn tick, got %d", got)
+	}
+	if got := cap.count(slog.LevelError, "empty/corrupt persistently"); got != 0 {
+		t.Fatalf("premature Error escalation, got %d", got)
+	}
+	l.ReclaimStalePending(context.Background())
+	l.ReclaimStalePending(context.Background()) // 第 3 次 → 升级聚合 Error
+	if got := cap.count(slog.LevelError, "empty/corrupt persistently"); got != 1 {
+		t.Fatalf("want 1 aggregated escalation Error, got %d", got)
+	}
+}
+
+// 计数条目 TTL 回收（评审六·1）：行经非成功路径离开域（此处 = 被 worker 取走转 running）
+// 后，失败计数不再永久驻留。
+func TestReclaimFailStatTTLPruned(t *testing.T) {
+	l, st, fake, _, _ := newReclaim(t)
+	fake.err = errors.New("dial tcp: connection refused")
+	seedOld(t, st, "p1", `{"task_id":"p1"}`, 0)
+	l.ReclaimStalePending(context.Background()) // 失败 1 次，计数在册
+	if len(l.enqueueFailCnt) != 1 {
+		t.Fatalf("counter should exist, got %+v", l.enqueueFailCnt)
+	}
+	// 行离开第一轮域（worker 取走 → running）
+	if err := st.MarkRunning(context.Background(), "p1", 1, time.Now()); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	// 时钟快进超过 TTL：条目被回收（行已不在域内，无需人为再触发）
+	ttl := failStatTTL + time.Minute
+	l.Now = func() time.Time { return time.Now().Add(ttl) }
+	l.ReclaimStalePending(context.Background())
+	if len(l.enqueueFailCnt) != 0 {
+		t.Fatalf("stale counter must be pruned, got %+v", l.enqueueFailCnt)
 	}
 }
 

@@ -30,7 +30,7 @@ func InitializeApp(cfg *config.Config) (*App, func(), error) {
 		cleanup1()
 		return nil, nil, err
 	}
-	submitter, cleanup3, err := provideSubmitter(cfg, store, redisOpt, inspector)
+	submitter, cleanup3, err := provideSubmitter(cfg, store, redisOpt, inspector, logger)
 	if err != nil {
 		cleanup2()
 		cleanup1()

@@ -63,10 +63,11 @@ func provideRedisOpt(cfg *config.Config) asynq.RedisClientOpt {
 }
 
 // provideSubmitter 统一受理路径（submit.go：DB-first 三步，ADR-003）。cleanup 关闭底层 asynq client。
-func provideSubmitter(cfg *config.Config, st *repository.Store, opt asynq.RedisClientOpt, ins *asynq.Inspector) (*service.Service, func(), error) {
+func provideSubmitter(cfg *config.Config, st *repository.Store, opt asynq.RedisClientOpt, ins *asynq.Inspector, logger *slog.Logger) (*service.Service, func(), error) {
 	cli := asynq.NewClient(opt)
 	return &service.Service{
-		Store: st, Client: cli, Inspector: ins, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry,
+		Store: st, Client: cli, Inspector: ins, Logger: logger,
+		Queue: cfg.Queue, MaxRetry: cfg.MaxRetry,
 		Retention: cfg.Reclaim.Retention, // 决策 5：入队留观，占住 TaskID 挡迟到重投
 	}, func() { cli.Close() }, nil
 }

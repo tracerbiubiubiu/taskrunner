@@ -38,11 +38,12 @@ type ReclaimLoop struct {
 	Now        func() time.Time
 
 	// ---- 进程内状态（非持久化；游标重启回卷 F46，计数器/集合重启清零 F30）----
-	unmarked       map[string]bool // 「已投未标记」集合（F3）：写者唯一为本扫描器（F33）
-	enqueueFailCnt map[string]int  // 第一轮逐行非冲突失败计数（同一行 ≥3 → Error）
-	probeFailCnt   map[string]int  // 第三域探针失败计数（F65）
-	stuckCursor    int64           // 第二轮游标（行主键 id），0 = 从头扫（F36/F46/F56——时间列绑定格式不可作游标，见实现记录）
-	cancelCursor   int64           // 第三域游标，同款
+	unmarked       map[string]bool      // 「已投未标记」集合（F3）：写者唯一为本扫描器（F33）
+	enqueueFailCnt map[string]*failStat // 第一轮逐行非冲突失败计数（≥3 → Error，TTL 回收）
+	probeFailCnt   map[string]*failStat // 第三域探针失败计数（F65，TTL 回收）
+	payloadSkipCnt map[string]*failStat // 空/损坏快照跳过计数（≥3 → Error 升级，TTL 回收）
+	stuckCursor    int64                // 第二轮游标（行主键 id），0 = 从头扫（F36/F46/F56——时间列绑定格式不可作游标，见实现记录）
+	cancelCursor   int64                // 第三域游标，同款
 }
 
 // Run ticker 薄壳（cron.go 同款生命周期与零值防御）。
@@ -66,7 +67,12 @@ func (l *ReclaimLoop) Run(ctx context.Context) {
 // ReclaimStalePending 一次扫描（三域顺序执行）。同步单轮方法，测试直驱。
 func (l *ReclaimLoop) ReclaimStalePending(ctx context.Context) {
 	l.defaults()
-	before := l.now().Add(-l.StaleAfter)
+	now := l.now()
+	// 计数条目 TTL 回收（实现记录 §6）：行经非成功路径离开域后不再驻留
+	prune(l.enqueueFailCnt, now)
+	prune(l.probeFailCnt, now)
+	prune(l.payloadSkipCnt, now)
+	before := now.Add(-l.StaleAfter)
 	l.requeueUnqueued(ctx, before)
 	l.alertStuckPending(ctx, before)
 	l.probeCanceled(ctx, before)
@@ -85,10 +91,13 @@ func (l *ReclaimLoop) defaults() {
 		l.Retention = 0
 	}
 	if l.enqueueFailCnt == nil {
-		l.enqueueFailCnt = map[string]int{}
+		l.enqueueFailCnt = map[string]*failStat{}
 	}
 	if l.probeFailCnt == nil {
-		l.probeFailCnt = map[string]int{}
+		l.probeFailCnt = map[string]*failStat{}
+	}
+	if l.payloadSkipCnt == nil {
+		l.payloadSkipCnt = map[string]*failStat{}
 	}
 	if l.unmarked == nil {
 		l.unmarked = map[string]bool{}
@@ -110,6 +119,39 @@ func sampleIDs(ids []string) string {
 	return strings.Join(ids, ",")
 }
 
+// failStat 失败/跳过计数 + 最近一次时间。条目按 TTL 回收（prune）：行经非成功路径
+// 离开域（取消/被取走/手工修数/M4 清理）后计数不再驻留——业界 TTL map 做法，
+// 防「只增不删」的内存微漏（实现记录 §6）。
+type failStat struct {
+	count int
+	last  time.Time
+}
+
+const failStatTTL = 10 * time.Minute // 连续性窗口：超窗视为新一轮计数
+
+// bump 递增计数，返回是否达到阈值。
+func bump(m map[string]*failStat, id string, now time.Time, threshold int) bool {
+	st, ok := m[id]
+	if !ok {
+		st = &failStat{}
+		m[id] = st
+	}
+	st.count++
+	st.last = now
+	return st.count >= threshold
+}
+
+// prune 回收超过 TTL 未见失败的条目。
+func prune(m map[string]*failStat, now time.Time) {
+	for id, st := range m {
+		if now.Sub(st.last) > failStatTTL {
+			delete(m, id)
+		}
+	}
+}
+
+const reclaimThreshold = 3 // 连续失败升级阈值（一轮/二轮告警与第三域探针共用）
+
 // ---- 第一轮：自动修复（仅 queued=0 AND status='pending' 安全域）----
 
 // requeueUnqueued 快照同参重投 + 条件标记。无需游标——Redis 全断时全批失败、恢复即逐批
@@ -120,10 +162,13 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 		l.Logger.Error("reclaim: list unqueued failed", slog.Any("err", err))
 		return
 	}
+	now := l.now()
 	var (
-		warned     []string // 本 tick 内 1–2 次失败的行（聚合 Warn，F62）
-		errored    []string // 连续 ≥3 次失败的行（聚合 Error）
-		markFailed []string // 条件标记执行失败（DB 写故障，F3/F33）
+		warned        []string // 本 tick 内 1–2 次失败的行（聚合 Warn，F62）
+		errored       []string // 连续 ≥3 次失败的行（聚合 Error）
+		markFailed    []string // 条件标记执行失败（DB 写故障，F3/F33）
+		payloadSkip   []string // 空/损坏快照跳过（1–2 次，聚合 Warn）
+		payloadBusted []string // 空/损坏快照连续 ≥3 次（聚合 Error 升级，评审五·3）
 	)
 	for _, r := range rows {
 		if l.unmarked[r.TaskID] {
@@ -143,15 +188,16 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 			delete(l.unmarked, r.TaskID) // 标记成功出集
 			continue
 		}
-		// 判空/反序列化失败防御（F7/F66）：空/损坏快照跳过 + Warn（正常不可达，纵深加固）
-		if r.EnqueuePayload == "" {
-			l.Logger.Warn("reclaim: empty enqueue payload, skip", slog.String("task_id", r.TaskID))
-			continue
-		}
+		// 判空/反序列化失败防御（F7/F66）：空/损坏快照跳过——按 tick 聚合 Warn，
+		// 连续 ≥3 次升级聚合 Error（正常不可达；真出现 = 手工改库/迁移问题，需人工）
 		var p task.Payload
-		if err := json.Unmarshal([]byte(r.EnqueuePayload), &p); err != nil {
-			l.Logger.Warn("reclaim: corrupt enqueue payload, skip",
-				slog.String("task_id", r.TaskID), slog.Any("err", err))
+		perr := json.Unmarshal([]byte(r.EnqueuePayload), &p)
+		if r.EnqueuePayload == "" || perr != nil {
+			if bump(l.payloadSkipCnt, r.TaskID, now, reclaimThreshold) {
+				payloadBusted = append(payloadBusted, r.TaskID)
+			} else {
+				payloadSkip = append(payloadSkip, r.TaskID)
+			}
 			continue
 		}
 		_, err := l.Client.Enqueue(asynq.NewTask(task.TypeCallback, []byte(r.EnqueuePayload)),
@@ -175,13 +221,20 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 			l.Logger.Info("reclaim: re-enqueued", slog.String("task_id", r.TaskID))
 		default:
 			// 非冲突失败（Redis 不可用等）：计数，同一行 ≥3 → Error（F62 聚合打点）
-			l.enqueueFailCnt[r.TaskID]++
-			if l.enqueueFailCnt[r.TaskID] >= 3 {
+			if bump(l.enqueueFailCnt, r.TaskID, now, reclaimThreshold) {
 				errored = append(errored, r.TaskID)
 			} else {
 				warned = append(warned, r.TaskID)
 			}
 		}
+	}
+	if len(payloadSkip) > 0 {
+		l.Logger.Warn("reclaim: enqueue payload empty/corrupt, skipped (escalates after 3 consecutive)",
+			slog.Int("rows", len(payloadSkip)), slog.String("sample_task_ids", sampleIDs(payloadSkip)))
+	}
+	if len(payloadBusted) > 0 {
+		l.Logger.Error("reclaim: enqueue payload empty/corrupt persistently (>=3) — manual data repair needed",
+			slog.Int("rows", len(payloadBusted)), slog.String("sample_task_ids", sampleIDs(payloadBusted)))
 	}
 	if len(warned) > 0 {
 		l.Logger.Warn("reclaim: enqueue failed (will retry next tick)",
@@ -268,16 +321,17 @@ func (l *ReclaimLoop) inspectStuck(r *repository.Run) {
 // 出域（F45/F48/F49）；探针失败计数，同一行 ≥3 → Error（F65，防漏配容忍集/脏态/Internal
 // 错误的永久静默循环）。
 func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
+	if l.Inspector == nil {
+		return
+	}
 	rows, err := l.Store.ListCanceledUnqueued(ctx, before, l.cancelCursor, l.BatchSize)
 	if err != nil {
 		l.Logger.Error("reclaim: list canceled unqueued failed", slog.Any("err", err))
 		return
 	}
+	now := l.now()
 	var errored []string
 	for _, r := range rows {
-		if l.Inspector == nil {
-			return
-		}
 		err := l.Inspector.DeleteTask(l.Queue, r.TaskID)
 		switch {
 		case err == nil || isKeyGoneErr(err):
@@ -296,8 +350,7 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 				l.Logger.Warn("reclaim: cancel-cleanup probe hit dirty task state (redis data inconsistent), will re-probe",
 					slog.String("task_id", r.TaskID))
 			}
-			l.probeFailCnt[r.TaskID]++
-			if l.probeFailCnt[r.TaskID] >= 3 {
+			if bump(l.probeFailCnt, r.TaskID, now, reclaimThreshold) {
 				errored = append(errored, r.TaskID)
 			}
 		}

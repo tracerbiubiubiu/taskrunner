@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -130,9 +131,9 @@ func enqueueCmd(args []string) error {
 		Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
 	defer ins.Close()
 
-	// 与 serve 路径同参（ADR-003：Inspector 供 A3 补偿撤销，Retention 入队留观）
-	sub := &service.Service{Store: st, Client: client, Inspector: ins, Queue: cfg.Queue,
-		MaxRetry: cfg.MaxRetry, Retention: cfg.Reclaim.Retention}
+	// 与 serve 路径同参（ADR-003：Inspector 供 A3 补偿撤销，Retention 入队留观，Logger 记标记失败）
+	sub := &service.Service{Store: st, Client: client, Inspector: ins, Logger: slog.Default(),
+		Queue: cfg.Queue, MaxRetry: cfg.MaxRetry, Retention: cfg.Reclaim.Retention}
 	accepted, warning, err := sub.Submit(context.Background(), task.Payload{
 		TaskID: *taskID, RequestID: *requestID, Action: *action, CallbackURL: *callbackURL,
 		Params: json.RawMessage(*params), SubmittedBy: *submittedBy, SourceIP: *sourceIP,

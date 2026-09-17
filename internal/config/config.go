@@ -36,7 +36,15 @@ type Config struct {
 	MaxRetry        int           `mapstructure:"max_retry"`
 	CallbackTimeout time.Duration `mapstructure:"callback_timeout"`
 	CronTick        time.Duration `mapstructure:"cron_tick"`
-	Log             struct {
+	// Reclaim 扫描器（ADR-003）：tick 扫描节奏、stale_after 入队宽限、batch 三域共用
+	// 批位上界、retention 入队留观（归入 reclaim 组的理由见 ADR-003 决策 5）。
+	Reclaim struct {
+		Tick       time.Duration `mapstructure:"tick"`
+		StaleAfter time.Duration `mapstructure:"stale_after"`
+		Batch      int           `mapstructure:"batch"`
+		Retention  time.Duration `mapstructure:"retention"`
+	}
+	Log struct {
 		Level      string `mapstructure:"level"`
 		Dir        string `mapstructure:"dir"`
 		MaxSizeMB  int    `mapstructure:"max_size_mb"`
@@ -96,6 +104,10 @@ func Load(path string) (*Config, error) {
 	viper.SetDefault("max_retry", 5)
 	bind("callback_timeout", "TASKRUNNER_CALLBACK_TIMEOUT", "30s")
 	bind("cron_tick", "TASKRUNNER_CRON_TICK", "30s")
+	bind("reclaim.tick", "TASKRUNNER_RECLAIM_TICK", "10s")
+	bind("reclaim.stale_after", "TASKRUNNER_RECLAIM_STALE_AFTER", "30s")
+	bind("reclaim.batch", "TASKRUNNER_RECLAIM_BATCH", "100")
+	bind("reclaim.retention", "TASKRUNNER_RECLAIM_RETENTION", "1h")
 	bind("log.level", "TASKRUNNER_LOG_LEVEL", "info")
 	bind("log.dir", "TASKRUNNER_LOG_DIR", "logs")
 	// 日志轮转（§6：MaxAge 必须显式——lumberjack 零值不限天数，文件含个人信息）
@@ -140,6 +152,34 @@ func Load(path string) (*Config, error) {
 	// 显式空串会压过 SetDefault，导致 worker 监听 "" 队列——拒绝
 	if cfg.Queue == "" {
 		return nil, fmt.Errorf("queue 不能为空")
+	}
+	// reclaim 扫描器（ADR-003 实施计划 4）：≤0 温和回退默认（cron.go 零值防御先例，不拒启），
+	// 非法组合 fail-closed 拒启。
+	if cfg.Reclaim.Tick <= 0 {
+		cfg.Reclaim.Tick = 10 * time.Second
+	}
+	if cfg.Reclaim.StaleAfter <= 0 {
+		cfg.Reclaim.StaleAfter = 30 * time.Second
+	}
+	if cfg.Reclaim.Batch <= 0 {
+		cfg.Reclaim.Batch = 100
+	}
+	if cfg.Reclaim.Retention <= 0 {
+		cfg.Reclaim.Retention = time.Hour
+	}
+	// F10：tick < 1s 拒启（防扫描打爆 CPU）
+	if cfg.Reclaim.Tick < time.Second {
+		return nil, fmt.Errorf("reclaim.tick %v < 1s——防扫描打爆 CPU，拒绝启动", cfg.Reclaim.Tick)
+	}
+	// F67：asynq 以整秒承载 Retention（client int64 截断 + processor >0 二分）——亚秒值
+	// 会静默关闭留观防线，整秒化后 <1s 拒启；stale_after<retention 不变式亦按整秒化后比较
+	cfg.Reclaim.Retention = cfg.Reclaim.Retention.Truncate(time.Second)
+	if cfg.Reclaim.Retention < time.Second {
+		return nil, fmt.Errorf("reclaim.retention %v 整秒化后 <1s——asynq 整秒截断会静默关闭留观防线，拒绝启动", cfg.Reclaim.Retention)
+	}
+	// F30：stale_after ≥ retention 时第一轮重投窗口与 Retention 防线重叠，风暴防线失效
+	if cfg.Reclaim.StaleAfter >= cfg.Reclaim.Retention {
+		return nil, fmt.Errorf("reclaim.stale_after(%v) 必须 < reclaim.retention(%v)——重投窗口与留观防线重叠，拒绝启动", cfg.Reclaim.StaleAfter, cfg.Reclaim.Retention)
 	}
 	return &cfg, nil
 }

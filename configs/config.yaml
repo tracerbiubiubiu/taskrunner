@@ -25,6 +25,12 @@ max_retry: 5              # env TASKRUNNER_MAX_RETRY
 callback_timeout: 30s     # env TASKRUNNER_CALLBACK_TIMEOUT
 cron_tick: 30s            # env TASKRUNNER_CRON_TICK
 
+reclaim:                  # 扫描器（ADR-003：DB-first outbox 补偿回路）
+  tick: 10s               # env TASKRUNNER_RECLAIM_TICK（<1s 拒启）
+  stale_after: 30s        # env TASKRUNNER_RECLAIM_STALE_AFTER（入队宽限；须 < retention，违反拒启）
+  batch: 100              # env TASKRUNNER_RECLAIM_BATCH（三域共用批位上界）
+  retention: 1h           # env TASKRUNNER_RECLAIM_RETENTION（asynq 留观；整秒生效，<1s 拒启）
+
 log:
   level: info             # env TASKRUNNER_LOG_LEVEL
   dir: logs               # env TASKRUNNER_LOG_DIR

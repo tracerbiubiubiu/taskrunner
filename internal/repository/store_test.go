@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -162,6 +163,192 @@ func TestMissingRowVisible(t *testing.T) {
 	}
 	if err := s.Finish(ctx, "ghost", StatusFailed, "boom", 1, time.Now(), time.Now()); err == nil {
 		t.Fatal("Finish on missing row must error")
+	}
+}
+
+// ---- ADR-003：queued 标志 / 三域扫描域 / MarkRunning 分类 ----
+
+func seedRun(t *testing.T, s *Store, id string, enqueuedAt time.Time, payload string) {
+	t.Helper()
+	if err := s.InsertPending(t.Context(), Run{
+		TaskID: id, Action: "a", CallbackURL: "http://x",
+		EnqueuedAt: enqueuedAt, EnqueuePayload: payload,
+	}); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+func TestQueuedFlagLifecycle(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// 新库直接含新列（F29）：InsertPending 写 queued=0 + 快照
+	seedRun(t, s, "q1", time.Now(), `{"task_id":"q1"}`)
+	q, err := s.GetQueued(ctx, "q1")
+	if err != nil || q {
+		t.Fatalf("fresh row must be queued=0, got %v %v", q, err)
+	}
+	// MarkQueued：pending → 1 行
+	if n, err := s.MarkQueued(ctx, "q1"); err != nil || n != 1 {
+		t.Fatalf("mark queued: n=%d err=%v", n, err)
+	}
+	if q, _ := s.GetQueued(ctx, "q1"); !q {
+		t.Fatal("queued should be 1 after MarkQueued")
+	}
+
+	// MarkQueued 条件标记（F19 回归）：canceled 行 → 0 行、queued 不被翻动
+	seedRun(t, s, "q2", time.Now(), "")
+	if ok, err := s.MarkCanceledIfPending(ctx, "q2", "canceled via API", time.Now()); !ok || err != nil {
+		t.Fatalf("cancel: %v %v", ok, err)
+	}
+	if n, err := s.MarkQueued(ctx, "q2"); err != nil || n != 0 {
+		t.Fatalf("mark queued on canceled must be 0 rows: n=%d err=%v", n, err)
+	}
+	if q, _ := s.GetQueued(ctx, "q2"); q {
+		t.Fatal("canceled row must keep queued=0（F37：取消不翻标志）")
+	}
+
+	// MarkCleanupDone（F48 条件回归）：pending 行 → 0 行；canceled+queued=0 → 1 行；重复 → 0 行
+	seedRun(t, s, "q3", time.Now(), "")
+	if n, err := s.MarkCleanupDone(ctx, "q3"); err != nil || n != 0 {
+		t.Fatalf("cleanup on pending must be 0 rows: n=%d err=%v", n, err)
+	}
+	if ok, err := s.MarkCanceledIfPending(ctx, "q3", "x", time.Now()); !ok {
+		t.Fatalf("cancel q3: %v %v", ok, err)
+	}
+	if n, err := s.MarkCleanupDone(ctx, "q3"); err != nil || n != 1 {
+		t.Fatalf("cleanup on canceled+queued=0: n=%d err=%v", n, err)
+	}
+	if n, _ := s.MarkCleanupDone(ctx, "q3"); n != 0 {
+		t.Fatalf("second cleanup must be 0 rows, got %d", n)
+	}
+}
+
+// 第一轮扫描域安全性（F1/F14）：canceled 行与 succeeded+queued=0 残留都不得入选。
+func TestListUnqueuedSafetyDomain(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+
+	seedRun(t, s, "u-ok", base, `{"k":1}`) // pending+queued=0 → 入选
+	seedRun(t, s, "u-cancel", base, "")    // canceled+queued=0 → 排除（F1）
+	if ok, _ := s.MarkCanceledIfPending(ctx, "u-cancel", "x", time.Now()); !ok {
+		t.Fatal("cancel u-cancel")
+	}
+	// succeeded+queued=0 残留（F14 场景：内联标记失败 + DB 抖动在执行前恢复）
+	seedRun(t, s, "u-done", base, "")
+	if err := s.MarkRunning(ctx, "u-done", 1, base); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if err := s.Finish(ctx, "u-done", StatusSucceeded, "", 1, base, base); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	// pending+queued=1 → 排除（属于第二轮域）
+	seedRun(t, s, "u-stuck", base, "")
+	if _, err := s.MarkQueued(ctx, "u-stuck"); err != nil {
+		t.Fatalf("mark queued: %v", err)
+	}
+
+	rows, err := s.ListUnqueued(ctx, time.Now(), 100)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 || rows[0].TaskID != "u-ok" {
+		t.Fatalf("safety domain broken: %+v", rows)
+	}
+	if rows[0].EnqueuePayload != `{"k":1}` {
+		t.Fatalf("payload round-trip: %q", rows[0].EnqueuePayload)
+	}
+
+	// LIMIT 批位上界（F66）
+	seedRun(t, s, "u-ok2", base, "")
+	rows, _ = s.ListUnqueued(ctx, time.Now(), 1)
+	if len(rows) != 1 {
+		t.Fatalf("limit: %+v", rows)
+	}
+}
+
+// 第二/三域游标轮转（F36/F46/F56）：id 游标推进、耗尽、回卷。
+func TestListCursorRotation(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	ids := []string{"c1", "c2", "c3"}
+	for i, id := range ids {
+		seedRun(t, s, id, base.Add(time.Duration(i)*time.Minute), "")
+		s.MarkQueued(ctx, id) // pending+queued=1（第二轮域）
+	}
+	before := time.Now()
+
+	rows, err := s.ListStuckPending(ctx, before, 0, 2)
+	if err != nil || len(rows) != 2 || rows[0].TaskID != "c1" || rows[1].TaskID != "c2" {
+		t.Fatalf("batch1: %+v err=%v", rows, err)
+	}
+	rows2, err := s.ListStuckPending(ctx, before, rows[len(rows)-1].ID, 2)
+	if err != nil || len(rows2) != 1 || rows2[0].TaskID != "c3" {
+		t.Fatalf("batch2: %+v err=%v", rows2, err)
+	}
+	rows3, _ := s.ListStuckPending(ctx, before, rows2[len(rows2)-1].ID, 2)
+	if len(rows3) != 0 {
+		t.Fatalf("exhausted: %+v", rows3)
+	}
+	rows4, _ := s.ListStuckPending(ctx, before, 0, 2)
+	if len(rows4) != 2 || rows4[0].TaskID != "c1" {
+		t.Fatalf("wrap around: %+v", rows4)
+	}
+
+	// 第三域同款（先出域的行不再入选）
+	for i, id := range []string{"x1", "x2"} {
+		seedRun(t, s, id, base.Add(time.Duration(i)*time.Minute), "")
+		if ok, err := s.MarkCanceledIfPending(ctx, id, "x", time.Now()); !ok {
+			t.Fatalf("cancel %s: %v %v", id, ok, err)
+		}
+	}
+	rows, err = s.ListCanceledUnqueued(ctx, before, 0, 1)
+	if err != nil || len(rows) != 1 || rows[0].TaskID != "x1" {
+		t.Fatalf("cancel batch1: %+v err=%v", rows, err)
+	}
+	if _, err := s.MarkCleanupDone(ctx, "x1"); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	rows, _ = s.ListCanceledUnqueued(ctx, before, 0, 1)
+	if len(rows) != 1 || rows[0].TaskID != "x2" {
+		t.Fatalf("cleanup 出域后应离开扫描域: %+v", rows)
+	}
+}
+
+// MarkRunning 分类（F59）：canceled/succeeded 复活拒绝 → ErrTerminalRejected；
+// 缺行 → ErrNotFound；worker 据此分流（守卫拦截 vs 旧口径继续）。
+func TestMarkRunningClassification(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	seedRun(t, s, "m-cancel", now, "")
+	if ok, _ := s.MarkCanceledIfPending(ctx, "m-cancel", "x", now); !ok {
+		t.Fatal("cancel")
+	}
+	if err := s.MarkRunning(ctx, "m-cancel", 1, now); !errors.Is(err, ErrTerminalRejected) {
+		t.Fatalf("canceled want ErrTerminalRejected, got %v", err)
+	}
+
+	seedRun(t, s, "m-done", now, "")
+	if err := s.MarkRunning(ctx, "m-done", 1, now); err != nil {
+		t.Fatalf("mark running: %v", err)
+	}
+	if err := s.Finish(ctx, "m-done", StatusSucceeded, "", 1, now, now); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if err := s.MarkRunning(ctx, "m-done", 2, now); !errors.Is(err, ErrTerminalRejected) {
+		t.Fatalf("succeeded want ErrTerminalRejected, got %v", err)
+	}
+
+	err := s.MarkRunning(ctx, "m-ghost", 1, now)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing want ErrNotFound, got %v", err)
+	}
+	if errors.Is(err, ErrTerminalRejected) {
+		t.Fatal("missing must not be classified as terminal rejection")
 	}
 }
 

@@ -62,15 +62,16 @@ func provideRedisOpt(cfg *config.Config) asynq.RedisClientOpt {
 	return asynq.RedisClientOpt{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB}
 }
 
-// provideSubmitter 统一受理路径（submit.go：A1 终身幂等）。cleanup 关闭底层 asynq client。
-func provideSubmitter(cfg *config.Config, st *repository.Store, opt asynq.RedisClientOpt) (*service.Service, func(), error) {
+// provideSubmitter 统一受理路径（submit.go：DB-first 三步，ADR-003）。cleanup 关闭底层 asynq client。
+func provideSubmitter(cfg *config.Config, st *repository.Store, opt asynq.RedisClientOpt, ins *asynq.Inspector) (*service.Service, func(), error) {
 	cli := asynq.NewClient(opt)
 	return &service.Service{
-		Store: st, Client: cli, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry,
+		Store: st, Client: cli, Inspector: ins, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry,
+		Retention: cfg.Reclaim.Retention, // 决策 5：入队留观，占住 TaskID 挡迟到重投
 	}, func() { cli.Close() }, nil
 }
 
-// provideInspector Asynq 检视（实时态/取消/重试/死信）。cleanup 关闭连接。
+// provideInspector Asynq 检视（实时态/取消/重试/死信 + ADR-003 补偿撤销与三域探针）。cleanup 关闭连接。
 func provideInspector(opt asynq.RedisClientOpt) (*asynq.Inspector, func(), error) {
 	ins := asynq.NewInspector(opt)
 	return ins, func() { ins.Close() }, nil
@@ -85,6 +86,15 @@ func provideTaskService(cfg *config.Config, st *repository.Store,
 // provideCron cron 定时触发（分钟级 tick 扫 DB，设计 §10 定案）。
 func provideCron(cfg *config.Config, st *repository.Store, sub *service.Service, logger *slog.Logger) *service.Loop {
 	return &service.Loop{Store: st, Submit: sub, Logger: logger, Tick: cfg.CronTick}
+}
+
+// provideReclaim 扫描器（ADR-003 决策 4：三域补偿回路；复用 submitter 的入队能力与现有 Inspector）。
+func provideReclaim(cfg *config.Config, st *repository.Store, sub *service.Service, ins *asynq.Inspector, logger *slog.Logger) *service.ReclaimLoop {
+	return &service.ReclaimLoop{
+		Store: st, Client: sub.Client, Inspector: ins, Logger: logger,
+		Tick: cfg.Reclaim.Tick, StaleAfter: cfg.Reclaim.StaleAfter, Retention: cfg.Reclaim.Retention,
+		BatchSize: cfg.Reclaim.Batch, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry,
+	}
 }
 
 // provideAsynqServer worker 进程（并发/队列/退避重试）。

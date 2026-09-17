@@ -82,7 +82,16 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 	now := time.Now()
 
 	if err := d.Store.MarkRunning(ctx, p.TaskID, attempt, now); err != nil {
-		// job_runs 缺行（如提交后未及落库）：照常执行回调，仅记日志
+		if errors.Is(err, repository.ErrTerminalRejected) {
+			// 终态守卫（ADR-003 决策 7）：行已 succeeded/canceled——重复投递或已取消任务
+			// 被取走，消费端拦截副作用：不执行回调、不写终态（行已是终态），SkipRetry 丢弃。
+			// F45/F58 窗口的「已取消任务产生回调」由此结构性关闭。
+			logger.Error("terminal-state guard: job_runs row already terminal, dropping delivery",
+				slog.Any("err", err))
+			return fmt.Errorf("worker: terminal row rejects resurrection: %w: %w", err, asynq.SkipRetry)
+		}
+		// 缺行（历史/手动残留——DB-first 下行先于任务存在，缺行只剩残留场景）或 DB 瞬时
+		// 错误：照常执行回调，仅记日志（ADR-003 决策 7 维持的旧口径容忍）
 		logger.Warn("mark running failed, continuing without job_runs update", slog.Any("err", err))
 	}
 

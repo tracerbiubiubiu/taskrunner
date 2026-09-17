@@ -126,8 +126,13 @@ func enqueueCmd(args []string) error {
 	client := asynq.NewClient(asynq.RedisClientOpt{
 		Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
 	defer client.Close()
+	ins := asynq.NewInspector(asynq.RedisClientOpt{
+		Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
+	defer ins.Close()
 
-	sub := &service.Service{Store: st, Client: client, Queue: cfg.Queue, MaxRetry: cfg.MaxRetry}
+	// 与 serve 路径同参（ADR-003：Inspector 供 A3 补偿撤销，Retention 入队留观）
+	sub := &service.Service{Store: st, Client: client, Inspector: ins, Queue: cfg.Queue,
+		MaxRetry: cfg.MaxRetry, Retention: cfg.Reclaim.Retention}
 	accepted, warning, err := sub.Submit(context.Background(), task.Payload{
 		TaskID: *taskID, RequestID: *requestID, Action: *action, CallbackURL: *callbackURL,
 		Params: json.RawMessage(*params), SubmittedBy: *submittedBy, SourceIP: *sourceIP,
@@ -137,7 +142,7 @@ func enqueueCmd(args []string) error {
 		return err
 	}
 	if warning != nil {
-		fmt.Fprintf(os.Stderr, "警告: 入队成功但 job_runs 落库失败（不影响执行，仅损失记录）: %v\n", warning)
+		fmt.Fprintf(os.Stderr, "警告: job_runs 已落库但入队失败（reclaim 扫描器将重试投递，结果经查询接口获取）: %v\n", warning)
 	}
 	if !accepted {
 		fmt.Printf("task_id=%s 已存在（幂等受理）\n", *taskID)

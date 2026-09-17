@@ -18,10 +18,18 @@ import (
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
-// fakeCB 可编程回调结果。
-type fakeCB struct{ err error }
+// fakeCB 可编程回调结果；calls 非 nil 时记录调用次数（终态守卫断言用）。
+type fakeCB struct {
+	err   error
+	calls *int32
+}
 
-func (f fakeCB) Do(context.Context, task.Payload) error { return f.err }
+func (f fakeCB) Do(_ context.Context, _ task.Payload) error {
+	if f.calls != nil {
+		*f.calls++
+	}
+	return f.err
+}
 
 func newDeps(t *testing.T, cb fakeCB) (Deps, *asynq.ServeMux) {
 	t.Helper()
@@ -102,5 +110,42 @@ func TestHandleBadPayloadDropped(t *testing.T) {
 	err := mux.ProcessTask(ctx, asynq.NewTask(task.TypeCallback, []byte("not-json")))
 	if !errors.Is(err, asynq.SkipRetry) {
 		t.Fatalf("bad payload want SkipRetry, got %v", err)
+	}
+}
+
+// 终态守卫（ADR-003 决策 7 / F59）：行已 canceled/succeeded 的投递——不执行回调、
+// SkipRetry 丢弃（关 F45/F58 窗口的取消回调与重复投递副作用）。
+func TestTerminalGuardSkipsCallback(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		finish func(d Deps, id string)
+	}{
+		{"canceled 行", func(d Deps, id string) {
+			d.Store.MarkCanceledIfPending(ctx, id, "canceled via API", time.Now())
+		}},
+		{"succeeded 行", func(d Deps, id string) {
+			d.Store.MarkRunning(ctx, id, 1, time.Now())
+			d.Store.Finish(ctx, id, repository.StatusSucceeded, "", 1, time.Now(), time.Now())
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls int32
+			d, mux := newDeps(t, fakeCB{calls: &calls})
+			d.Store.InsertPending(ctx, repository.Run{TaskID: "g1", Action: "a", EnqueuedAt: time.Now()})
+			tc.finish(d, "g1")
+
+			err := mux.ProcessTask(ctx, payload(t, "g1"))
+			if !errors.Is(err, asynq.SkipRetry) {
+				t.Fatalf("terminal row delivery want SkipRetry, got %v", err)
+			}
+			if calls != 0 {
+				t.Fatalf("callback must be intercepted, got %d calls", calls)
+			}
+			r, _ := d.Store.GetByTaskID(ctx, "g1")
+			if r.Status == repository.StatusRunning {
+				t.Fatalf("terminal row must not be resurrected: %s", r.Status)
+			}
+		})
 	}
 }

@@ -203,6 +203,7 @@ TASKRUNNER_TEST_PG_DSN=... go test ./internal/repository/ -run TestPG -v
 5. **游标 + 宽限推进的交互登记（评审六·5）**：行在游标越过时尚不满足宽限（enqueued_at > before）、之后才变老的，须等游标回卷再被检视/探视——最长延迟 ≈ 域大小 / batch × tick。对告警/清理用途可接受（业界更严谨做法为按状态分游标或定期全量扫，当前规模不必）。
 6. **失败/跳过计数 TTL 化（评审六·1/3）**：`enqueueFailCnt` / `probeFailCnt` / `payloadSkipCnt` 条目带最近时间戳，每 tick 按 TTL（10 分钟）回收——行经非成功路径离开域（取消/被取走/手工修数）后计数不再永久驻留（此前仅「重启清零」F30）；空/损坏快照跳过同步按 tick 聚合 Warn + 连续 ≥3 升级聚合 Error（此前实现为逐行 Warn，与 F66 文本「按 tick 聚合」不符，一并修正）。
 7. **`Service` 增 `Logger` 字段（评审六·2）**：A3 条件标记执行失败原先静默返回 `(true, nil, nil)`——现 Warn 留痕（「enqueued but mark queued failed, reclaim conflict branch will retry」），与扫描器 markFailed 聚合对称；装配两处同步。
+8. **「已投未标记」集合 TTL 化 + 实施计划描述同步（评审七·1/2）**：① 集合改 `map[task_id]lastSeen`——成员行经其它路径离开 pending（worker 取走转 running / 取消 canceled；MarkQueued 瞬时写故障后、任务在 Redis 会被 worker 即时取走，下一 tick 前即常发生）后，条目不再被成员路径触碰，原 `map[task_id]bool` 实现永久驻留至进程重启。成员路径每次检视重盖时间戳，prune 按 TTL（10 分钟）回收孤儿条目；TTL 内条目被误剪的极端情形（域内积压超 batch 挤出批位导致成员久未检视）后果为该行重投一次撞冲突自愈——已在 at-least-once 残余内，无正确性影响。② 实施计划 1 三个 partial index 的索引列与 `ListStuckPending` / `ListCanceledUnqueued` 游标签名、决策 4 两处游标描述，同步为 id 方案并加「见实现记录 §1」指针（此前仅实现记录描述偏差，照计划实现的读者会拿到旧形态）。评审七·3/④ 系对 ce49e62 之前版本的复核（快照聚合与 nil 检查外提已于评审六轮落地），无需再改。
 
 ## 关联文档
 - `docs/taskrunner.md` §5（HTTP API/受理语义——`POST /v1/tasks` 行）、§6（job_runs 状态机、日志分工与「日志级别约定」条目）、§10（实施计划 + 后置项总表 + 运行时边界口径）、§12（变更记录；实施时标注取代 2026-09-03「先入队后落库」决策）（评审 F16/F27/F28：原引用 §4/§5 与「风险窗口表」有偏差，已按实际章节结构修正；评审 F55：行号引用易随并发编辑漂移，以条目名为锚，数字仅作当前定位参考）

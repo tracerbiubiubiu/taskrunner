@@ -291,7 +291,11 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 			}
 		default:
 			// active / Lua 脏态 / 瞬时错误：不出域，下轮重探（F49：无条件出域会放走
-			// 仍在 Redis 的已取消任务，重开 F45 空洞）
+			// 仍在 Redis 的已取消任务，重开 F45 空洞）；脏态单列日志（数据不一致指纹，F65 分类面）
+			if isRedisDirtyStateErr(err) {
+				l.Logger.Warn("reclaim: cancel-cleanup probe hit dirty task state (redis data inconsistent), will re-probe",
+					slog.String("task_id", r.TaskID))
+			}
 			l.probeFailCnt[r.TaskID]++
 			if l.probeFailCnt[r.TaskID] >= 3 {
 				errored = append(errored, r.TaskID)

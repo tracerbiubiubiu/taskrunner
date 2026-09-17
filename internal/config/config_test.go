@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // env-only 成功路径 + 日志轮转默认值（锁住 §6「MaxAge 必须显式 / 默认 90 天」承诺，
@@ -36,6 +37,96 @@ func writeYaml(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// reclaim 扫描器配置（ADR-003 实施计划 4）：默认值 + fail-closed 校验 + F67 整秒化。
+func TestReclaimDefaults(t *testing.T) {
+	t.Setenv("TASKRUNNER_CALLER_ZHUZHAO_SK", "sk-z")
+	t.Setenv("TASKRUNNER_SELF_SK", "sk-t")
+	t.Setenv("TASKRUNNER_QUEUE", "jobs")
+	t.Setenv("TASKRUNNER_RECLAIM_TICK", "")
+	t.Setenv("TASKRUNNER_RECLAIM_STALE_AFTER", "")
+	t.Setenv("TASKRUNNER_RECLAIM_BATCH", "")
+	t.Setenv("TASKRUNNER_RECLAIM_RETENTION", "")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Reclaim.Tick != 10*time.Second || cfg.Reclaim.StaleAfter != 30*time.Second ||
+		cfg.Reclaim.Batch != 100 || cfg.Reclaim.Retention != time.Hour {
+		t.Fatalf("reclaim defaults: %+v", cfg.Reclaim)
+	}
+}
+
+func TestReclaimFailClosed(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     map[string]string
+		wantErr string
+	}{
+		{
+			name:    "tick < 1s 拒启（F10）",
+			env:     map[string]string{"TASKRUNNER_RECLAIM_TICK": "500ms"},
+			wantErr: "reclaim.tick",
+		},
+		{
+			name:    "retention 亚秒值拒启（F67：asynq 整秒截断静默关防线）",
+			env:     map[string]string{"TASKRUNNER_RECLAIM_RETENTION": "900ms"},
+			wantErr: "整秒化",
+		},
+		{
+			name: "stale_after >= retention 拒启（F30；900ms/500ms 组合即靶点）",
+			env: map[string]string{
+				"TASKRUNNER_RECLAIM_RETENTION":   "900ms",
+				"TASKRUNNER_RECLAIM_STALE_AFTER": "500ms",
+			},
+			wantErr: "整秒化", // 整秒化校验先行拦截
+		},
+		{
+			name: "不变式违反拒启",
+			env: map[string]string{
+				"TASKRUNNER_RECLAIM_STALE_AFTER": "2h", // 默认 retention 1h
+			},
+			wantErr: "stale_after",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TASKRUNNER_CALLER_ZHUZHAO_SK", "sk-z")
+			t.Setenv("TASKRUNNER_SELF_SK", "sk-t")
+			t.Setenv("TASKRUNNER_QUEUE", "jobs")
+			// 显式清空其余 reclaim 键，防全局 viper 串扰
+			t.Setenv("TASKRUNNER_RECLAIM_TICK", "")
+			t.Setenv("TASKRUNNER_RECLAIM_STALE_AFTER", "")
+			t.Setenv("TASKRUNNER_RECLAIM_BATCH", "")
+			t.Setenv("TASKRUNNER_RECLAIM_RETENTION", "")
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			_, err := Load("")
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want err containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// F67 正路：retention 整秒化截断生效（1999ms → 1s），不变式按整秒化后比较通过。
+func TestReclaimRetentionTruncatesToWholeSeconds(t *testing.T) {
+	t.Setenv("TASKRUNNER_CALLER_ZHUZHAO_SK", "sk-z")
+	t.Setenv("TASKRUNNER_SELF_SK", "sk-t")
+	t.Setenv("TASKRUNNER_QUEUE", "jobs")
+	t.Setenv("TASKRUNNER_RECLAIM_RETENTION", "1999ms")
+	t.Setenv("TASKRUNNER_RECLAIM_STALE_AFTER", "500ms")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Reclaim.Retention != time.Second {
+		t.Fatalf("retention must truncate to whole seconds, got %v", cfg.Reclaim.Retention)
+	}
 }
 
 func TestLoadFailClosed(t *testing.T) {

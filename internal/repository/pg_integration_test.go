@@ -7,6 +7,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -194,6 +195,65 @@ func TestPGMarkRunningRejectsSucceededResurrection(t *testing.T) {
 	must(err, "get")
 	if got.Status != StatusSucceeded || got.Attempts != 1 {
 		t.Fatalf("终态应保持不变: %+v", got)
+	}
+}
+
+// ADR-003：queued 标志 / 三域扫描查询 / id 游标 / MarkRunning 分类在 PG 下的等价性。
+func TestPGReclaimColumnsAndQueries(t *testing.T) {
+	if os.Getenv("TASKRUNNER_TEST_PG_DSN") == "" {
+		t.Skip("TASKRUNNER_TEST_PG_DSN 未设置")
+	}
+	s := openTestStorePG(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	now := time.Now()
+
+	// 新列写入 + 第一轮扫描域 + payload 往返
+	if err := s.InsertPending(ctx, Run{TaskID: "pg-rq1", Action: "a", EnqueuedAt: base,
+		EnqueuePayload: `{"task_id":"pg-rq1"}`}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	rows, err := s.ListUnqueued(ctx, now, 10)
+	if err != nil || len(rows) != 1 || rows[0].TaskID != "pg-rq1" || rows[0].EnqueuePayload != `{"task_id":"pg-rq1"}` {
+		t.Fatalf("list unqueued: %+v err=%v", rows, err)
+	}
+	if n, err := s.MarkQueued(ctx, "pg-rq1"); err != nil || n != 1 {
+		t.Fatalf("mark queued: %d %v", n, err)
+	}
+	if q, err := s.GetQueued(ctx, "pg-rq1"); err != nil || !q {
+		t.Fatalf("get queued: %v %v", q, err)
+	}
+
+	// 第二轮 id 游标：耗尽判定
+	stuck, err := s.ListStuckPending(ctx, now, 0, 10)
+	if err != nil || len(stuck) != 1 || stuck[0].TaskID != "pg-rq1" {
+		t.Fatalf("stuck: %+v err=%v", stuck, err)
+	}
+	if stuck2, err := s.ListStuckPending(ctx, now, stuck[0].ID, 10); err != nil || len(stuck2) != 0 {
+		t.Fatalf("cursor exhausted: %+v err=%v", stuck2, err)
+	}
+
+	// 第三域：取消 → 探针域入选 → 出域后离开
+	if err := s.InsertPending(ctx, Run{TaskID: "pg-rq2", Action: "a", EnqueuedAt: base}); err != nil {
+		t.Fatalf("insert rq2: %v", err)
+	}
+	if ok, err := s.MarkCanceledIfPending(ctx, "pg-rq2", "x", now); !ok || err != nil {
+		t.Fatalf("cancel: %v %v", ok, err)
+	}
+	crows, err := s.ListCanceledUnqueued(ctx, now, 0, 10)
+	if err != nil || len(crows) != 1 || crows[0].TaskID != "pg-rq2" {
+		t.Fatalf("canceled domain: %+v err=%v", crows, err)
+	}
+	if n, err := s.MarkCleanupDone(ctx, "pg-rq2"); err != nil || n != 1 {
+		t.Fatalf("cleanup done: %d %v", n, err)
+	}
+	if crows2, _ := s.ListCanceledUnqueued(ctx, now, 0, 10); len(crows2) != 0 {
+		t.Fatalf("出域后应离开扫描域: %+v", crows2)
+	}
+
+	// MarkRunning 分类（F59）：canceled 复活 → ErrTerminalRejected
+	if err := s.MarkRunning(ctx, "pg-rq2", 1, now); !errors.Is(err, ErrTerminalRejected) {
+		t.Fatalf("want ErrTerminalRejected, got %v", err)
 	}
 }
 

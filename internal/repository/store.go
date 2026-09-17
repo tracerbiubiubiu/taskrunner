@@ -30,6 +30,10 @@ const (
 
 var ErrNotFound = errors.New("store: job_run not found")
 
+// ErrTerminalRejected MarkRunning 复活拒绝（ADR-003 决策 7 终态守卫）：行已 succeeded/canceled
+// ——重复投递或已取消任务被取走，消费端必须拦截副作用（不回调 + SkipRetry）。
+var ErrTerminalRejected = errors.New("store: terminal row rejects resurrection")
+
 // 存储驱动（C7）。
 const (
 	DriverSQLite = "sqlite"
@@ -43,6 +47,7 @@ type Store struct {
 
 // Run job_runs 一行。
 type Run struct {
+	ID          int64 // 行主键（自增）——仅由扫描器列表方法填充，游标推进用（ADR-003 F36/F46/F56）
 	TaskID      string
 	RequestID   string
 	Action      string
@@ -59,6 +64,10 @@ type Run struct {
 	EnqueuedAt  time.Time
 	StartedAt   sql.NullTime
 	FinishedAt  sql.NullTime
+	Queued      bool // 投递状态标志（ADR-003，两义：已交付 Redis / 已了结）——仅由新方法填充，既有查询下恒为零值、不可作判据（F29）
+	// EnqueuePayload 提交载荷快照（task.Payload JSON，ADR-003 决策 2）——reclaim 重投唯一来源，
+	// 自带 timeout_secs 规避「job_runs 无超时覆盖」的重建缺口；与 asynq 载荷同源（F9）。
+	EnqueuePayload string
 }
 
 // extraSchemas 其他文件（如 jobs.go）按驱动注册的建表语句。
@@ -82,16 +91,24 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	source_ip     TEXT NOT NULL DEFAULT '',
 	enqueued_at   TIMESTAMP NOT NULL,
 	started_at    TIMESTAMP,
-	finished_at   TIMESTAMP
+	finished_at   TIMESTAMP,
+	queued        INTEGER NOT NULL DEFAULT 1,
+	enqueue_payload TEXT NOT NULL DEFAULT ''
 );
 `
 
-// indexes 建表/补列之后执行——引用新列（job_id）的索引依赖列迁移先行。
+// indexes 建表/补列之后执行——引用新列（job_id/queued）的索引依赖列迁移先行。
+// 三个 partial index（ADR-003 实施计划 1）谓词与三域判据逐字对齐，与既有
+// idx_job_runs_enqueued_at 正交、可并存；索引列 = id（游标键，F36/F46/F56——
+// 时间列绑定含驱动内部格式后缀，等值/边界比较不可靠，游标必须走整数主键，见实现记录）。
 const indexes = `
 CREATE INDEX IF NOT EXISTS idx_job_runs_request_id ON job_runs(request_id);
 CREATE INDEX IF NOT EXISTS idx_job_runs_action_status ON job_runs(action, status);
 CREATE INDEX IF NOT EXISTS idx_job_runs_job_id ON job_runs(job_id);
 CREATE INDEX IF NOT EXISTS idx_job_runs_enqueued_at ON job_runs(enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_job_runs_unqueued ON job_runs(id) WHERE queued = 0 AND status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_job_runs_stuck ON job_runs(id) WHERE status = 'pending' AND queued = 1;
+CREATE INDEX IF NOT EXISTS idx_job_runs_cancel_cleanup ON job_runs(id) WHERE status = 'canceled' AND queued = 0;
 `
 
 // Open 打开（或创建）SQLite 库并建表。WAL + busy_timeout 适配单容器单进程部署。
@@ -175,7 +192,9 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	source_ip     TEXT NOT NULL DEFAULT '',
 	enqueued_at   TIMESTAMPTZ NOT NULL,
 	started_at    TIMESTAMPTZ,
-	finished_at   TIMESTAMPTZ
+	finished_at   TIMESTAMPTZ,
+	queued        INTEGER NOT NULL DEFAULT 1,
+	enqueue_payload TEXT NOT NULL DEFAULT ''
 );
 `
 	}
@@ -232,6 +251,10 @@ func migrateColumns(db *sql.DB, driver string) error {
 		{"job_runs", "job_id", "ALTER TABLE job_runs ADD COLUMN job_id TEXT NOT NULL DEFAULT ''"},
 		{"job_runs", "dept", "ALTER TABLE job_runs ADD COLUMN dept TEXT NOT NULL DEFAULT ''"},
 		{"job_runs", "params", "ALTER TABLE job_runs ADD COLUMN params TEXT NOT NULL DEFAULT '{}'"},
+		// ADR-003（F29）：历史行 DEFAULT 1 =「已尝试过投递」——旧世界行存在 ⟺ 入队成功过，
+		// 事实正确；新行由 InsertPending 显式写 0。
+		{"job_runs", "queued", "ALTER TABLE job_runs ADD COLUMN queued INTEGER NOT NULL DEFAULT 1"},
+		{"job_runs", "enqueue_payload", "ALTER TABLE job_runs ADD COLUMN enqueue_payload TEXT NOT NULL DEFAULT ''"},
 	} {
 		rows, err := db.Query(existsQuery[driver], c.table, c.col)
 		if err != nil {
@@ -257,12 +280,15 @@ func (s *Store) Ping() error {
 	return s.db.QueryRowContext(context.Background(), `SELECT 1`).Scan(&one)
 }
 
-// InsertPending 入队时写入 pending 行；task_id 重复（幂等重提）返回已存在错误。
+// InsertPending 受理落库（ADR-003 记录先行）：写 pending 行 + queued=0（未投递）+
+// enqueue_payload 快照（重投唯一来源）；task_id 重复（幂等重提/并发竞提）返回已存在错误。
+// EnqueuedAt 先 Round(0) 剥离单调时钟——驱动按 time.Time.String() 落库，m=+ 后缀会让
+// 同一时刻的等值/边界比较永假（实测记录，ADR-003 游标改 id 的同源原因）。
 func (s *Store) InsertPending(ctx context.Context, r Run) error {
 	_, err := s.exec(ctx, `
-INSERT INTO job_runs (task_id, request_id, action, job_id, dept, params, callback_url, status, submitted_by, source_ip, enqueued_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.Params, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt)
+INSERT INTO job_runs (task_id, request_id, action, job_id, dept, params, callback_url, status, submitted_by, source_ip, enqueued_at, queued, enqueue_payload)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.Params, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt.Round(0), 0, r.EnqueuePayload)
 	if err != nil {
 		return fmt.Errorf("store: insert job_run: %w", err)
 	}
@@ -419,9 +445,19 @@ WHERE task_id = ? AND status NOT IN (?, ?)`,
 		return fmt.Errorf("store: mark running rows: %w", err)
 	}
 	if n == 0 {
-		// 0 行 = 行缺失或 succeeded/canceled 复活被拒（C6：有意的终态不可被过期写者
-		// 推翻；failed→running 为 asynq 重试周期正常路径，dead→running 仅供手动重置后）
-		return fmt.Errorf("store: mark running: job_runs succeeded/canceled resurrection rejected or missing (task_id=%s)", taskID)
+		// 0 行 = 行缺失或 succeeded/canceled 复活被拒（C6：有意的终态不可被过期写者推翻；
+		// failed→running 为 asynq 重试周期正常路径，dead→running 仅供手动重置后）。
+		// 补查分类（ADR-003 F59：UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按
+		// 未知包装，worker 对未知维持「继续执行」旧口径）：
+		run, gerr := s.GetByTaskID(ctx, taskID)
+		switch {
+		case gerr == nil:
+			return fmt.Errorf("store: mark running: %w (status=%s, task_id=%s)", ErrTerminalRejected, run.Status, taskID)
+		case errors.Is(gerr, ErrNotFound):
+			return fmt.Errorf("store: mark running: %w (task_id=%s)", ErrNotFound, taskID)
+		default:
+			return fmt.Errorf("store: mark running: missing or terminal resurrection rejected (classification failed: %w, task_id=%s)", gerr, taskID)
+		}
 	}
 	return nil
 }
@@ -451,4 +487,102 @@ WHERE task_id = ? AND status = ? AND attempts = ?`,
 		return fmt.Errorf("store: finish job_run: no running row with matching attempt (task_id=%s)", taskID)
 	}
 	return nil
+}
+
+// ---- ADR-003：outbox 补偿（queued 标志 + 三域扫描器）----
+
+// MarkQueued 入队成功后按状态条件置位（决策 3/理由）：`status='pending'` 条件是
+// 取消检测器（F19）——0 行 = 行已离开 pending（并发取消/已被取走/已达终态，F39 三义），
+// 调用方据此走 DeleteTask 补偿撤销；返回影响行数供调用方判定。
+func (s *Store) MarkQueued(ctx context.Context, taskID string) (int64, error) {
+	res, err := s.exec(ctx, `UPDATE job_runs SET queued = 1 WHERE task_id = ? AND status = ?`, taskID, StatusPending)
+	if err != nil {
+		return 0, fmt.Errorf("store: mark queued: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: mark queued rows: %w", err)
+	}
+	return n, nil
+}
+
+// MarkCleanupDone 第三域探针确认键消亡后的出域置位（F45/F48）：canceled 域专用——
+// 不可复用 MarkQueued（其 status='pending' 条件是 F19 取消检测器，对 canceled 行恒 0 行）。
+func (s *Store) MarkCleanupDone(ctx context.Context, taskID string) (int64, error) {
+	res, err := s.exec(ctx, `UPDATE job_runs SET queued = 1 WHERE task_id = ? AND status = ? AND queued = 0`, taskID, StatusCanceled)
+	if err != nil {
+		return 0, fmt.Errorf("store: mark cleanup done: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: mark cleanup done rows: %w", err)
+	}
+	return n, nil
+}
+
+// GetQueued 窄查询投递标志（F58：CancelTask 降级判据）——不扩既有 SELECT/Scan（F29 约束不变）。
+func (s *Store) GetQueued(ctx context.Context, taskID string) (bool, error) {
+	var queued int
+	err := s.queryRow(ctx, `SELECT queued FROM job_runs WHERE task_id = ?`, taskID).Scan(&queued)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("store: get queued: %w", err)
+	}
+	return queued == 1, nil
+}
+
+// reclaimListCols 扫描器三域共用的最小列集（行主键 + 任务 ID + 快照 + 入队时间；
+// F29：新列只被新方法读取，既有查询零触碰）。
+const reclaimListCols = `SELECT id, task_id, enqueue_payload, enqueued_at FROM job_runs`
+
+func scanReclaimRuns(rows *sql.Rows) ([]*Run, error) {
+	defer rows.Close()
+	var out []*Run
+	for rows.Next() {
+		var r Run
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.EnqueuePayload, &r.EnqueuedAt); err != nil {
+			return nil, fmt.Errorf("store: scan reclaim run: %w", err)
+		}
+		out = append(out, &r)
+	}
+	return out, rows.Err()
+}
+
+// ListUnqueued 第一轮扫描域（F1/F14：queued=0 AND status='pending' 才是安全域），
+// 显式批位上界（F66）。无需游标——论证见 ADR-003 决策 4 第一轮。
+func (s *Store) ListUnqueued(ctx context.Context, before time.Time, limit int) ([]*Run, error) {
+	rows, err := s.query(ctx, reclaimListCols+`
+WHERE queued = 0 AND status = ? AND enqueued_at <= ?
+ORDER BY id LIMIT ?`, StatusPending, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list unqueued: %w", err)
+	}
+	return scanReclaimRuns(rows)
+}
+
+// ListStuckPending 第二轮扫描域（pending AND queued=1），id 游标支持轮转
+// （F36/F46/F56；cursorID=0 = 从头扫；游标键必须走整数主键——时间列绑定格式
+// 含驱动内部后缀，等值/边界比较不可靠，见实现记录）。
+func (s *Store) ListStuckPending(ctx context.Context, before time.Time, cursorID int64, limit int) ([]*Run, error) {
+	rows, err := s.query(ctx, reclaimListCols+`
+WHERE status = ? AND queued = 1 AND enqueued_at <= ? AND id > ?
+ORDER BY id LIMIT ?`, StatusPending, before, cursorID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list stuck pending: %w", err)
+	}
+	return scanReclaimRuns(rows)
+}
+
+// ListCanceledUnqueued 第三域扫描域（canceled AND queued=0，F45），同款 id 游标 +
+// 批位上界（F50/F56：队头取消行探针持续失败时不占死批位）。
+func (s *Store) ListCanceledUnqueued(ctx context.Context, before time.Time, cursorID int64, limit int) ([]*Run, error) {
+	rows, err := s.query(ctx, reclaimListCols+`
+WHERE status = ? AND queued = 0 AND enqueued_at <= ? AND id > ?
+ORDER BY id LIMIT ?`, StatusCanceled, before, cursorID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list canceled unqueued: %w", err)
+	}
+	return scanReclaimRuns(rows)
 }

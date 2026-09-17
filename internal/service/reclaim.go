@@ -345,6 +345,7 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 	}
 	now := l.now()
 	var errored []string
+	var dirty []string // 脏态行（数据不一致指纹，F65 分类面）——按 tick 聚合 Warn（F62 精神，评审七·补）
 	for _, r := range rows {
 		err := l.Inspector.DeleteTask(l.Queue, r.TaskID)
 		switch {
@@ -359,15 +360,18 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 			}
 		default:
 			// active / Lua 脏态 / 瞬时错误：不出域，下轮重探（F49：无条件出域会放走
-			// 仍在 Redis 的已取消任务，重开 F45 空洞）；脏态单列日志（数据不一致指纹，F65 分类面）
+			// 仍在 Redis 的已取消任务，重开 F45 空洞）
 			if isRedisDirtyStateErr(err) {
-				l.Logger.Warn("reclaim: cancel-cleanup probe hit dirty task state (redis data inconsistent), will re-probe",
-					slog.String("task_id", r.TaskID))
+				dirty = append(dirty, r.TaskID)
 			}
 			if bump(l.probeFailCnt, r.TaskID, now, reclaimThreshold) {
 				errored = append(errored, r.TaskID)
 			}
 		}
+	}
+	if len(dirty) > 0 {
+		l.Logger.Warn("reclaim: cancel-cleanup probe hit dirty task state (redis data inconsistent), will re-probe",
+			slog.Int("rows", len(dirty)), slog.String("sample_task_ids", sampleIDs(dirty)))
 	}
 	if len(errored) > 0 {
 		l.Logger.Error("reclaim: cancel-cleanup probe persistently failing (>=3 consecutive)",

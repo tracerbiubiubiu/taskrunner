@@ -366,12 +366,14 @@ func seedCanceled(t *testing.T, s *repository.Store, id string, offset time.Dura
 }
 
 func TestReclaimCancelCleanupProbes(t *testing.T) {
-	l, st, fake, ins, _ := newReclaim(t)
+	l, st, fake, ins, cap := newReclaim(t)
 	seedCanceled(t, st, "c-ok", 0)    // DeleteTask 成功 → 出域
 	seedCanceled(t, st, "c-gone", 0)  // ErrTaskNotFound → 出域
 	seedCanceled(t, st, "c-qgone", 0) // F64：ErrQueueNotFound（队列注册集被清）→ 出域
 	seedCanceled(t, st, "c-act", 0)   // active → 不出域
+	seedCanceled(t, st, "c-dirty", 0) // Lua 脏态 → 不出域 + 聚合 Warn（F65 分类面）
 	ins.delErr["c-act"] = errors.New("asynq: INTERNAL_ERROR: cannot delete task in active state. use CancelProcessing instead.")
+	ins.delErr["c-dirty"] = errors.New("task is not found in list: asynq:{jobs}:pending")
 
 	// 宽限内的取消行不探（F45 判据）
 	seedOld(t, st, "c-fresh", "", 2*time.Hour)
@@ -388,6 +390,12 @@ func TestReclaimCancelCleanupProbes(t *testing.T) {
 	}
 	if q, _ := st.GetQueued(context.Background(), "c-act"); q {
 		t.Fatal("active probe failure must keep row in domain")
+	}
+	if q, _ := st.GetQueued(context.Background(), "c-dirty"); q {
+		t.Fatal("dirty-state probe failure must keep row in domain")
+	}
+	if got := cap.count(slog.LevelWarn, "dirty task state"); got != 1 {
+		t.Fatalf("dirty-state Warn must be aggregated per tick, got %d", got)
 	}
 	if fake.count() != 0 {
 		t.Fatal("domain-3 must never re-enqueue")

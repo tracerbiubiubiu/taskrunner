@@ -4,7 +4,7 @@
 2026-09-17（同日完成评审修正合入；同日七审增补 F58–F63、八审增补 F64–F67，见评审修正记录）
 
 ## 状态
-已采纳（2026-09-17 落地于 `feat/outbox-reclaim`：store/submit/cancel/reclaim/worker/装配/文档五批；验证 = build + vet + 全量单测 + race 绿，PG 集成用例 DSN 门控补齐）。实现与计划的偏差及实测发现见文末「实现记录」。
+已采纳（2026-09-17 落地于 `feat/outbox-reclaim`：store/submit/cancel/reclaim/worker/装配/文档五批；验证 = build + vet + 全量单测 + race 绿，PG 集成实测 6/6，冒烟五步 + E2E 七场景全过——E2E 已脚本化 `scripts/e2e/e2e.sh` 可独立复核，cron 场景 `E2E_INCLUDE_CRON=1`）。实现与计划的偏差及实测发现见文末「实现记录」。
 
 ## 背景
 现状 `internal/service/submit.go` 的提交顺序是 **GetByTaskID → Enqueue → InsertPending**（入队优先）。当 Enqueue 成功但 InsertPending 失败时，任务真实执行但在 job_runs 中永久隐形：无法取消/重试、审计断档、同 task_id 重提会二次执行（A1 去重失效），且 warning 不回传调用方。

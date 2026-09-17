@@ -157,13 +157,13 @@ func TestReclaimUnmarkedMemberMarkOnly(t *testing.T) {
 	l, st, fake, _, _ := newReclaim(t)
 	seedOld(t, st, "m1", `{"task_id":"m1"}`, 0)
 	l.defaults() // 仅初始化进程内状态（不跑扫描——避免首轮把行置位）
-	l.unmarked["m1"] = true
+	l.unmarked["m1"] = time.Now()
 
 	l.ReclaimStalePending(context.Background())
 	if fake.count() != 0 {
 		t.Fatal("member must skip re-enqueue (mark-only retry)")
 	}
-	if l.unmarked["m1"] {
+	if _, ok := l.unmarked["m1"]; ok {
 		t.Fatal("member must leave the set after successful mark")
 	}
 	if q, _ := st.GetQueued(context.Background(), "m1"); !q {
@@ -180,7 +180,7 @@ func TestReclaimUnmarkedMemberZeroRowsCompensates(t *testing.T) {
 	seedOld(t, st, "a1", `{"task_id":"a1"}`, 0) // 先插入 → id 小 → 同批先处理
 	seedOld(t, st, "m2", `{"task_id":"m2"}`, 0)
 	l.defaults()
-	l.unmarked["m2"] = true
+	l.unmarked["m2"] = time.Now()
 	fake.hook = func(task.Payload) { // a1 入队时取消 m2（此刻 m2 尚未被本轮标记）
 		_, _ = st.MarkCanceledIfPending(ctx, "m2", "canceled via API", time.Now())
 	}
@@ -189,7 +189,7 @@ func TestReclaimUnmarkedMemberZeroRowsCompensates(t *testing.T) {
 	if len(ins.deleted) == 0 || ins.deleted[0] != "m2" {
 		t.Fatalf("member 0 rows must compensate via DeleteTask first, got %+v", ins.deleted)
 	}
-	if l.unmarked["m2"] {
+	if _, ok := l.unmarked["m2"]; ok {
 		t.Fatal("member must leave the set after 0-row compensation")
 	}
 	// 行保持 canceled（第一轮不得复活）；其 queued=1 来自同 tick 第三域的
@@ -264,6 +264,23 @@ func TestReclaimFailStatTTLPruned(t *testing.T) {
 	l.ReclaimStalePending(context.Background())
 	if len(l.enqueueFailCnt) != 0 {
 		t.Fatalf("stale counter must be pruned, got %+v", l.enqueueFailCnt)
+	}
+}
+
+// 集合孤儿 TTL 回收（评审七·1）：成员行经其它路径离开 pending（worker 取走 running /
+// 取消 canceled）后不再被成员路径检视，条目按 TTL 回收、不永久驻留。
+func TestReclaimUnmarkedOrphanPruned(t *testing.T) {
+	l, _, _, _, _ := newReclaim(t)
+	l.defaults()
+	l.unmarked["orph"] = time.Now().Add(-failStatTTL - time.Minute) // 孤儿：超过 TTL 未被检视
+	l.unmarked["live"] = time.Now().Add(-time.Minute)               // 新鲜条目（行仍待处理）
+
+	l.ReclaimStalePending(context.Background())
+	if _, ok := l.unmarked["orph"]; ok {
+		t.Fatal("orphan entry must be pruned after TTL")
+	}
+	if _, ok := l.unmarked["live"]; !ok {
+		t.Fatal("fresh entry must survive prune")
 	}
 }
 

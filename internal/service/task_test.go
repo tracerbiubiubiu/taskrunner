@@ -16,20 +16,28 @@ import (
 
 // fakeInspector 可编程 asynq 检视（干预路径竞态验证）。
 type fakeInspector struct {
-	state  asynq.TaskState // GetTaskInfo 返回的状态
-	exists bool
-	delErr error
-	runErr error
+	state   asynq.TaskState // GetTaskInfo 返回的状态
+	exists  bool
+	getErr  error // GetTaskInfo 返回的错误（模拟 Redis 可用性故障 / ErrQueueNotFound，F58/F64）
+	delErr  error
+	runErr  error
+	deleted []string // DeleteTask 调用记录
 }
 
 func (f *fakeInspector) GetTaskInfo(_, _ string) (*asynq.TaskInfo, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
 	if !f.exists {
 		return nil, asynq.ErrTaskNotFound
 	}
 	return &asynq.TaskInfo{State: f.state}, nil
 }
-func (f *fakeInspector) DeleteTask(_, _ string) error { return f.delErr }
-func (f *fakeInspector) RunTask(_, _ string) error    { return f.runErr }
+func (f *fakeInspector) DeleteTask(_, id string) error {
+	f.deleted = append(f.deleted, id)
+	return f.delErr
+}
+func (f *fakeInspector) RunTask(_, _ string) error { return f.runErr }
 func (f *fakeInspector) ListArchivedTasks(string, ...asynq.ListOption) ([]*asynq.TaskInfo, error) {
 	return nil, nil
 }
@@ -127,6 +135,72 @@ func TestCancelRaces(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 	if r, _ := s4.repo.GetByTaskID(ctx, "rd"); r.Status != repository.StatusCanceled {
+		t.Fatalf("status: %s", r.Status)
+	}
+}
+
+// F35：Retention 留观中的 completed / archived 命中 → 409 且不删留观
+// （删了会抹掉「已执行」告警指纹并写 canceled 假终态）。
+func TestCancelTerminalStateFingerprints409(t *testing.T) {
+	ctx := context.Background()
+	for _, st := range []asynq.TaskState{asynq.TaskStateCompleted, asynq.TaskStateArchived} {
+		ins := &fakeInspector{exists: true, state: st}
+		s := newSvc(t, ins)
+		row(t, s, "f35", repository.StatusPending)
+		wantConflict(t, s.CancelTask(ctx, "f35"))
+		if len(ins.deleted) != 0 {
+			t.Fatalf("%v: must not delete the retention copy", st)
+		}
+		if r, _ := s.repo.GetByTaskID(ctx, "f35"); r.Status != repository.StatusPending {
+			t.Fatalf("%v: row must stay pending (fingerprint preserved), got %s", st, r.Status)
+		}
+	}
+}
+
+// F58：queued=0 行遇 Redis 可用性错误 → 降级取消（200，不触 Redis 删除，第三域探针收尾）；
+// queued=1 行同错误 → 原样返回（取消必须 Redis 配合）。
+func TestCancelDegradedByQueuedFlag(t *testing.T) {
+	ctx := context.Background()
+	down := errors.New("dial tcp: connection refused")
+
+	ins := &fakeInspector{getErr: down}
+	s := newSvc(t, ins)
+	row(t, s, "dg0", repository.StatusPending) // InsertPending 默认 queued=0
+	if err := s.CancelTask(ctx, "dg0"); err != nil {
+		t.Fatalf("queued=0 cancel must degrade to success, got %v", err)
+	}
+	if r, _ := s.repo.GetByTaskID(ctx, "dg0"); r.Status != repository.StatusCanceled {
+		t.Fatalf("degraded cancel must mark canceled, got %s", r.Status)
+	}
+	if len(ins.deleted) != 0 {
+		t.Fatal("degraded cancel must not call DeleteTask")
+	}
+
+	ins2 := &fakeInspector{getErr: down}
+	s2 := newSvc(t, ins2)
+	row(t, s2, "dg1", repository.StatusPending)
+	if _, err := s2.repo.MarkQueued(ctx, "dg1"); err != nil {
+		t.Fatal(err)
+	}
+	err := s2.CancelTask(ctx, "dg1")
+	if err == nil || isConflict(err) {
+		t.Fatalf("queued=1 availability error must surface as-is, got %v", err)
+	}
+	if r, _ := s2.repo.GetByTaskID(ctx, "dg1"); r.Status != repository.StatusPending {
+		t.Fatalf("queued=1 row must stay pending, got %s", r.Status)
+	}
+}
+
+// F64：ErrQueueNotFound（队列注册集被清，如 FLUSHDB）= 键消亡确认——取消照常完成。
+func TestCancelQueueNotFoundIsKeyGone(t *testing.T) {
+	ctx := context.Background()
+	ins := &fakeInspector{getErr: asynq.ErrQueueNotFound}
+	s := newSvc(t, ins)
+	row(t, s, "qnf", repository.StatusPending)
+	if err := s.CancelTask(ctx, "qnf"); err != nil {
+		t.Fatalf("queue-not-found must be tolerated, got %v", err)
+	}
+	if r, _ := s.repo.GetByTaskID(ctx, "qnf"); r.Status != repository.StatusCanceled {
 		t.Fatalf("status: %s", r.Status)
 	}
 }

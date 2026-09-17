@@ -184,7 +184,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 | 端点 | 用途 |
 |---|---|
-| `POST /v1/tasks` | 提交任务；**受理语义**：校验通过 + 写入队列（Redis AOF）即返回 task_id，「受理 ≠ 执行成功」；**幂等**：接受调用方生成的 `task_id`，重复提交去重；`timeout_secs` 0–86400（0=默认 30s） |
+| `POST /v1/tasks` | 提交任务；**受理语义（ADR-003 记录先行，2026-09-17）**：校验通过 + job_runs 落库即返回 task_id，「受理 ≠ 执行成功」；入队失败（Redis 抖动）仍 200 = **已受理待入队**（warning 仅日志不回传响应体，reclaim 扫描器补偿投递）；**幂等**：接受调用方生成的 `task_id`，重复提交去重；`timeout_secs` 0–86400（0=默认 30s） |
 | `GET /v1/tasks/{id}` | 查任务状态（**C11：响应补 `dept` 字段**——zhuzhao E-⑤ 可见性校验前提） |
 | `GET /v1/runs?request_id=&action=&status=&job_id=&dept=&from=&to=&page=&page_size=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；**C11：加 `dept` 多值过滤，按 `runs.dept` 快照列**——提交时从 job 定义或请求带入、一次性任务由 zhuzhao 携带，**不 JOIN jobs**（job 删除后历史可查、改 dept=转派不改历史归属）；zhuzhao E-⑤ 按可见标签集组装传入，修复「job 定义隔离但执行记录全量可见」旁路） |
 | `GET /v1/jobs?dept=&action_id=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签 + `timeout_secs` 0–86400，§4） |
@@ -208,13 +208,15 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **重试不是自循环**：handler 返回错误 → asynq 按退避策略把任务延迟重投递（`ProcessIn`），到期由池内任意协程再取——重试与首次是同一条消费路径；
 - **崩溃不丢**：执行中任务有租约（lease），协程存活即自动续期；进程挂 → 租约到期自动重新投递（at-least-once 的机制来源，也是回调幂等义务的来源）；
 - **多副本**：队列消费天然安全（多实例共享 Redis 队列、原子弹出，一条任务只被一个实例取走）；**cronloop tick 每实例独立跑——多副本部署前必须给 fireDue 加分布式锁**（Redis SETNX 即可），是 PG 解除单副本约束后的配套项，随多副本部署落地。
+- **提交路径 DB-first（ADR-003，2026-09-17）**：Submit = 查重 → job_runs 落库（queued=0 + 载荷快照）→ 入队；行即事实源（SSOT），Redis 任务是可重建投影。配套 **ReclaimLoop 三域扫描器**（自动修复 queued=0+pending / 告警 pending+queued=1 / 清理 canceled+queued=0，config `reclaim.*`）与 **worker 终态守卫**（终态行被投递 → 不回调 + SkipRetry）。运行时边界口径见 §10。
+- **取消语义（ADR-003，2026-09-17）**：`queued=0` 行（未交付/交付未知）遇 Redis 可用性错误**降级取消**——照常标 canceled，Redis 键收尾交第三域探针；`queued=1` 行取消仍需 Redis 配合。留观中的 completed / archived 命中 → 409（保「已执行」告警指纹，需人工介入）。
 
 ## 6. job_runs 存储与日志分工（2026-09-03 定稿）
 
 **执行记录落库**（不存文件、不依赖 Asynq/Redis 自带记录——Redis 只保队列运转，撑不起按 request_id/action/时间段的查询）：
 
 - 存储：**独立 DB**。~~SQLite 起步~~ ✅ **统一 PG，C7 已落地（2026-09-08）**：repository 双驱动（`db.driver: sqlite | pg`，默认 sqlite 供开发/单测零依赖；pg = `database/sql` + pgx stdlib，DSN 由 utils `postgres.Config` 构造）——schema 方言双版（PG：BIGSERIAL / BOOLEAN / TIMESTAMPTZ），查询统一 `?` 编写、PG 执行前机械转 `$n`；PG 集成测试 env 门控（`TASKRUNNER_TEST_PG_DSN`）覆盖全生命周期；
-- 最小 schema：`task_id`、`request_id`、`action`、`status`（pending / running / succeeded / failed / dead / canceled——canceled 为 API 取消终态，仅未开始的任务）、`attempts`、`callback_url`、`dept`（归属标签**快照列**——提交时从 job 定义或请求带入、一次性任务由 zhuzhao 携带；C11 查询按此过滤、不 JOIN jobs，2026-09-07）、`error`、`duration_ms`、`submitted_by` / `source_ip`（zhuzhao 透传的原始调用人，cron 触发为空，仅审计归因）、`enqueued_at` / `started_at` / `finished_at`；
+- 最小 schema：`task_id`、`request_id`、`action`、`status`（pending / running / succeeded / failed / dead / canceled——canceled 为 API 取消终态，仅未开始的任务）、`attempts`、`callback_url`、`dept`（归属标签**快照列**——提交时从 job 定义或请求带入、一次性任务由 zhuzhao 携带；C11 查询按此过滤、不 JOIN jobs，2026-09-07）、`error`、`duration_ms`、`submitted_by` / `source_ip`（zhuzhao 透传的原始调用人，cron 触发为空，仅审计归因）、`enqueued_at` / `started_at` / `finished_at`；ADR-003 补两列（2026-09-17）：`queued`（投递状态标志，两义=已交付 Redis / 已了结；历史行默认 1，新行写 0，入队成功翻 1）、`enqueue_payload`（提交载荷快照，重投唯一来源）；
 - 存储层代码放**本仓库 `internal/repository`**（2026-09-04 结构重构，原 `internal/store`）：job_runs 是 taskrunner 领域 schema，**不放 zhuzhao-utils**（utils 只收通用件；出现第二个同类消费者再考虑下沉）；
 - 保留策略 ⚠️ 落地时定（建议：保留期可配置 + 定时清理，思路同审计归档；`submitted_by` / `source_ip` 属个人信息，同受保留期约束）。
 
@@ -226,7 +228,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 过程细节 | 回调请求/响应报文、堆栈、debug 输出 | 应用日志文件（zhuzhao-utils `logger`：slog JSON + lumberjack 轮转，**文件+stdout 双写**） | 人工排障（grep 文件）；后续采集入 ES（见下） |
 
 - 关联约定：任务执行链路统一打点四件套 `request_id` / `task_id` / `action` / `attempt`（`slog.With` 常驻前三个，attempt 随每次尝试记）——表里查到一条记录，拿 task_id 即可在日志文件中按 attempt 定位每次执行的细节。~~run_id~~ **取消（2026-09-07）**：job_runs 是「一个 task_id 一行、重试覆盖更新 attempts」的模型，不存在独立 run 行，run_id 无从定义；尝试区分由 attempt 字段承担；
-- **日志级别约定（2026-09-07；09-08 补 4xx 终败）**：任务成功 = `Info`；失败但还将重试 = `Warn`；**终败（4xx 不重试）= `Error`**；死信 / 重试耗尽 / 载荷损坏丢弃 / 组件启动失败 = `Error`；cron 到点触发、API 写操作归因 = `Info`。ES 告警规则按此建立（Error 出现即告警）；
+- **日志级别约定（2026-09-07；09-08 补 4xx 终败；09-17 补扫描器与终态守卫）**：任务成功 = `Info`；失败但还将重试 = `Warn`；**终败（4xx 不重试）= `Error`**；死信 / 重试耗尽 / 载荷损坏丢弃 / 组件启动失败 = `Error`；cron 到点触发、API 写操作归因 = `Info`；**终态守卫拦截**（终态行被投递，决策 7）与**扫描器异常**（ADR-003：absent/completed/archived 指纹、入队/探针持续失败 ≥3）= `Error`，扫描器瞬时失败按 tick 聚合 = `Warn`（不逐行刷屏）。ES 告警规则按此建立（Error 出现即告警）；
 - **脱敏与截断边界（2026-09-07）**：过程日志中的 params 与回调报文**当前全量记录**（仅内网、文件留存）；错误响应片段截断 1KB 后进 `job_runs.error`，成功响应不落正文。脱敏策略后置（触发条件：日志将出内网 / 接入 ES 时启动；落点 = C1 访问日志中间件已预留的脱敏钩子 + callback 日志一处，不散改）；
 - **应用日志文件保留参数（2026-09-07；09-08 落地默认值）**：轮转参数走 config（utils logger：MaxSize / MaxBackups / MaxAge，env `TASKRUNNER_LOG_MAX_SIZE_MB / _MAX_BACKUPS / _MAX_AGE_DAYS`）。**MaxAge 必须显式配置**——lumberjack 零值为不限天数，而文件日志含工号 / IP 等个人信息；✅ 已实现默认 **90 天**（MaxSize 100MB / MaxBackups 不限，由天数控），M4 定 `job_runs` 保留期时可一并调整；
 - **双写路径**：utils logger 同时写文件与 stdout——容器 stdout 天然被 Docker 采集，是未来接入日志平台的第二条现成通道（与文件 shipper 二选一或并用）。
@@ -303,6 +305,14 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 模块内顺序 **M1 → M2 → M3**，M4 可与 M3 并行。
 
 ### 后置项触发条件总表（2026-09-15 沉淀；评审时逐行过一遍触发状态）
+
+**运行时边界口径（ADR-003 落地，2026-09-17）**：
+
+- **双投递残余**（不可再缩点 + 边界变体）：并发取消恰逢 worker 取走（补偿 DeleteTask 报 active 放弃；回调被 worker 终态守卫拦截，无副作用）；DB 全故障超 Retention（键释放后重投成功——行无法落终态，守卫无从生效），M4 对账兜底 + 告警介入；
+- **Redis 丢失告警口径**：行 pending 但队列 absent / completed / archived 指纹 → `Error`（人工处置：重新提交（新 task_id）或等 M4 对账；completed 需人工补录终态）；`RetryTask` 只收 failed/dead，pending 行重试 409；
+- **登记不变式**：`job_runs` 行生命周期 ≥ 同 task_id 的 Redis 键生命周期（含 Retention 留观）——M4 保留期清理落地时必须重估（清理不得早于 Redis 键消亡 + Retention）；
+- **既存空洞登记**：`running + queued=0`（MarkRunning 成功但 Finish 长期失败）不落任何扫描域——依赖 Finish Error 日志 + M4 对账；将来可在第二轮加 running 超时 alert-only 分支（不自动重投）；
+- **completed 留观过期清理由 asynq Server 内置 janitor 执行**（随 worker 进程运行，非 Redis TTL）——全停/纯 CLI 场景键滞留超 retention、TaskID 释放晚于配置值，安全方向，运维知悉。
 
 检测逻辑：触发信号 = 开始有人在现有机制外打补丁。各后置项详见上方 ⚠️ 列表与对应章节。
 
@@ -403,3 +413,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-15 | **能力目录定稿（原五开放点关闭，实现后置）**：注册表=taskrunner DB；自注册为主+管理兜底；提交时快照；显式 callback_url 保留；与密钥环分表+服务级 owner_ak 引用；粒度按能力/扁平 code/跨 AK 抢注 409/无 TTL 心跳；SDK 抽 zhuzhao-utils。实现触发条件=第二执行端 / zhuzhao 薄化 / 手填负担（满足其一立独立批次，1–2 天） |
 | 2026-09-15 | **PG 列迁移对称落地（migrateColumns 双驱动）**：SQLite pragma_table_info / PG information_schema 判存补列，ALTER 通用；修复 PG 存在性查询占位符（?→$1/$2）；旧库升级回归测试 SQLite+PG 双侧覆盖——消除「PG 部署后首次加字段升级即计划外停机」缺口（对应场景：C11 式加列在 PG 旧库上报 column not exist 全量失败） |
 | 2026-09-16 | **服务间验签统一批（utils v0.4.0）**：自研 AKSKAuth（150 行：MaxBytesReader 读体+手工验签+authErrMsg 分档+credentialOf 归因）退役，/v1 组改挂 `aksk.GinMiddleware(&Verifier{Keys, Logger}, response.AKSKFail())`——失败响应统一信封+分档中文文案（码引 errcode 常量，原 10001 字面量消除），caller/operator 归因键由 GinMiddleware 验签后统一写入（AccessLog 提前读头退役，改 ctx 优先+头回退+system 兜底），失败现场落 Verifier.Logger 服务端日志；行为增强：无 Authorization 头请求在读体前即 401（不再读体）。middleware 单测适配（credentialOf/authErrMsg 用例随逻辑收编 utils，8MB 用例改带签名打 413）。验证：lint+全量单测绿 |
+| 2026-09-17 | **ADR-003 落地（feat/outbox-reclaim）：提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器）**。**取代 2026-09-03「先入队后落库防孤儿行」决策**（该取舍的「执行但无记录」隐性窗口由本批结构性关闭：插行失败=500 干净，入队失败=行在可修）。① submit 三步（查重→落库 queued=0+载荷快照→入队；UNIQUE 竞提复查幂等 F23；条件标记 0 行补偿撤销 F19）；② ReclaimLoop 三域（自动修复 queued=0+pending / 告警 pending+queued=1 按 State 分流 / 清理 canceled+queued=0 探针出域；「已投未标记」集合、失败计数 tick 聚合、id 游标轮转；config `reclaim.tick/stale_after/batch/retention` 四键）；③ worker 终态守卫（终态行被投递 → 不回调 + SkipRetry——关闭取消残余与重复投递副作用面）；④ CancelTask：completed/archived 命中 409 保指纹（F35）、queued=0 行 Redis 宕机降级取消（F58）、消亡容忍集含 ErrQueueNotFound（F64）；⑤ 受理语义更新（§5）：入队失败 200=已受理待入队，warning 不回传响应体。实现偏差与游标改 id 的实测依据见 ADR-003「实现记录」。验证：build/vet/全量单测/race 绿；PG 集成用例补齐（DSN 门控） |

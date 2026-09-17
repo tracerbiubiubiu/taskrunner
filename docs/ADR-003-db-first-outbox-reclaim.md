@@ -192,7 +192,7 @@ TASKRUNNER_TEST_PG_DSN=... go test ./internal/repository/ -run TestPG -v
 ```
 手动冒烟五步：① 正常提交 → accepted=true 且行已落；② 停 Redis 提交 → 200 + warning，行 pending+queued=0；③ 恢复 Redis → 等 reclaim 日志「re-enqueued」，任务执行；④ 同 task_id 重提 → accepted=false 幂等；⑤ 停 Redis → 提交 → **取消** → 恢复 Redis → 确认已取消任务不被执行（F1/F19 冒烟；取消步走 F58 降级路径——Redis 宕机下正常完成，恢复后由第三域探针确认键消亡）。
 
-分支 `feat/outbox-reclaim`（自 develop），规模约 800 行含测试。
+分支 `feat/outbox-reclaim`（自 develop），实际规模 ≈2400 行含测试（计划估算 800 行为代码主体，测试与 E2E 资产另计）。冒烟五步已脚本化为 `scripts/e2e/e2e.sh`（19 断言七场景，含上文⑤的降级取消路径），可独立复核；cron 到点场景 `E2E_INCLUDE_CRON=1`。
 
 ## 实现记录（2026-09-17，落地时回写）
 

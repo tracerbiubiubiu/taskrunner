@@ -200,6 +200,9 @@ TASKRUNNER_TEST_PG_DSN=... go test ./internal/repository/ -run TestPG -v
 2. **`ErrRunNotFound` 复用既有 `ErrNotFound`**：store 包本就有该 sentinel（`GetByTaskID` 同用），不新增重复定义；worker 分流判 `ErrTerminalRejected` / 其余（含 `ErrNotFound`）。
 3. **`Service` 增 `Inspector TaskDelete` 字段**：决策 3 A3 的补偿撤销依赖 DeleteTask 能力，改动清单 2 此前未列（同 F35 类遗漏）；定义最小接口 `TaskDelete`（`*asynq.Inspector` 即满足），装配两处（provideSubmitter / main.go CLI）同步注入。
 4. **测试节到实现的对应**：A2「复查命中」分支无确定性注入点（row 在 A1 后、Insert 失败前出现的窗口无法在同构 store 上伪造），以并发同提测试覆盖（8 goroutine 竞提：恰一受理、恰一入队、恰一行、零错误——输者走 A1 命中或 A2 复查命中，两条路径返回值相同）；A3 0 行（F19 核心用例）与集合成员 0 行（F34）用入队 hook 在循环中途翻转行状态，确定性达成。
+5. **游标 + 宽限推进的交互登记（评审六·5）**：行在游标越过时尚不满足宽限（enqueued_at > before）、之后才变老的，须等游标回卷再被检视/探视——最长延迟 ≈ 域大小 / batch × tick。对告警/清理用途可接受（业界更严谨做法为按状态分游标或定期全量扫，当前规模不必）。
+6. **失败/跳过计数 TTL 化（评审六·1/3）**：`enqueueFailCnt` / `probeFailCnt` / `payloadSkipCnt` 条目带最近时间戳，每 tick 按 TTL（10 分钟）回收——行经非成功路径离开域（取消/被取走/手工修数）后计数不再永久驻留（此前仅「重启清零」F30）；空/损坏快照跳过同步按 tick 聚合 Warn + 连续 ≥3 升级聚合 Error（此前实现为逐行 Warn，与 F66 文本「按 tick 聚合」不符，一并修正）。
+7. **`Service` 增 `Logger` 字段（评审六·2）**：A3 条件标记执行失败原先静默返回 `(true, nil, nil)`——现 Warn 留痕（「enqueued but mark queued failed, reclaim conflict branch will retry」），与扫描器 markFailed 聚合对称；装配两处同步。
 
 ## 关联文档
 - `docs/taskrunner.md` §5（HTTP API/受理语义——`POST /v1/tasks` 行）、§6（job_runs 状态机、日志分工与「日志级别约定」条目）、§10（实施计划 + 后置项总表 + 运行时边界口径）、§12（变更记录；实施时标注取代 2026-09-03「先入队后落库」决策）（评审 F16/F27/F28：原引用 §4/§5 与「风险窗口表」有偏差，已按实际章节结构修正；评审 F55：行号引用易随并发编辑漂移，以条目名为锚，数字仅作当前定位参考）

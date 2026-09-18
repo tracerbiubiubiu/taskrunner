@@ -4,9 +4,15 @@ on:
     branches: ["**"]
   pull_request:
 
+# 连续 push 只跑最新提交（过期 run 自动取消，省 runner 时长）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # testcontainers/PG 挂起时兜底（默认 6h）
     services:
       postgres:
         image: postgres:15-alpine

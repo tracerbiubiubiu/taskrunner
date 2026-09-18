@@ -42,10 +42,14 @@ export TASKRUNNER_DB_USER=taskrunner TASKRUNNER_DB_PASSWORD=... TASKRUNNER_DB_NA
 ## 验证
 
 ```bash
+make lint                  # vet + gofmt
+make build                 # bin/taskrunner
 make test                  # 单测
 make e2e                   # E2E 端到端（需 docker；19 断言七场景，cron 场景 E2E_INCLUDE_CRON=1）
 TASKRUNNER_TEST_PG_DSN=... go test ./internal/repository/ -run TestPG   # PG 集成（需 PG）
 ```
+
+CI（GitHub Actions）：push/PR 全触发——vet + gofmt + 单测（race）+ PG 集成（race，services 起 postgres:15-alpine）。
 
 ## 状态
 

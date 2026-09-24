@@ -186,8 +186,7 @@ func TestSubmitTask(t *testing.T) {
 	f := newFixture(t)
 	w := f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
 		"task_id": "tk-1", "request_id": "req-1", "action": "audit_archive",
-		"callback_url": "http://zhu.internal/internal/jobs/audit_archive",
-		"params":       map[string]any{"retain_days": 90}, "submitted_by": "10086", "source_ip": "10.0.0.9",
+		"params": map[string]any{"retain_days": 90}, "submitted_by": "10086", "source_ip": "10.0.0.9",
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
@@ -207,7 +206,7 @@ func TestSubmitTask(t *testing.T) {
 	// 幂等重提
 	f.sub.dup = true
 	w2 := f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
-		"task_id": "tk-1", "action": "a", "callback_url": "http://x",
+		"task_id": "tk-1", "action": "a",
 	})
 	if w2.Code != http.StatusOK {
 		t.Fatalf("idempotent resubmit want 200, got %d", w2.Code)
@@ -221,7 +220,7 @@ func TestSubmitTask(t *testing.T) {
 func TestGetTaskLiveState(t *testing.T) {
 	f := newFixture(t)
 	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
-		"task_id": "tk-live", "action": "a", "callback_url": "http://x"})
+		"task_id": "tk-live", "action": "a"})
 	f.insp.live["tk-live"] = &asynq.TaskInfo{ID: "tk-live", State: asynq.TaskStateRetry}
 
 	w := f.do(t, http.MethodGet, "/v1/tasks/tk-live", nil)
@@ -243,8 +242,8 @@ func TestGetTaskLiveState(t *testing.T) {
 
 func TestListRunsFilter(t *testing.T) {
 	f := newFixture(t)
-	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "r1", "request_id": "rqA", "action": "a1", "callback_url": "http://x"})
-	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "r2", "request_id": "rqB", "action": "a2", "callback_url": "http://x"})
+	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "r1", "request_id": "rqA", "action": "a1"})
+	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "r2", "request_id": "rqB", "action": "a2"})
 
 	w := f.do(t, http.MethodGet, "/v1/runs?request_id=rqA", nil)
 	if w.Code != http.StatusOK {
@@ -263,7 +262,7 @@ func TestListRunsFilter(t *testing.T) {
 	var jaID, jbID string
 	for _, job := range []struct{ id, dept string }{{"j-a", "deptA"}, {"j-b", "deptB"}} {
 		wj := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
-			"action_id": "a1", "callback_url": "http://x", "trigger_type": "cron",
+			"action_id": "a1", "trigger_type": "cron",
 			"cron_spec": "0 4 * * *", "dept": job.dept,
 		})
 		if wj.Code != http.StatusOK {
@@ -295,7 +294,7 @@ func TestListRunsFilter(t *testing.T) {
 func TestSubmitParamsRoundTrip(t *testing.T) {
 	f := newFixture(t)
 	w := f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
-		"task_id": "p-rt-1", "action": "a", "callback_url": "http://x",
+		"task_id": "p-rt-1", "action": "a",
 		"dept": "d1", "params": map[string]any{"retain_days": 7},
 	})
 	if w.Code != http.StatusOK {
@@ -368,7 +367,7 @@ func TestC10NegativeBindings(t *testing.T) {
 func TestC11DeptFilterNegative(t *testing.T) {
 	f := newFixture(t)
 	wj := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
-		"action_id": "a1", "callback_url": "http://x", "trigger_type": "cron",
+		"action_id": "a1", "trigger_type": "cron",
 		"cron_spec": "0 4 * * *", "dept": "deptA",
 	})
 	if wj.Code != http.StatusOK {
@@ -403,7 +402,7 @@ func TestC11DeptFilterNegative(t *testing.T) {
 func TestCreateJobCreatedByFallback(t *testing.T) {
 	f := newFixture(t)
 	w := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
-		"action_id": "audit_archive", "callback_url": "http://x",
+		"action_id":    "audit_archive",
 		"trigger_type": "cron", "cron_spec": "0 3 * * *",
 	})
 	if w.Code != http.StatusOK {
@@ -416,7 +415,7 @@ func TestCreateJobCreatedByFallback(t *testing.T) {
 	}
 
 	w2 := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
-		"action_id": "audit_archive", "callback_url": "http://x",
+		"action_id":    "audit_archive",
 		"trigger_type": "cron", "cron_spec": "0 4 * * *",
 		"created_by": "bob",
 	})
@@ -429,7 +428,7 @@ func TestCreateJobCreatedByFallback(t *testing.T) {
 
 func TestCancelAndRetry(t *testing.T) {
 	f := newFixture(t)
-	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "c1", "action": "a", "callback_url": "http://x"})
+	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "c1", "action": "a"})
 
 	// 取消 pending（C10：POST URL 不携带业务信息，标识在 body）
 	w := f.do(t, http.MethodPost, "/v1/tasks/cancel", map[string]any{"task_id": "c1"})
@@ -449,7 +448,7 @@ func TestCancelAndRetry(t *testing.T) {
 	}
 
 	// retry failed 任务：置 failed 后重试成功
-	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "c2", "action": "a", "callback_url": "http://x"})
+	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "c2", "action": "a"})
 	// C6 谓词适配：真实 worker 不变量 = Finish 前必 MarkRunning（running 态才可终态）
 	if err := f.st.MarkRunning(context.Background(), "c2", 1, time.Now()); err != nil {
 		t.Fatal(err)
@@ -473,7 +472,7 @@ func TestCancelAndRetry(t *testing.T) {
 func TestJobsCRUDAndTrigger(t *testing.T) {
 	f := newFixture(t)
 	w := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
-		"action_id": "audit_archive", "callback_url": "http://zhu.internal/internal/jobs/audit_archive",
+		"action_id":    "audit_archive",
 		"trigger_type": "cron", "cron_spec": "0 3 * * *", "params": map[string]any{"retain_days": 90},
 		"dept": "audit", "created_by": "10086",
 	})
@@ -489,7 +488,7 @@ func TestJobsCRUDAndTrigger(t *testing.T) {
 
 	// 非法 cron → 400
 	wBad := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
-		"action_id": "a", "callback_url": "http://x", "trigger_type": "cron", "cron_spec": "bad"})
+		"action_id": "a", "trigger_type": "cron", "cron_spec": "bad"})
 	if wBad.Code != http.StatusBadRequest {
 		t.Fatalf("bad cron want 400, got %d", wBad.Code)
 	}
@@ -604,7 +603,7 @@ func TestErrorMessageDistinguishesState(t *testing.T) {
 
 	// 取消成功态任务 → 409 消息带中文当前状态
 	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
-		"task_id": "tk-done", "action": "a", "callback_url": "http://x"})
+		"task_id": "tk-done", "action": "a"})
 	now := time.Now()
 	if err := f.st.MarkRunning(context.Background(), "tk-done", 1, now); err != nil {
 		t.Fatalf("mark running: %v", err)

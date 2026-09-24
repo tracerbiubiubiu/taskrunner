@@ -24,12 +24,15 @@ type Submitter interface {
 }
 
 type Loop struct {
-	Store     *repository.Store
-	Submit    Submitter
-	Logger    *slog.Logger
-	Tick      time.Duration // 默认 30s（cron 最细粒度 1 分钟，30s 轮询足够）
-	NewTaskID func() string
-	Now       func() time.Time
+	Store  *repository.Store
+	Submit Submitter
+	Logger *slog.Logger
+	// CallbackTargetURL W0b：cron 触发的出站回调目标——忽略 jobs 列存量值
+	//（十七批「读侧覆盖不迁存量」），一律配置值。
+	CallbackTargetURL string
+	Tick              time.Duration // 默认 30s（cron 最细粒度 1 分钟，30s 轮询足够）
+	NewTaskID         func() string
+	Now               func() time.Time
 }
 
 // ParseSpec 解析并校验 cron 表达式（5 段标准格式）。
@@ -79,7 +82,7 @@ func (l *Loop) FireDue(ctx context.Context) {
 		p := task.Payload{
 			TaskID: newID,
 			Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
-			CallbackURL: j.CallbackURL,
+			CallbackURL: l.CallbackTargetURL, // W0b：读侧覆盖存量列
 			Params:      []byte(j.Params),
 			TimeoutSecs: j.TimeoutSecs,
 			// cron 触发无用户参与：request_id / submitted_by / source_ip 留空（§4）

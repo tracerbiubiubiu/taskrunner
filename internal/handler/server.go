@@ -203,7 +203,7 @@ func (d *Deps) retryTask(c *gin.Context) {
 
 type createJobReq struct {
 	ActionID     string          `json:"action_id" binding:"required"`
-	CallbackURL  string          `json:"callback_url" binding:"required"`
+	CallbackURL  string          `json:"callback_url"` // W0b：拒收用户值（非空 400），目标由服务端配置
 	TriggerType  string          `json:"trigger_type" binding:"required"`
 	CronSpec     string          `json:"cron_spec"`
 	Params       json.RawMessage `json:"params"`

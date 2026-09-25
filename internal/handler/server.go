@@ -75,8 +75,8 @@ type submitReq struct {
 	TaskID      string          `json:"task_id"`
 	RequestID   string          `json:"request_id"`
 	Action      string          `json:"action" binding:"required"`
-	Dept        string          `json:"dept"` // 一次性任务归属标签（zhuzhao E-⑤ 携带，C11 快照列）
-	CallbackURL string          `json:"callback_url" binding:"required"`
+	Dept        string          `json:"dept"`         // 一次性任务归属标签（zhuzhao E-⑤ 携带，C11 快照列）
+	CallbackURL string          `json:"callback_url"` // W0b：拒收用户值（非空 400），目标由服务端配置
 	Params      json.RawMessage `json:"params"`
 	SubmittedBy string          `json:"submitted_by"` // 工号（审计归因）
 	SourceIP    string          `json:"source_ip"`
@@ -85,7 +85,7 @@ type submitReq struct {
 
 func (d *Deps) submitTask(c *gin.Context) {
 	var req submitReq
-	if !bindBody(c, &req, "action 与 callback_url 必填") {
+	if !bindBody(c, &req, "action 必填") {
 		return
 	}
 	// request_id 兜底：zhuzhao client 签名头携带 X-Request-ID，body 可不带——
@@ -203,7 +203,7 @@ func (d *Deps) retryTask(c *gin.Context) {
 
 type createJobReq struct {
 	ActionID     string          `json:"action_id" binding:"required"`
-	CallbackURL  string          `json:"callback_url" binding:"required"`
+	CallbackURL  string          `json:"callback_url"` // W0b：拒收用户值（非空 400），目标由服务端配置
 	TriggerType  string          `json:"trigger_type" binding:"required"`
 	CronSpec     string          `json:"cron_spec"`
 	Params       json.RawMessage `json:"params"`
@@ -217,7 +217,7 @@ type createJobReq struct {
 
 func (d *Deps) createJob(c *gin.Context) {
 	var req createJobReq
-	if !bindBody(c, &req, "action_id / callback_url / trigger_type 必填") {
+	if !bindBody(c, &req, "action_id / trigger_type 必填") {
 		return
 	}
 	if !validTimeoutSecs(req.TimeoutSecs) {

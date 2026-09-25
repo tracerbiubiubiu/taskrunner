@@ -35,7 +35,9 @@ type Config struct {
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"` // asynq 停机排空上限；<=0 → 30s（C5）
 	MaxRetry        int           `mapstructure:"max_retry"`
 	CallbackTimeout time.Duration `mapstructure:"callback_timeout"`
-	CronTick        time.Duration `mapstructure:"cron_tick"`
+	// CallbackTargetURL W0b（SSRF 根治）：唯一出站回调目标（zhuzhao /internal/jobs/callback）
+	CallbackTargetURL string        `mapstructure:"callback_target_url"`
+	CronTick          time.Duration `mapstructure:"cron_tick"`
 	// Reclaim 扫描器（ADR-003）：tick 扫描节奏、stale_after 入队宽限、batch 三域共用
 	// 批位上界、retention 入队留观（归入 reclaim 组的理由见 ADR-003 决策 5）。
 	Reclaim struct {
@@ -103,6 +105,7 @@ func Load(path string) (*Config, error) {
 	viper.BindEnv("max_retry", "TASKRUNNER_MAX_RETRY")
 	viper.SetDefault("max_retry", 5)
 	bind("callback_timeout", "TASKRUNNER_CALLBACK_TIMEOUT", "30s")
+	bind("callback_target_url", "TASKRUNNER_CALLBACK_TARGET_URL", "")
 	bind("cron_tick", "TASKRUNNER_CRON_TICK", "30s")
 	bind("reclaim.tick", "TASKRUNNER_RECLAIM_TICK", "10s")
 	bind("reclaim.stale_after", "TASKRUNNER_RECLAIM_STALE_AFTER", "30s")

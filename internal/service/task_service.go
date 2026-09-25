@@ -82,6 +82,10 @@ type TaskService struct {
 	inspector TaskInspector
 	queue     string
 	logger    *slog.Logger
+	// callbackTarget 服务端回调目标（W0b SSRF 根治）：出站 URL 一律此值，
+	// 永不取自请求体/jobs 存量列——生态内回调唯一合法消费者 = zhuzhao
+	// /internal/jobs/callback（十七批：用户级 URL 无正当用途）。
+	callbackTarget string
 	// Now 可注入时钟（时间确定性测试）；零值回退 time.Now。
 	Now func() time.Time
 }
@@ -94,8 +98,9 @@ func (s *TaskService) now() time.Time {
 }
 
 func NewTaskService(repo *repository.Store, submitter Submitter,
-	inspector TaskInspector, queue string, logger *slog.Logger) *TaskService {
-	return &TaskService{repo: repo, submitter: submitter, inspector: inspector, queue: queue, logger: logger}
+	inspector TaskInspector, queue string, logger *slog.Logger, callbackTarget string) *TaskService {
+	return &TaskService{repo: repo, submitter: submitter, inspector: inspector, queue: queue,
+		logger: logger, callbackTarget: callbackTarget}
 }
 
 // ---- 提交 ----
@@ -120,15 +125,23 @@ type SubmitOutput struct {
 }
 
 func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput, error) {
-	if in.Action == "" || in.CallbackURL == "" {
-		return nil, invalid("action 与 callback_url 必填")
+	if in.Action == "" {
+		return nil, invalid("action 必填")
+	}
+	// W0b（十七批 SSRF 根治）：callback_url 拒收用户值（非空即 400，fail-fast）；
+	// 出站目标一律配置值（TASKRUNNER_CALLBACK_TARGET_URL）。
+	if in.CallbackURL != "" {
+		return nil, invalid("callback_url 不再接受（回调地址由服务端配置决定）")
+	}
+	if s.callbackTarget == "" {
+		return nil, invalid("回调未配置（TASKRUNNER_CALLBACK_TARGET_URL），禁止无回调受理")
 	}
 	if in.TaskID == "" {
 		in.TaskID = uuid.NewString()
 	}
 	accepted, warning, err := s.submitter.Submit(ctx, task.Payload{
 		TaskID: in.TaskID, RequestID: in.RequestID, Action: in.Action, Dept: in.Dept,
-		CallbackURL: in.CallbackURL, Params: in.Params,
+		CallbackURL: s.callbackTarget, Params: in.Params,
 		SubmittedBy: in.SubmittedBy, SourceIP: in.SourceIP, TimeoutSecs: in.TimeoutSecs,
 	})
 	if err != nil {
@@ -441,9 +454,17 @@ func jobView(j *repository.Job) JobView {
 }
 
 func (s *TaskService) CreateJob(ctx context.Context, in JobInput) (*JobView, error) {
-	if in.ActionID == "" || in.CallbackURL == "" || in.TriggerType == "" {
-		return nil, invalid("action_id / callback_url / trigger_type 必填")
+	if in.ActionID == "" || in.TriggerType == "" {
+		return nil, invalid("action_id / trigger_type 必填")
 	}
+	// W0b：同 Submit——callback_url 拒用户值，jobs 列写配置目标
+	if in.CallbackURL != "" {
+		return nil, invalid("callback_url 不再接受（回调地址由服务端配置决定）")
+	}
+	if s.callbackTarget == "" {
+		return nil, invalid("回调未配置（TASKRUNNER_CALLBACK_TARGET_URL），禁止建任务定义")
+	}
+	in.CallbackURL = s.callbackTarget
 	if in.TriggerType != repository.TriggerCron && in.TriggerType != repository.TriggerManual {
 		return nil, invalid("trigger_type 仅支持 cron | manual")
 	}
@@ -491,15 +512,16 @@ func (s *TaskService) ListJobs(ctx context.Context, f repository.JobFilter) ([]J
 }
 
 func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (*JobView, error) {
+	// W0b：PATCH 拒改 callback_url（同 SSRF 收口）
+	if p.CallbackURL != nil {
+		return nil, invalid("callback_url 不再接受（回调地址由服务端配置决定）")
+	}
 	j, err := s.repo.GetJob(ctx, jobID)
 	if errors.Is(err, repository.ErrNotFound) {
 		return nil, jobNotFound(jobID)
 	}
 	if err != nil {
 		return nil, err
-	}
-	if p.CallbackURL != nil {
-		j.CallbackURL = *p.CallbackURL
 	}
 	if p.CronSpec != nil {
 		if j.TriggerType != repository.TriggerCron {
@@ -557,7 +579,8 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 	taskID := uuid.NewString()
 	accepted, warning, err := s.submitter.Submit(ctx, task.Payload{
 		TaskID: taskID, RequestID: in.RequestID, Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
-		CallbackURL: j.CallbackURL, Params: []byte(j.Params),
+		CallbackURL: s.callbackTarget, // W0b：读侧覆盖 jobs 列（SSRF 收口，存量行不迁）
+		Params:      []byte(j.Params),
 		SubmittedBy: in.Actor, SourceIP: in.SourceIP, TimeoutSecs: j.TimeoutSecs,
 	})
 	if err != nil {

@@ -75,6 +75,8 @@ services:
       TASKRUNNER_SELF_SK: ${TASKRUNNER_SELF_SK:-dev-callback-sk}
       # 重试上限（默认 5；E 阶段演练曾临时置 0 快速造 dead 靶标）
       TASKRUNNER_MAX_RETRY: ${TASKRUNNER_MAX_RETRY:-5}
+      # W0b SSRF 收口：唯一出站回调目标（zhuzhao 内网回调端点）——无兜底必填
+      TASKRUNNER_CALLBACK_TARGET_URL: ${TASKRUNNER_CALLBACK_TARGET_URL:?required — http://zhuzhao:33333/internal/jobs/callback}
     networks:
       taskrunner_internal: {}
       zhuzhao_to_taskrunner:

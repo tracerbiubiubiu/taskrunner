@@ -68,7 +68,7 @@ func newSvc(t *testing.T, ins *fakeInspector) *TaskService {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return NewTaskService(st, nil, ins, "jobs", slog.Default())
+	return NewTaskService(st, nil, ins, "jobs", slog.Default(), "http://test-zhuzhao/internal/jobs/callback")
 }
 
 func row(t *testing.T, s *TaskService, id, status string) {

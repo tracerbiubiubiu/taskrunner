@@ -236,6 +236,7 @@ func (s *TaskService) GetTask(ctx context.Context, taskID string) (*TaskView, er
 type RunQuery struct {
 	RequestID, Action, Status, JobID string
 	Depts                            []string
+	SubmittedBy                      string // 「只看我提交的」（zhuzhao 代理把 me 换 actor 后透传）
 	From, To                         *time.Time
 	Page, PageSize                   int
 }
@@ -243,7 +244,8 @@ type RunQuery struct {
 func (s *TaskService) ListRuns(ctx context.Context, q RunQuery) ([]RunView, int64, error) {
 	runs, total, err := s.repo.ListRuns(ctx, repository.RunFilter{
 		RequestID: q.RequestID, Action: q.Action, Status: q.Status, JobID: q.JobID, Depts: q.Depts,
-		From: q.From, To: q.To, Page: q.Page, PageSize: q.PageSize,
+		SubmittedBy: q.SubmittedBy,
+		From:        q.From, To: q.To, Page: q.Page, PageSize: q.PageSize,
 	})
 	if err != nil {
 		return nil, 0, err

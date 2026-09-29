@@ -348,15 +348,16 @@ UPDATE job_runs SET status = ?, error = ?, finished_at = ? WHERE task_id = ? AND
 
 // RunFilter 执行记录查询条件（§5 GET /v1/runs，全部可选）。
 type RunFilter struct {
-	RequestID string
-	Action    string
-	Status    string
-	JobID     string
-	Depts     []string
-	From      *time.Time
-	To        *time.Time
-	Page      int // 1 起
-	PageSize  int
+	RequestID   string
+	Action      string
+	Status      string
+	JobID       string
+	Depts       []string
+	SubmittedBy string // 「只看我提交的」精确过滤（zhuzhao 代理把 me 换 actor 后透传，02 W5）
+	From        *time.Time
+	To          *time.Time
+	Page        int // 1 起
+	PageSize    int
 }
 
 // toAny []string → []any（SQL 参数）。
@@ -383,6 +384,9 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	}
 	if f.JobID != "" {
 		where, args = where+" AND job_id = ?", append(args, f.JobID)
+	}
+	if f.SubmittedBy != "" {
+		where, args = where+" AND submitted_by = ?", append(args, f.SubmittedBy)
 	}
 	if len(f.Depts) > 0 {
 		ph := strings.Repeat("?,", len(f.Depts))

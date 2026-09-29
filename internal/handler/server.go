@@ -135,6 +135,7 @@ func (d *Deps) listRuns(c *gin.Context) {
 	q := service.RunQuery{
 		RequestID: c.Query("request_id"), Action: c.Query("action"),
 		Status: c.Query("status"), JobID: c.Query("job_id"), Depts: c.QueryArray("dept"),
+		SubmittedBy: c.Query("submitted_by"), // zhuzhao 代理已把 me 换成 actor（02 W5）
 		Page: atoi(c.Query("page"), 1), PageSize: atoi(c.Query("page_size"), 20),
 	}
 	for k, dest := range map[string]**time.Time{"from": &q.From, "to": &q.To} {

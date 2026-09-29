@@ -77,6 +77,10 @@ services:
       TASKRUNNER_MAX_RETRY: ${TASKRUNNER_MAX_RETRY:-5}
       # W0b SSRF 收口：唯一出站回调目标（zhuzhao 内网回调端点）——无兜底必填
       TASKRUNNER_CALLBACK_TARGET_URL: ${TASKRUNNER_CALLBACK_TARGET_URL:?required — http://zhuzhao:33333/internal/jobs/callback}
+      # ── P4-2 死信告警（默认关闭；开启时 AK/SK 须与 zhuzhao /internal 验签对齐）──
+      # TASKRUNNER_NOTIFY_TARGET_URL: http://zhuzhao:33333/internal/notify/dead-letter
+      # TASKRUNNER_NOTIFY_AK: taskrunner        # 必须恒 taskrunner（=internal_jobs.taskrunner_ak）
+      # TASKRUNNER_NOTIFY_SK: ${TASKRUNNER_SELF_SK}  # 必须与 SELF_SK 同值（zhuzhao INTERNAL_JOBS_SK）
     networks:
       taskrunner_internal: {}
       zhuzhao_to_taskrunner:

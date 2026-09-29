@@ -70,9 +70,13 @@ func (n *Notifier) NotifyDeadLetter(p Payload) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if n.cfg.AK != "" && len(n.cfg.SK) > 0 {
-			aksk.Sign(req, body, aksk.SignOptions{AK: n.cfg.AK, SK: n.cfg.SK})
+		// 审计修正（2026-09-30 二轮）：无条件签名——config.Load fail-closed 后此分支
+		// 恒真，但保留 if 形态=不经 Load 的构造（测试/新调用方）静默走无签名 401 死路
+		if n.cfg.AK == "" || len(n.cfg.SK) == 0 {
+			n.logger.Error("dead-letter notify: AK/SK missing (config.Load fail-closed bypassed?)", slog.String("task_id", p.TaskID))
+			return
 		}
+		aksk.Sign(req, body, aksk.SignOptions{AK: n.cfg.AK, SK: n.cfg.SK})
 		resp, err := n.client.Do(req)
 		if err != nil {
 			n.logger.Error("dead-letter notify: post", "err", err, "task_id", p.TaskID)

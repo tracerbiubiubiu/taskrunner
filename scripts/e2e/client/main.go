@@ -35,7 +35,7 @@ func main() {
 	switch os.Args[1] {
 	case "submit": // submit <id> <cbPath>
 		do("POST", "/v1/tasks", fmt.Appendf(nil,
-			`{"task_id":%q,"action":"audit_archive","callback_url":"http://127.0.0.1:6398%s","params":{},"dept":"e2e"}`,
+			`{"task_id":%q,"action":"audit_archive","params":{},"dept":"e2e"}`,
 			os.Args[2], os.Args[3]))
 	case "cancel": // cancel <id>
 		do("POST", "/v1/tasks/cancel", fmt.Appendf(nil, `{"task_id":%q}`, os.Args[2]))
@@ -46,7 +46,7 @@ func main() {
 	case "dead":
 		do("GET", "/v1/dead-letters?page=1&page_size=50", nil)
 	case "createjob":
-		do("POST", "/v1/jobs", []byte(`{"action_id":"audit_archive","callback_url":"http://127.0.0.1:6398/cb","trigger_type":"cron","cron_spec":"* * * * *","params":{},"dept":"e2e","timeout_secs":30}`))
+		do("POST", "/v1/jobs", []byte(`{"action_id":"audit_archive","trigger_type":"cron","cron_spec":"* * * * *","params":{},"dept":"e2e","timeout_secs":30}`))
 	default:
 		os.Exit(2)
 	}

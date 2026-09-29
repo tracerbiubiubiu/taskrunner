@@ -16,6 +16,7 @@ import (
 
 	"github.com/tracerbiubiubiu/taskrunner/internal/callback"
 	"github.com/tracerbiubiubiu/taskrunner/internal/config"
+	"github.com/tracerbiubiubiu/taskrunner/internal/notify"
 	"github.com/tracerbiubiubiu/taskrunner/internal/repository"
 	"github.com/tracerbiubiubiu/taskrunner/internal/worker"
 )
@@ -31,6 +32,7 @@ type App struct {
 	reclaim  cronRunner // ADR-003：outbox 补偿扫描器（与 cron 同款最小接口解耦）
 	store    *repository.Store
 	cb       *callback.Client
+	notifier *notify.Notifier
 }
 
 // cronRunner cron 循环最小接口（*service.Loop / *service.ReclaimLoop 满足；解耦 app↔service 具体类型）。
@@ -38,8 +40,14 @@ type cronRunner interface{ Run(ctx context.Context) }
 
 func NewApp(cfg *config.Config, logger *slog.Logger, engine *gin.Engine,
 	asynqSrv *asynq.Server, cron, reclaim cronRunner, store *repository.Store, cb *callback.Client) *App {
+	// P4-2 死信告警：target 空 = nil（worker 侧 nil 安全跳过）
+	var notifier *notify.Notifier
+	if cfg.NotifyTargetURL != "" {
+		notifier = notify.New(notify.Config{
+			TargetURL: cfg.NotifyTargetURL, AK: cfg.NotifyAK, SK: []byte(cfg.NotifySK)}, logger)
+	}
 	return &App{cfg: cfg, logger: logger, engine: engine, asynqSrv: asynqSrv,
-		cron: cron, reclaim: reclaim, store: store, cb: cb}
+		cron: cron, reclaim: reclaim, store: store, cb: cb, notifier: notifier}
 }
 
 // Run 启动并阻塞至退出信号；优雅停止（HTTP drain → worker 收尾）。
@@ -68,7 +76,8 @@ func (a *App) Run() error {
 	go a.cron.Run(ctx)
 	go a.reclaim.Run(ctx) // ADR-003：扫描器与 cron 同 ctx 生命周期，停机 = ctx 取消
 	if err := a.asynqSrv.Start(worker.NewMux(worker.Deps{
-		Store: a.store, Callback: a.cb, Logger: a.logger,
+		Notifier: a.notifier,
+		Store:    a.store, Callback: a.cb, Logger: a.logger,
 	})); err != nil {
 		return fmt.Errorf("worker start: %w", err)
 	}

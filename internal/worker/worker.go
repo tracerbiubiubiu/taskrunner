@@ -12,6 +12,7 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/tracerbiubiubiu/taskrunner/internal/callback"
+	"github.com/tracerbiubiubiu/taskrunner/internal/notify"
 	"github.com/tracerbiubiubiu/taskrunner/internal/repository"
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
@@ -25,6 +26,12 @@ type Deps struct {
 	Store    *repository.Store
 	Callback CallbackClient
 	Logger   *slog.Logger
+	Notifier DeadLetterNotifier // P4-2 死信告警（nil=关闭——App 装配处按配置注入）
+}
+
+// DeadLetterNotifier 死信通知出口（最小接口——notify.Notifier 实现；nil 安全）
+type DeadLetterNotifier interface {
+	NotifyDeadLetter(p notify.Payload)
 }
 
 // NewMux 注册任务处理器（cron 触发由 service.Loop 分钟级 tick 扫 DB，§10 定案）。
@@ -118,6 +125,14 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		d.finish(ctx, logger, p.TaskID, status, err.Error(), attempt, now)
 		if final {
 			logger.Error("task dead (retries exhausted)", slog.Int("attempt", attempt), slog.Any("err", err))
+			// P4-2 死信告警：异步尽力而为（nil/未配置=空操作；失败不阻塞死信落库路径）
+			if d.Notifier != nil {
+				d.Notifier.NotifyDeadLetter(notify.Payload{
+					TaskID: p.TaskID, RequestID: p.RequestID, Action: p.Action,
+					JobID: p.JobID, Dept: p.Dept, Error: err.Error(),
+					Attempts: attempt, FailedAt: now.Format(time.RFC3339),
+				})
+			}
 		} else {
 			logger.Warn("task failed, will retry", slog.Int("attempt", attempt), slog.Any("err", err))
 		}

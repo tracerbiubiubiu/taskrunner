@@ -191,5 +191,10 @@ func Load(path string) (*Config, error) {
 	if cfg.Reclaim.StaleAfter >= cfg.Reclaim.Retention {
 		return nil, fmt.Errorf("reclaim.stale_after(%v) 必须 < reclaim.retention(%v)——重投窗口与留观防线重叠，拒绝启动", cfg.Reclaim.StaleAfter, cfg.Reclaim.Retention)
 	}
+	// 审计修复（2026-09-30 P2）：notify 半配置 fail-closed——target 已设但 AK/SK
+	// 缺失拒启（zhuzhao /internal 恒验签，静默跳签名=每条通知 401 整体静默失效）
+	if cfg.NotifyTargetURL != "" && (cfg.NotifyAK == "" || cfg.NotifySK == "") {
+		return nil, fmt.Errorf("notify 目标已配置但 TASKRUNNER_NOTIFY_AK/SK 缺失——zhuzhao 侧恒验签，缺省将全部 401（fail-closed）")
+	}
 	return &cfg, nil
 }

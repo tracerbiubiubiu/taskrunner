@@ -40,7 +40,8 @@ type cronRunner interface{ Run(ctx context.Context) }
 
 func NewApp(cfg *config.Config, logger *slog.Logger, engine *gin.Engine,
 	asynqSrv *asynq.Server, cron, reclaim cronRunner, store *repository.Store, cb *callback.Client) *App {
-	// P4-2 死信告警：target 空 = nil（worker 侧 nil 安全跳过）
+	// P4-2 死信告警：target 空 = nil（worker 侧 nil 安全跳过）。
+	// 半配置 fail-closed 校验在 config.Load（NewApp 无 error 返回位）
 	var notifier *notify.Notifier
 	if cfg.NotifyTargetURL != "" {
 		notifier = notify.New(notify.Config{

@@ -33,10 +33,10 @@ func do(method, path string, body []byte) {
 
 func main() {
 	switch os.Args[1] {
-	case "submit": // submit <id> <cbPath>
+	case "submit": // submit <id>（W0b 后无 cbPath——回调服务端定）
 		do("POST", "/v1/tasks", fmt.Appendf(nil,
 			`{"task_id":%q,"action":"audit_archive","params":{},"dept":"e2e"}`,
-			os.Args[2], os.Args[3]))
+			os.Args[2]))
 	case "cancel": // cancel <id>
 		do("POST", "/v1/tasks/cancel", fmt.Appendf(nil, `{"task_id":%q}`, os.Args[2]))
 	case "retry": // retry <id>

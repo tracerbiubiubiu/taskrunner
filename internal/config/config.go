@@ -114,6 +114,9 @@ func Load(path string) (*Config, error) {
 	bind("notify_ak", "TASKRUNNER_NOTIFY_AK", "")
 	bind("notify_sk", "TASKRUNNER_NOTIFY_SK", "")
 	bind("cron_tick", "TASKRUNNER_CRON_TICK", "30s")
+	// 三轮审计（2026-09-30）：容器内 configs/ 不存在（Dockerfile 只 COPY 二进制）→
+	// env-only 模式下无默认 → WithTimeout(ctx, 0) 即刻过期 → HTTP 排空恒跳过
+	bind("shutdown_timeout", "TASKRUNNER_SHUTDOWN_TIMEOUT", "30s")
 	bind("reclaim.tick", "TASKRUNNER_RECLAIM_TICK", "10s")
 	bind("reclaim.stale_after", "TASKRUNNER_RECLAIM_STALE_AFTER", "30s")
 	bind("reclaim.batch", "TASKRUNNER_RECLAIM_BATCH", "100")

@@ -95,7 +95,12 @@ func (a *App) Run() error {
 	// 总停机 ≈ 2×shutdown_timeout，编排侧 terminationGracePeriod 须 ≥ 该值；
 	// 排空超时不再静默（此前 `_ =` 吞掉，在途请求被无痕丢弃——HTTP 侧无
 	// requeue 兜底，与任务侧 at-least-once 不同）
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
+	// 三轮审计（2026-09-30）：≤0（容器 env-only 且漏配时）→ 兜底 30s（asynq 侧同款）
+	httpDrain := a.cfg.ShutdownTimeout
+	if httpDrain <= 0 {
+		httpDrain = 30 * time.Second
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), httpDrain)
 	defer cancel()
 	if err := a.server.Shutdown(shutdownCtx); err != nil {
 		a.logger.Warn("http drain timeout/skipped, in-flight requests dropped", "err", err)

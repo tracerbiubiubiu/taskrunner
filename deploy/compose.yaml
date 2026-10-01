@@ -6,16 +6,19 @@
 # 同一网络并以 http://taskrunner:8080 寻址本服务）。本栈全部服务【不对宿主发布端口】，
 # zhuzhao 经共享网反代式调用；回调由本服务主动拨 zhuzhao（callback URL 由 zhuzhao 下发）。
 #
-# 环境变量（.env 或 export）：
-#   TASKRUNNER_PG_PASSWORD      taskrunner 专用 PG 口令（必需，缺失拒建）
-#   TASKRUNNER_CALLER_ZHUZHAO_SK  zhuzhao 出站签名 SK（须与 zhuzhao 侧 TASKRUNNER_SK 同值）。
-#                                 compose 缺省 dev-taskrunner-sk（=zhuzhao dev 同值）仅供
-#                                 本地起栈；应用对空 SK fail-closed 拒启
-#   TASKRUNNER_SELF_SK          回调签名 SK（须与 zhuzhao 侧 INTERNAL_JOBS_SK 同值）；
-#                                 缺省 dev-callback-sk 同上
+# 环境变量（.env 或 export）——五项均必填，缺失 compose 直接报错拒建（fail-closed，
+# 对齐 activelist compose.prod 与主仓 W0 三件套纪律；本地起栈的 .env 快配见 deploy/README.md）：
+#   TASKRUNNER_PG_PASSWORD        taskrunner 专用 PG 口令
+#   TASKRUNNER_REDIS_PASSWORD     本栈 Redis 口令
+#   TASKRUNNER_CALLER_ZHUZHAO_SK  zhuzhao 出站签名 SK（须与 zhuzhao 侧 TASKRUNNER_SK 同值）；
+#                                 应用对空 SK 亦 fail-closed 拒启——不给弱缺省，
+#                                 防生产忘配 env 时以公开弱密钥起栈、验签形同虚设
+#   TASKRUNNER_SELF_SK            回调签名 SK（须与 zhuzhao 侧 INTERNAL_JOBS_SK 同值）
+#   TASKRUNNER_CALLBACK_TARGET_URL  唯一出站回调目标（W0b SSRF 收口）
 #
 # 存储：job_runs/jobs 落专用 PG（C7 拍板，联调只用 PG）；asynq 队列落本栈 Redis。
-# 备份口径未定（job_runs 保留期 M4 一并拍）——pgbackup 侧车暂缺位。
+# 备份：每日 02:00 pg_dump（pgbackup 服务，保留 14 份；恢复见 deploy/backup/README.md）。
+# job_runs 保留期口径 M4 一并拍——保留期调整=改 pgbackup 的 RETAIN_COUNT。
 name: taskrunner
 
 services:
@@ -40,7 +43,7 @@ services:
   redis:
     image: redis:6.2-alpine
     environment:
-      REDIS_PASSWORD: ${TASKRUNNER_REDIS_PASSWORD:-taskrunner-dev}
+      REDIS_PASSWORD: ${TASKRUNNER_REDIS_PASSWORD:?需注入 TASKRUNNER_REDIS_PASSWORD}
     command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""]
     volumes:
       - redisdata:/data
@@ -67,12 +70,12 @@ services:
       TASKRUNNER_DB_SSLMODE: disable
       # asynq 队列（本栈 Redis，独立键空间归属本服务）
       TASKRUNNER_REDIS_ADDR: redis:6379
-      TASKRUNNER_REDIS_PASSWORD: ${TASKRUNNER_REDIS_PASSWORD:-taskrunner-dev}
+      TASKRUNNER_REDIS_PASSWORD: ${TASKRUNNER_REDIS_PASSWORD:?需注入 TASKRUNNER_REDIS_PASSWORD}
       TASKRUNNER_REDIS_DB: "0"
       # AK/SK 密钥环（与 zhuzhao 侧对值：TASKRUNNER_SK / INTERNAL_JOBS_SK）
-      TASKRUNNER_CALLER_ZHUZHAO_SK: ${TASKRUNNER_CALLER_ZHUZHAO_SK:-dev-taskrunner-sk}
+      TASKRUNNER_CALLER_ZHUZHAO_SK: ${TASKRUNNER_CALLER_ZHUZHAO_SK:?需注入 TASKRUNNER_CALLER_ZHUZHAO_SK（与 zhuzhao 侧 TASKRUNNER_SK 同值）}
       TASKRUNNER_SELF_AK: taskrunner
-      TASKRUNNER_SELF_SK: ${TASKRUNNER_SELF_SK:-dev-callback-sk}
+      TASKRUNNER_SELF_SK: ${TASKRUNNER_SELF_SK:?需注入 TASKRUNNER_SELF_SK（与 zhuzhao 侧 INTERNAL_JOBS_SK 同值）}
       # 重试上限（默认 5；E 阶段演练曾临时置 0 快速造 dead 靶标）
       TASKRUNNER_MAX_RETRY: ${TASKRUNNER_MAX_RETRY:-5}
       # W0b SSRF 收口：唯一出站回调目标（zhuzhao 内网回调端点）——无兜底必填
@@ -101,6 +104,27 @@ services:
     # 已预授权（named volume 首挂继承镜像属主 app），bind mount 改挂时依赖
     # 启动探针 fail-closed 暴露属主问题。
 
+  pgbackup:
+    # 每日 02:00 pg_dump 物理备份（对齐 activelist pgbackup 模式；恢复见 backup/README.md）
+    image: postgres:15-alpine
+    environment:
+      PGHOST: postgres
+      PGUSER: taskrunner
+      PGPASSWORD: ${TASKRUNNER_PG_PASSWORD}
+      PGDATABASE: taskrunner
+      BACKUP_DIR: /backups
+      RETAIN_COUNT: "14"
+    volumes:
+      - backups:/backups
+      - ./backup/backup.sh:/usr/local/bin/backup.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+    networks:
+      - taskrunner_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 networks:
   taskrunner_internal: {}
   zhuzhao_to_taskrunner:
@@ -109,3 +133,4 @@ networks:
 volumes:
   pgdata:
   redisdata:
+  backups:

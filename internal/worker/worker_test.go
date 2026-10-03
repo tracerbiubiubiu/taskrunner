@@ -113,7 +113,7 @@ func TestHandleBadPayloadDropped(t *testing.T) {
 	}
 }
 
-// 终态守卫（ADR-003 决策 7 / F59）：行已 canceled/succeeded 的投递——不执行回调、
+// 终态守卫（ADR-004 决策 7 / F59）：行已 canceled/succeeded 的投递——不执行回调、
 // SkipRetry 丢弃（关 F45/F58 窗口的取消回调与重复投递副作用）。
 func TestTerminalGuardSkipsCallback(t *testing.T) {
 	ctx := context.Background()

@@ -29,7 +29,7 @@ type App struct {
 	server   *http.Server
 	asynqSrv *asynq.Server
 	cron     cronRunner
-	reclaim  cronRunner // ADR-003：outbox 补偿扫描器（与 cron 同款最小接口解耦）
+	reclaim  cronRunner // ADR-004：outbox 补偿扫描器（与 cron 同款最小接口解耦）
 	store    *repository.Store
 	cb       *callback.Client
 	notifier *notify.Notifier
@@ -75,7 +75,7 @@ func (a *App) Run() error {
 	}()
 
 	go a.cron.Run(ctx)
-	go a.reclaim.Run(ctx) // ADR-003：扫描器与 cron 同 ctx 生命周期，停机 = ctx 取消
+	go a.reclaim.Run(ctx) // ADR-004：扫描器与 cron 同 ctx 生命周期，停机 = ctx 取消
 	if err := a.asynqSrv.Start(worker.NewMux(worker.Deps{
 		Notifier: a.notifier,
 		Store:    a.store, Callback: a.cb, Logger: a.logger,

@@ -119,7 +119,7 @@ var registry = map[string]JobHandler{
 |---|---|---|
 | 用户发起工单 | zhuzhao 工单领域 | 现成 |
 | 审批通过 | zhuzhao **单库事务**：更新工单状态 + 落 L1 `ticket_events`（`ticket.approved`） | ADR-001/ADR-002 |
-| 向 activelist 加值 | **zhuzhao 经网关调 activelist API**（activelist = 数据层 CRUD，独立库、网络仅 zhuzhao 可达、无业务 handler，不作为 taskrunner 回调对端） | activelist ADR-003 |
+| 向 activelist 加值 | **zhuzhao 经网关调 activelist API**（activelist = 数据层 CRUD，独立库、网络仅 zhuzhao 可达、无业务 handler，不作为 taskrunner 回调对端） | activelist ADR-004 |
 | 下发任务 | zhuzhao 调 taskrunner `POST /v1/tasks`（`action` + `params` 携带加值结果 / `request_id` 跨查） | taskrunner.md §5 |
 | 业务平台操作 | taskrunner 可靠执行 → 回调预置动作端点 → **组合 handler** 串行「调 activelist 加值 → 拿值调业务平台」 | 三层模型 + 回调契约 |
 

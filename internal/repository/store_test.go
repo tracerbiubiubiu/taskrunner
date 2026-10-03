@@ -166,7 +166,7 @@ func TestMissingRowVisible(t *testing.T) {
 	}
 }
 
-// ---- ADR-003：queued 标志 / 三域扫描域 / MarkRunning 分类 ----
+// ---- ADR-004：queued 标志 / 三域扫描域 / MarkRunning 分类 ----
 
 func seedRun(t *testing.T, s *Store, id string, enqueuedAt time.Time, payload string) {
 	t.Helper()
@@ -360,7 +360,7 @@ func TestLegacyRowsDefaultQueuedOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// ADR-003 之前的 schema（无 queued/enqueue_payload），并预置一条「存量行」
+	// ADR-004 之前的 schema（无 queued/enqueue_payload），并预置一条「存量行」
 	if _, err := raw.Exec(`CREATE TABLE job_runs (
 		id           INTEGER PRIMARY KEY AUTOINCREMENT,
 		task_id      TEXT NOT NULL UNIQUE,

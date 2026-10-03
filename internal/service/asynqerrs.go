@@ -1,7 +1,7 @@
-// asynq 错误分类 helper（ADR-003 F60/F64/F65）：CancelTask 降级、A3/扫描器补偿撤销、
+// asynq 错误分类 helper（ADR-004 F60/F64/F65）：CancelTask 降级、A3/扫描器补偿撤销、
 // 第三域探针计数共用同一分类，避免各处字符串匹配漂移。
 // asynq v0.26.0 对 DeleteTask 的 active 态与 Lua 脏态 error_reply 无导出 sentinel，
-// 只能匹配错误文本——原文钉死如下，升级 asynq 时必须回归（ADR-003 实施计划 6）。
+// 只能匹配错误文本——原文钉死如下，升级 asynq 时必须回归（ADR-004 实施计划 6）。
 package service
 
 import (

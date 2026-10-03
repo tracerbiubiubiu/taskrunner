@@ -1,5 +1,5 @@
 // submit 统一「受理一个任务」的路径（CLI / HTTP API / 手动触发 / cron 触发共用）。
-// DB-first（ADR-003：job_runs 兼任 outbox）：记录先行——GetByTaskID → InsertPending(queued=0+快照)
+// DB-first（ADR-004：job_runs 兼任 outbox）：记录先行——GetByTaskID → InsertPending(queued=0+快照)
 // → Enqueue。行即事实源（SSOT），Redis 任务是可重建投影：插行失败 = 500（Redis 无任务、
 // DB 无行，干净）；入队失败 = 行在（可见、可修、可查），由 reclaim 扫描器修复后执行。
 // 幂等语义（§5 契约）：task_id 终身唯一——先查 job_runs（覆盖任务完成后 Asynq 释放 ID 的
@@ -25,7 +25,7 @@ type Enqueuer interface {
 	Enqueue(t *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error)
 }
 
-// TaskDelete 补偿撤销能力（ADR-003 决策 3 A3：入队后行已离开 pending 时立即撤销刚投递的
+// TaskDelete 补偿撤销能力（ADR-004 决策 3 A3：入队后行已离开 pending 时立即撤销刚投递的
 // 任务；*asynq.Inspector 即满足；最小接口便于单测注入）。
 type TaskDelete interface {
 	DeleteTask(queue, id string) error
@@ -38,7 +38,7 @@ type Service struct {
 	Logger    *slog.Logger // A3 标记失败 Warn（nil 时静默——reclaim 冲突分支兜底）
 	Queue     string
 	MaxRetry  int
-	Retention time.Duration // 入队留观（ADR-003 决策 5：占住 TaskID 挡迟到重投与完成释放竞态）
+	Retention time.Duration // 入队留观（ADR-004 决策 5：占住 TaskID 挡迟到重投与完成释放竞态）
 }
 
 // buildEnqueueOpts A3 与 reclaim 重投共用的入队参数（F61：同参唯一来源，防两处漂移）。

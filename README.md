@@ -21,7 +21,7 @@
 - [设计文档](./docs/taskrunner.md) —— SSOT：定位/职责/回调模型/HTTP API/日志边界/部署形态/实施计划
 - [zhuzhao 侧配套需求](./docs/zhuzhao-integration.md) —— 本设计引出的 zhuzhao 侧工作项清单（注册表/任务管理/部门策略等）
 - [ADR-002 契约快照](./docs/ADR-002-asynq-async-task-executor.md) —— Asynq 执行器决策（zhuzhao 侧为 SSOT）
-- [ADR-003 提交 DB-first](./docs/ADR-003-db-first-outbox-reclaim.md) —— job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器 + worker 终态守卫）
+- [ADR-004 提交 DB-first](./docs/ADR-004-db-first-outbox-reclaim.md) —— job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器 + worker 终态守卫）
 
 ## 快速开始
 
@@ -61,6 +61,6 @@ CI（GitHub Actions）：push/PR 全触发——vet + gofmt + 单测（race）+ 
 - 2026-09-04：代码评审修复（提交幂等扩为终身；cancel 竞态三道防护，fix/idempotency-and-cancel-race）；§1 补「什么算一个任务」判定标准；
 - 首个预置动作：审计归档（B11②，定时回调 zhuzhao 导出 audit_logs JSONL）；
 - 2026-09-08/09：C7 存储双驱动落地（SQLite/PG，CLI enqueue 复用 OpenStore）+ 日志轮转 + 全面验证/二次审计修复批（读体上限/worker 终态 off-by-one/任务级 deadline）；
-- 2026-09-17：**ADR-003 落地（feat/outbox-reclaim，PR #1）**——提交改 DB-first（job_runs 兼任 Outbox：queued 标志 + Reclaim 三域扫描器 + worker 终态守卫 + 取消降级），取代「先入队后落库」取舍；单测 + race + PG 集成 + E2E（`scripts/e2e/e2e.sh`，19 断言含 cron）全绿；
+- 2026-09-17：**ADR-004 落地（feat/outbox-reclaim，PR #1）**——提交改 DB-first（job_runs 兼任 Outbox：queued 标志 + Reclaim 三域扫描器 + worker 终态守卫 + 取消降级），取代「先入队后落库」取舍；单测 + race + PG 集成 + E2E（`scripts/e2e/e2e.sh`，19 断言含 cron）全绿；
 - 2026-09-29（P4 随批三件）：**W0b 四口同收对齐**（zhuzhao 出站不再拼接/预检 callback_url——提交链三处契约断裂修复，提交恒 400 根治）；**ListRuns 加 submitted_by 过滤**（「只看我提交的」，zhuzhao 代理把 me 换 actor）；**P4-2 死信终败通知**（notify 包：TASKRUNNER_NOTIFY_* env，死信→zhuzhao /internal/notify/dead-letter→webhook，异步尽力而为）。cron 收归注意：zhuzhao 侧 audit_archive 已可进程内调度（advisory lock）——启用则停本仓 audit_archive cron job 防双跑（zhuzhao deployments/CRON-MIGRATION.md）。
-- 状态：M1/M2/C7/ADR-003 已落地；**P4 期随批三件已交付**（Phase 4 于 2026-09-29 收官）；下一步 = M3 部署联调；工作区状态见 git status。
+- 状态：M1/M2/C7/ADR-004 已落地；**P4 期随批三件已交付**（Phase 4 于 2026-09-29 收官）；下一步 = M3 部署联调；工作区状态见 git status。

@@ -30,7 +30,7 @@ const (
 
 var ErrNotFound = errors.New("store: job_run not found")
 
-// ErrTerminalRejected MarkRunning 复活拒绝（ADR-003 决策 7 终态守卫）：行已 succeeded/canceled
+// ErrTerminalRejected MarkRunning 复活拒绝（ADR-004 决策 7 终态守卫）：行已 succeeded/canceled
 // ——重复投递或已取消任务被取走，消费端必须拦截副作用（不回调 + SkipRetry）。
 var ErrTerminalRejected = errors.New("store: terminal row rejects resurrection")
 
@@ -47,7 +47,7 @@ type Store struct {
 
 // Run job_runs 一行。
 type Run struct {
-	ID          int64 // 行主键（自增）——仅由扫描器列表方法填充，游标推进用（ADR-003 F36/F46/F56）
+	ID          int64 // 行主键（自增）——仅由扫描器列表方法填充，游标推进用（ADR-004 F36/F46/F56）
 	TaskID      string
 	RequestID   string
 	Action      string
@@ -64,8 +64,8 @@ type Run struct {
 	EnqueuedAt  time.Time
 	StartedAt   sql.NullTime
 	FinishedAt  sql.NullTime
-	Queued      bool // 投递状态标志（ADR-003，两义：已交付 Redis / 已了结）——仅由新方法填充，既有查询下恒为零值、不可作判据（F29）
-	// EnqueuePayload 提交载荷快照（task.Payload JSON，ADR-003 决策 2）——reclaim 重投唯一来源，
+	Queued      bool // 投递状态标志（ADR-004，两义：已交付 Redis / 已了结）——仅由新方法填充，既有查询下恒为零值、不可作判据（F29）
+	// EnqueuePayload 提交载荷快照（task.Payload JSON，ADR-004 决策 2）——reclaim 重投唯一来源，
 	// 自带 timeout_secs 规避「job_runs 无超时覆盖」的重建缺口；与 asynq 载荷同源（F9）。
 	EnqueuePayload string
 }
@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
 `
 
 // indexes 建表/补列之后执行——引用新列（job_id/queued）的索引依赖列迁移先行。
-// 三个 partial index（ADR-003 实施计划 1）谓词与三域判据逐字对齐，与既有
+// 三个 partial index（ADR-004 实施计划 1）谓词与三域判据逐字对齐，与既有
 // idx_job_runs_enqueued_at 正交、可并存；索引列 = id（游标键，F36/F46/F56——
 // 时间列绑定含驱动内部格式后缀，等值/边界比较不可靠，游标必须走整数主键，见实现记录）。
 const indexes = `
@@ -251,7 +251,7 @@ func migrateColumns(db *sql.DB, driver string) error {
 		{"job_runs", "job_id", "ALTER TABLE job_runs ADD COLUMN job_id TEXT NOT NULL DEFAULT ''"},
 		{"job_runs", "dept", "ALTER TABLE job_runs ADD COLUMN dept TEXT NOT NULL DEFAULT ''"},
 		{"job_runs", "params", "ALTER TABLE job_runs ADD COLUMN params TEXT NOT NULL DEFAULT '{}'"},
-		// ADR-003（F29）：历史行 DEFAULT 1 =「已尝试过投递」——旧世界行存在 ⟺ 入队成功过，
+		// ADR-004（F29）：历史行 DEFAULT 1 =「已尝试过投递」——旧世界行存在 ⟺ 入队成功过，
 		// 事实正确；新行由 InsertPending 显式写 0。
 		{"job_runs", "queued", "ALTER TABLE job_runs ADD COLUMN queued INTEGER NOT NULL DEFAULT 1"},
 		{"job_runs", "enqueue_payload", "ALTER TABLE job_runs ADD COLUMN enqueue_payload TEXT NOT NULL DEFAULT ''"},
@@ -280,10 +280,10 @@ func (s *Store) Ping() error {
 	return s.db.QueryRowContext(context.Background(), `SELECT 1`).Scan(&one)
 }
 
-// InsertPending 受理落库（ADR-003 记录先行）：写 pending 行 + queued=0（未投递）+
+// InsertPending 受理落库（ADR-004 记录先行）：写 pending 行 + queued=0（未投递）+
 // enqueue_payload 快照（重投唯一来源）；task_id 重复（幂等重提/并发竞提）返回已存在错误。
 // EnqueuedAt 先 Round(0) 剥离单调时钟——驱动按 time.Time.String() 落库，m=+ 后缀会让
-// 同一时刻的等值/边界比较永假（实测记录，ADR-003 游标改 id 的同源原因）。
+// 同一时刻的等值/边界比较永假（实测记录，ADR-004 游标改 id 的同源原因）。
 func (s *Store) InsertPending(ctx context.Context, r Run) error {
 	_, err := s.exec(ctx, `
 INSERT INTO job_runs (task_id, request_id, action, job_id, dept, params, callback_url, status, submitted_by, source_ip, enqueued_at, queued, enqueue_payload)
@@ -451,7 +451,7 @@ WHERE task_id = ? AND status NOT IN (?, ?)`,
 	if n == 0 {
 		// 0 行 = 行缺失或 succeeded/canceled 复活被拒（C6：有意的终态不可被过期写者推翻；
 		// failed→running 为 asynq 重试周期正常路径，dead→running 仅供手动重置后）。
-		// 补查分类（ADR-003 F59：UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按
+		// 补查分类（ADR-004 F59：UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按
 		// 未知包装，worker 对未知维持「继续执行」旧口径）：
 		run, gerr := s.GetByTaskID(ctx, taskID)
 		switch {
@@ -493,7 +493,7 @@ WHERE task_id = ? AND status = ? AND attempts = ?`,
 	return nil
 }
 
-// ---- ADR-003：outbox 补偿（queued 标志 + 三域扫描器）----
+// ---- ADR-004：outbox 补偿（queued 标志 + 三域扫描器）----
 
 // MarkQueued 入队成功后按状态条件置位（决策 3/理由）：`status='pending'` 条件是
 // 取消检测器（F19）——0 行 = 行已离开 pending（并发取消/已被取走/已达终态，F39 三义），
@@ -555,7 +555,7 @@ func scanReclaimRuns(rows *sql.Rows) ([]*Run, error) {
 }
 
 // ListUnqueued 第一轮扫描域（F1/F14：queued=0 AND status='pending' 才是安全域），
-// 显式批位上界（F66）。无需游标——论证见 ADR-003 决策 4 第一轮。
+// 显式批位上界（F66）。无需游标——论证见 ADR-004 决策 4 第一轮。
 func (s *Store) ListUnqueued(ctx context.Context, before time.Time, limit int) ([]*Run, error) {
 	rows, err := s.query(ctx, reclaimListCols+`
 WHERE queued = 0 AND status = ? AND enqueued_at <= ?

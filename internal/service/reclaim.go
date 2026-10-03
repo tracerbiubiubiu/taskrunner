@@ -1,4 +1,4 @@
-// reclaim 扫描器（ADR-003 决策 4）：job_runs 兼任 outbox 的补偿回路。
+// reclaim 扫描器（ADR-004 决策 4）：job_runs 兼任 outbox 的补偿回路。
 // 三域职责（仿 cron.go 范式：Run 薄壳 + 同步单轮方法；单 goroutine 串行，停机 = ctx 取消；
 // 多副本安全——同 task_id 竞投被 asynq TaskID 冲突挡住，无需分布式锁，F30）：
 //
@@ -382,7 +382,7 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 
 // advanceCursor 游标按批推进；不足一批 = 耗尽回卷（F36/F46：重启回卷已点明）。
 // 游标键 = 行主键 id——时间列绑定含驱动内部格式后缀（time.Time.String() 的 m=+…），
-// 等值/边界比较不可靠，实测记录见 ADR-003 实现记录。
+// 等值/边界比较不可靠，实测记录见 ADR-004 实现记录。
 func (l *ReclaimLoop) advanceCursor(rows []*repository.Run, batch int, cursor *int64) {
 	if len(rows) < batch {
 		*cursor = 0

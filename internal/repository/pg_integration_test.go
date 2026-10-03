@@ -198,7 +198,7 @@ func TestPGMarkRunningRejectsSucceededResurrection(t *testing.T) {
 	}
 }
 
-// ADR-003：queued 标志 / 三域扫描查询 / id 游标 / MarkRunning 分类在 PG 下的等价性。
+// ADR-004：queued 标志 / 三域扫描查询 / id 游标 / MarkRunning 分类在 PG 下的等价性。
 func TestPGReclaimColumnsAndQueries(t *testing.T) {
 	if os.Getenv("TASKRUNNER_TEST_PG_DSN") == "" {
 		t.Skip("TASKRUNNER_TEST_PG_DSN 未设置")

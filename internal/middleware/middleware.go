@@ -39,7 +39,7 @@ func randomHex(n int) string {
 // request_id/caller/operator/ip。operator 与 caller 由 utils aksk.GinMiddleware
 // 验签通过后写入 gin context（归因收编 2026-09-16 统一批）；未过验签的路径
 // （探针已 skip）operator 兜底 "system"（§9 口径）。
-// 将来启用脱敏只改本函数一处（预留钩子，ADR-003 审计落点机制同款）。
+// 将来启用脱敏只改本函数一处（预留钩子，ADR-004 审计落点机制同款）。
 func AccessLog(logger *slog.Logger) gin.HandlerFunc {
 	skip := map[string]bool{"/healthz": true, "/readyz": true}
 	return func(c *gin.Context) {

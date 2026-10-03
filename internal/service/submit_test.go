@@ -15,7 +15,7 @@ import (
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
-// fakeEnqueuer 可编程入队假件（ADR-003 F31：全仓原先无 Enqueuer 假件）：
+// fakeEnqueuer 可编程入队假件（ADR-004 F31：全仓原先无 Enqueuer 假件）：
 // 记录调用；err/conflict 控制返回；hook 在 Enqueue 内执行（模拟入队期间的并发翻转）。
 type fakeEnqueuer struct {
 	mu       sync.Mutex

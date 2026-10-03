@@ -39,7 +39,7 @@ func writeYaml(t *testing.T, content string) string {
 	return p
 }
 
-// reclaim 扫描器配置（ADR-003 实施计划 4）：默认值 + fail-closed 校验 + F67 整秒化。
+// reclaim 扫描器配置（ADR-004 实施计划 4）：默认值 + fail-closed 校验 + F67 整秒化。
 func TestReclaimDefaults(t *testing.T) {
 	t.Setenv("TASKRUNNER_CALLER_ZHUZHAO_SK", "sk-z")
 	t.Setenv("TASKRUNNER_SELF_SK", "sk-t")

@@ -1,4 +1,4 @@
-# ADR-003: 提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 扫描器）
+# ADR-004: 提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 扫描器）
 
 ## 日期
 2026-09-17（同日完成评审修正合入；同日七审增补 F58–F63、八审增补 F64–F67，见评审修正记录）
@@ -152,7 +152,7 @@
    - **`MarkCanceledIfPending` 保持现 SQL 不动、不翻 queued**（评审 F37：两轮判据含 status 过滤后翻标志冗余且污染单一语义），仅更新其注释口径（决策 6 连带）。
    - **`MarkRunning` 拆分类错误（评审 F59）**：0 行时补查 `GetByTaskID` 分类——行缺失 → `ErrRunNotFound`、行 succeeded/canceled → `ErrTerminalRejected`（UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按未知包装、worker 维持继续执行）；现单条字符串错误退役，调用方仅 worker。
    - pgq 注意：字符串字面量禁 `?`（`status = 'pending'` 这类字面量安全）。
-2. `internal/service/submit.go`：按决策 3 重排为三步；`json.Marshal(p)` 提前到 InsertPending 之前，同一份 bytes 填 `Run.EnqueuePayload` 与 asynq task（评审 F9）；**service.Service 结构体新增 `Retention time.Duration` 字段**（A3 opts 用，评审 F22）；头部注释更新为「DB-first（job_runs 兼任 outbox，见 ADR-003）」；入队 opts 构造抽共享函数 `buildEnqueueOpts(p task.Payload, retention time.Duration)`（含 Timeout 86400 截断与 Retention），A3 与 reclaim 同源调用，防两处漂移（评审 F61）。
+2. `internal/service/submit.go`：按决策 3 重排为三步；`json.Marshal(p)` 提前到 InsertPending 之前，同一份 bytes 填 `Run.EnqueuePayload` 与 asynq task（评审 F9）；**service.Service 结构体新增 `Retention time.Duration` 字段**（A3 opts 用，评审 F22）；头部注释更新为「DB-first（job_runs 兼任 outbox，见 ADR-004）」；入队 opts 构造抽共享函数 `buildEnqueueOpts(p task.Payload, retention time.Duration)`（含 Timeout 86400 截断与 Retention），A3 与 reclaim 同源调用，防两处漂移（评审 F61）。
 3. 新建 `internal/service/reclaim.go`：
    ```go
    type ReclaimLoop struct {

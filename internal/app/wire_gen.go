@@ -24,7 +24,7 @@ func InitializeApp(cfg *config.Config) (*App, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	// inspector 先于 submitter：A3 补偿撤销依赖（ADR-003 决策 3）
+	// inspector 先于 submitter：A3 补偿撤销依赖（ADR-004 决策 3）
 	inspector, cleanup2, err := provideInspector(redisOpt)
 	if err != nil {
 		cleanup1()

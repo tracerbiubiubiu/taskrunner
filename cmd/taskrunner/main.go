@@ -131,7 +131,7 @@ func enqueueCmd(args []string) error {
 		Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
 	defer ins.Close()
 
-	// 与 serve 路径同参（ADR-003：Inspector 供 A3 补偿撤销，Retention 入队留观，Logger 记标记失败）
+	// 与 serve 路径同参（ADR-004：Inspector 供 A3 补偿撤销，Retention 入队留观，Logger 记标记失败）
 	sub := &service.Service{Store: st, Client: client, Inspector: ins, Logger: slog.Default(),
 		Queue: cfg.Queue, MaxRetry: cfg.MaxRetry, Retention: cfg.Reclaim.Retention}
 	accepted, warning, err := sub.Submit(context.Background(), task.Payload{

@@ -42,8 +42,8 @@ type Config struct {
 	NotifyAK        string        `mapstructure:"notify_ak"`
 	NotifySK        string        `mapstructure:"notify_sk"`
 	CronTick        time.Duration `mapstructure:"cron_tick"`
-	// Reclaim 扫描器（ADR-003）：tick 扫描节奏、stale_after 入队宽限、batch 三域共用
-	// 批位上界、retention 入队留观（归入 reclaim 组的理由见 ADR-003 决策 5）。
+	// Reclaim 扫描器（ADR-004）：tick 扫描节奏、stale_after 入队宽限、batch 三域共用
+	// 批位上界、retention 入队留观（归入 reclaim 组的理由见 ADR-004 决策 5）。
 	Reclaim struct {
 		Tick       time.Duration `mapstructure:"tick"`
 		StaleAfter time.Duration `mapstructure:"stale_after"`
@@ -166,7 +166,7 @@ func Load(path string) (*Config, error) {
 	if cfg.Queue == "" {
 		return nil, fmt.Errorf("queue 不能为空")
 	}
-	// reclaim 扫描器（ADR-003 实施计划 4）：≤0 温和回退默认（cron.go 零值防御先例，不拒启），
+	// reclaim 扫描器（ADR-004 实施计划 4）：≤0 温和回退默认（cron.go 零值防御先例，不拒启），
 	// 非法组合 fail-closed 拒启。
 	if cfg.Reclaim.Tick <= 0 {
 		cfg.Reclaim.Tick = 10 * time.Second

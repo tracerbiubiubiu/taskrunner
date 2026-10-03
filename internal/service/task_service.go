@@ -148,7 +148,7 @@ func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput
 		return nil, fmt.Errorf("submit: %w", err)
 	}
 	if warning != nil {
-		// DB-first（ADR-003）：行已落库（SSOT）但入队失败——reclaim 扫描器将修复投递，
+		// DB-first（ADR-004）：行已落库（SSOT）但入队失败——reclaim 扫描器将修复投递，
 		// 200 = 已受理待入队；warning 仅留痕不回传响应体（F8）
 		s.logger.Warn("submit: job_runs persisted but enqueue failed, reclaim loop will retry",
 			slog.String("task_id", in.TaskID), slog.Any("err", warning))
@@ -294,7 +294,7 @@ func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) (
 
 // ---- 干预 ----
 
-// CancelTask 取消未开始的任务。竞态防护（A2 三道关卡 + ADR-003 增补）：
+// CancelTask 取消未开始的任务。竞态防护（A2 三道关卡 + ADR-004 增补）：
 // ① 删队列前 GetTaskInfo 确认非 active；② DeleteTask 报 active 错误映射冲突（①之后被取走的兜底）；
 // ③ MarkCanceledIfPending 条件更新收口（权威防线——保证不出现「回了已取消、实际跑完了」）；
 // F35：GetTaskInfo 命中 completed/archived（Retention 留观/已归档）→ 409——删留观并标 canceled
@@ -589,7 +589,7 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 		return nil, err
 	}
 	if warning != nil {
-		// 与 Submit 同口径（ADR-003）：行已落库但入队失败，reclaim 将重试
+		// 与 Submit 同口径（ADR-004）：行已落库但入队失败，reclaim 将重试
 		s.logger.Warn("trigger: job_runs persisted but enqueue failed, reclaim loop will retry",
 			slog.String("task_id", taskID), slog.String("job_id", j.JobID), slog.Any("err", warning))
 	}

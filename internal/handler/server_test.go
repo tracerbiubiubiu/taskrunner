@@ -620,3 +620,51 @@ func TestErrorMessageDistinguishesState(t *testing.T) {
 		t.Fatalf("conflict message should show chinese+raw state, got %q", msg)
 	}
 }
+
+// 契约审计护栏批（2026-10-14）：B2 params 显式 null 三入口 400 / B1 RunView.ID
+// 字符串出站 + ?id= 精确筛选（ca9ac65 未随提交信息登记的特性，此处补承重断言）/
+// B3 source_ip 键恒出。
+func TestContractGuardrails(t *testing.T) {
+	f := newFixture(t)
+
+	// B2：三入口 params 显式 null 一律 400（省略字段才表示不修改）
+	for _, tc := range []struct {
+		path string
+		body map[string]any
+	}{
+		{"/v1/tasks", map[string]any{"task_id": "g1", "request_id": "rg1", "action": "a1", "params": nil}},
+		{"/v1/jobs", map[string]any{"action_id": "a1", "trigger_type": "manual", "params": nil}},
+		{"/v1/jobs/update", map[string]any{"job_id": "j-x", "params": nil}},
+	} {
+		w := f.do(t, http.MethodPost, tc.path, tc.body)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "params 不可为 null") {
+			t.Fatalf("POST %s params=null 应 400+分档文案，got %d: %s", tc.path, w.Code, w.Body.String())
+		}
+	}
+
+	// B1：RunView.ID 字符串出站 + ?id= 精确筛选 + B3 source_ip 键恒出
+	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "g1", "request_id": "rg1", "action": "a1"})
+	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "g2", "request_id": "rg2", "action": "a1"})
+	w := f.do(t, http.MethodGet, "/v1/runs?request_id=rg1", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("runs: %d %s", w.Code, w.Body.String())
+	}
+	_, m := decode(t, w)
+	run := m["data"].(map[string]any)["list"].([]any)[0].(map[string]any)
+	runID, ok := run["id"].(string)
+	if !ok {
+		t.Fatalf("RunView.id 必须字符串出站（B1）：%T %v", run["id"], run["id"])
+	}
+	if _, ok := run["source_ip"]; !ok {
+		t.Fatalf("source_ip 键必须恒出（B3 无 omitempty）：%v", run)
+	}
+	w2 := f.do(t, http.MethodGet, "/v1/runs?id="+runID, nil)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("runs?id: %d %s", w2.Code, w2.Body.String())
+	}
+	_, m2 := decode(t, w2)
+	list := m2["data"].(map[string]any)["list"].([]any)
+	if len(list) != 1 || list[0].(map[string]any)["request_id"] != "rg1" {
+		t.Fatalf("?id=%s 精确筛选应只含 rg1：%v", runID, list)
+	}
+}

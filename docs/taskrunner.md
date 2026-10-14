@@ -186,7 +186,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 |---|---|
 | `POST /v1/tasks` | 提交任务；**受理语义（ADR-004 记录先行，2026-09-17）**：校验通过 + job_runs 落库即返回 task_id，「受理 ≠ 执行成功」；入队失败（Redis 抖动）仍 200 = **已受理待入队**（warning 仅日志不回传响应体，reclaim 扫描器补偿投递）；**幂等**：接受调用方生成的 `task_id`，重复提交去重；`timeout_secs` 0–86400（0=默认 30s） |
 | `GET /v1/tasks/{id}` | 查任务状态（**C11：响应补 `dept` 字段**——zhuzhao E-⑤ 可见性校验前提） |
-| `GET /v1/runs?request_id=&action=&status=&job_id=&dept=&from=&to=&page=&page_size=` | 查执行记录（§7 日志边界的「request_id 跨查」即此；**C11：加 `dept` 多值过滤，按 `runs.dept` 快照列**——提交时从 job 定义或请求带入、一次性任务由 zhuzhao 携带，**不 JOIN jobs**（job 删除后历史可查、改 dept=转派不改历史归属）；zhuzhao E-⑤ 按可见标签集组装传入，修复「job 定义隔离但执行记录全量可见」旁路） |
+| `GET /v1/runs?id=&request_id=&action=&status=&job_id=&dept=&from=&to=&page=&page_size=` | 查执行记录（`id`=job_runs 自增序号精确匹配，2026-10-13 前端「任务序号」检索随批）（§7 日志边界的「request_id 跨查」即此；**C11：加 `dept` 多值过滤，按 `runs.dept` 快照列**——提交时从 job 定义或请求带入、一次性任务由 zhuzhao 携带，**不 JOIN jobs**（job 删除后历史可查、改 dept=转派不改历史归属）；zhuzhao E-⑤ 按可见标签集组装传入，修复「job 定义隔离但执行记录全量可见」旁路） |
 | `GET /v1/jobs?dept=&action_id=&enabled=` / `POST /v1/jobs` | 列出（支持按归属标签等过滤）/ 新增任务定义（action_id + cron 或手动 + params + enabled + 归属标签 + `timeout_secs` 0–86400，§4） |
 | `POST /v1/jobs/update`（原 `PATCH /v1/jobs/{id}`） | 修改任务定义：body 带 job_id + cron / params / 启停 |
 | `POST /v1/jobs/trigger`（原 `POST /v1/jobs/{id}/trigger`） | 手动执行一次：body 带 job_id（按定义提交任务，前端「立即执行」按钮） |

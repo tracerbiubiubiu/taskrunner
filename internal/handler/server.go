@@ -94,6 +94,13 @@ func (d *Deps) submitTask(c *gin.Context) {
 		req.RequestID = c.GetString("request_id")
 	}
 	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
+	if string(req.Params) == "null" {
+		// 契约审计 B2：RawMessage 对显式 null 非 nil（len==4），直通 service 的
+		// p.Params != nil 判断会把字面量 "null" 落库并随回调扩散——显式 null 拒绝，
+		// 省略字段才表示不修改
+		response.BadRequest(c, "params 不可为 null：省略该字段表示不修改")
+		return
+	}
 	if len(req.Params) > 64<<10 {
 		response.BadRequest(c, "params 超过上限（64KB），请精简后重试")
 		return
@@ -133,7 +140,7 @@ func (d *Deps) getTask(c *gin.Context) {
 
 func (d *Deps) listRuns(c *gin.Context) {
 	q := service.RunQuery{
-		RequestID: c.Query("request_id"), Action: c.Query("action"),
+		ID: int64(atoi(c.Query("id"), 0)), RequestID: c.Query("request_id"), Action: c.Query("action"),
 		Status: c.Query("status"), JobID: c.Query("job_id"), Depts: c.QueryArray("dept"),
 		SubmittedBy: c.Query("submitted_by"), // zhuzhao 代理已把 me 换成 actor（02 W5）
 		Page:        atoi(c.Query("page"), 1), PageSize: atoi(c.Query("page_size"), 20),
@@ -226,6 +233,13 @@ func (d *Deps) createJob(c *gin.Context) {
 		return
 	}
 	// params 上限（与 zhuzhao 提交入口对称；防大参数滥用）
+	if string(req.Params) == "null" {
+		// 契约审计 B2：RawMessage 对显式 null 非 nil（len==4），直通 service 的
+		// p.Params != nil 判断会把字面量 "null" 落库并随回调扩散——显式 null 拒绝，
+		// 省略字段才表示不修改
+		response.BadRequest(c, "params 不可为 null：省略该字段表示不修改")
+		return
+	}
 	if len(req.Params) > 64<<10 {
 		response.BadRequest(c, "params 超过上限（64KB），请精简后重试")
 		return
@@ -287,6 +301,13 @@ func (d *Deps) patchJob(c *gin.Context) {
 	}
 	if req.TimeoutSecs != nil && !validTimeoutSecs(*req.TimeoutSecs) {
 		response.BadRequest(c, msgTimeoutSecs)
+		return
+	}
+	if string(req.Params) == "null" {
+		// 契约审计 B2：RawMessage 对显式 null 非 nil（len==4），直通 service 的
+		// p.Params != nil 判断会把字面量 "null" 落库并随回调扩散——显式 null 拒绝，
+		// 省略字段才表示不修改
+		response.BadRequest(c, "params 不可为 null：省略该字段表示不修改")
 		return
 	}
 	if len(req.Params) > 64<<10 {

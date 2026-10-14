@@ -348,6 +348,7 @@ UPDATE job_runs SET status = ?, error = ?, finished_at = ? WHERE task_id = ? AND
 
 // RunFilter 执行记录查询条件（§5 GET /v1/runs，全部可选）。
 type RunFilter struct {
+	ID          int64 // 任务序号(=id 自增,精确匹配)
 	RequestID   string
 	Action      string
 	Status      string
@@ -373,6 +374,9 @@ func toAny(ss []string) []any {
 // C11：按归属标签（dept 快照列）多值过滤，行内返回 dept（zhuzhao E-⑤ 可见性）——纯表查询不 JOIN jobs。
 func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error) {
 	where, args := " WHERE 1=1", []any{}
+	if f.ID > 0 {
+		where, args = where+" AND id = ?", append(args, f.ID)
+	}
 	if f.RequestID != "" {
 		where, args = where+" AND request_id = ?", append(args, f.RequestID)
 	}
@@ -411,7 +415,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	if size < 1 || size > 200 {
 		size = 20
 	}
-	q := `SELECT task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
+	q := `SELECT id, task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
        submitted_by, source_ip, enqueued_at, started_at, finished_at FROM job_runs` + where +
 		` ORDER BY enqueued_at DESC LIMIT ? OFFSET ?`
 	rows, err := s.query(ctx, q, append(args, size, (page-1)*size)...)
@@ -423,7 +427,7 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	var out []*Run
 	for rows.Next() {
 		var r Run
-		if err := rows.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.Params, &r.CallbackURL, &r.Status,
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.Params, &r.CallbackURL, &r.Status,
 			&r.Attempts, &r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP,
 			&r.EnqueuedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 			return nil, 0, fmt.Errorf("store: scan run: %w", err)

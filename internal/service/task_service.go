@@ -180,6 +180,7 @@ type TaskView struct {
 
 // RunView 执行记录行。
 type RunView struct {
+	ID          int64      `json:"id,string"` // 行主键(自增)——人类可读序号(前端列表首列/筛选);task_id 为 UUID 幂等键。,string 对齐生态 ID 公约（2026-10-14 契约审计 B1）
 	TaskID      string     `json:"task_id"`
 	RequestID   string     `json:"request_id"`
 	Action      string     `json:"action"`
@@ -191,6 +192,7 @@ type RunView struct {
 	Error       string     `json:"error"`
 	DurationMS  int64      `json:"duration_ms"`
 	SubmittedBy string     `json:"submitted_by"`
+	SourceIP    string     `json:"source_ip"` // 补齐（契约审计 B3）：与 TaskView 详情字段集一致，store ListRuns 早已 SELECT
 	EnqueuedAt  time.Time  `json:"enqueued_at"`
 	StartedAt   *time.Time `json:"started_at"`
 	FinishedAt  *time.Time `json:"finished_at"`
@@ -198,9 +200,9 @@ type RunView struct {
 
 func runView(r *repository.Run) RunView {
 	return RunView{
-		TaskID: r.TaskID, RequestID: r.RequestID, Action: r.Action, JobID: r.JobID, Dept: r.Dept,
+		ID: r.ID, TaskID: r.TaskID, RequestID: r.RequestID, Action: r.Action, JobID: r.JobID, Dept: r.Dept,
 		Params: r.Params, Status: r.Status, Attempts: r.Attempts, Error: r.Error, DurationMS: r.DurationMS,
-		SubmittedBy: r.SubmittedBy, EnqueuedAt: r.EnqueuedAt,
+		SubmittedBy: r.SubmittedBy, SourceIP: r.SourceIP, EnqueuedAt: r.EnqueuedAt,
 		StartedAt: nullTime(r.StartedAt), FinishedAt: nullTime(r.FinishedAt),
 	}
 }
@@ -234,6 +236,7 @@ func (s *TaskService) GetTask(ctx context.Context, taskID string) (*TaskView, er
 
 // RunQuery 执行记录查询（全部可选；from/to 为 RFC3339）。
 type RunQuery struct {
+	ID                               int64 // 任务序号(=job_runs.id 自增,前端「任务序号」筛选)
 	RequestID, Action, Status, JobID string
 	Depts                            []string
 	SubmittedBy                      string // 「只看我提交的」（zhuzhao 代理把 me 换 actor 后透传）
@@ -243,7 +246,7 @@ type RunQuery struct {
 
 func (s *TaskService) ListRuns(ctx context.Context, q RunQuery) ([]RunView, int64, error) {
 	runs, total, err := s.repo.ListRuns(ctx, repository.RunFilter{
-		RequestID: q.RequestID, Action: q.Action, Status: q.Status, JobID: q.JobID, Depts: q.Depts,
+		ID: q.ID, RequestID: q.RequestID, Action: q.Action, Status: q.Status, JobID: q.JobID, Depts: q.Depts,
 		SubmittedBy: q.SubmittedBy,
 		From:        q.From, To: q.To, Page: q.Page, PageSize: q.PageSize,
 	})
@@ -437,7 +440,7 @@ type JobView struct {
 	OwnerService string          `json:"owner_service"`
 	CreatedAt    time.Time       `json:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at"`
-	NextRun      *time.Time      `json:"next_run,omitempty"`
+	NextRun      *time.Time      `json:"next_run"` // omitempty 已去（契约审计 B3）：同族 started_at/finished_at 均 null 表缺失，判空逻辑统一
 }
 
 func jobView(j *repository.Job) JobView {

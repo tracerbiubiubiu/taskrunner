@@ -53,12 +53,13 @@ type body struct {
 }
 
 // paramJSON 保持 params 原样透传（不二次编码）。
+// 注（2026-10-14 契约审计）：空 params 的 null 分支已删——tag omitempty 把它
+// 短路为「字段消失」，null 语义从未启用（死代码）；若将来契约要 null 表达，
+// 须去 omitempty 并同步 zhuzhao 侧回调解析。透传 MarshalJSON 不可删：删掉后
+// paramJSON 退化为 []byte 基序列化（base64 字符串），回调体直接损坏。
 type paramJSON json.RawMessage
 
 func (p paramJSON) MarshalJSON() ([]byte, error) {
-	if len(p) == 0 {
-		return []byte("null"), nil
-	}
 	return p, nil
 }
 

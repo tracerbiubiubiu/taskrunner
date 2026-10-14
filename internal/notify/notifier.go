@@ -27,12 +27,12 @@ type Config struct {
 // Payload 死信事件载荷（zhuzhao DeadLetterNotifyPayload 契约）
 type Payload struct {
 	TaskID    string `json:"task_id"`
-	RequestID string `json:"request_id,omitempty"`
+	RequestID string `json:"request_id"` // omitempty 已去（契约审计 B3）：与 zhuzhao DeadLetterNotifyPayload 成对恒出，Attempts=0/空 id 不得凭空消失
 	Action    string `json:"action"`
-	JobID     string `json:"job_id,omitempty"`
+	JobID     string `json:"job_id"`
 	Dept      string `json:"dept,omitempty"`
 	Error     string `json:"error,omitempty"`
-	Attempts  int    `json:"attempts,omitempty"`
+	Attempts  int    `json:"attempts"`
 	FailedAt  string `json:"failed_at,omitempty"`
 }
 

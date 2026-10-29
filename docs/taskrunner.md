@@ -131,7 +131,7 @@
 - **统一回调 body schema（执行端 SDK 的入口约定）**：`{ "task_id": …, "request_id": …, "action": …, "params": …, "actor": …, "source_ip": … }`（actor/source_ip 为可选审计归因字段）——执行端 SDK 解包统一 schema → 校验 → **按 `action` 查本服务 `jobs.Registry`** → 取 `params` 传 Handler；~~action_id~~ **2026-09-08 勘误**：C10 实现两侧均为 `action`（zhuzhao jobs_handler binding required / taskrunner client），此前 SSOT 误写为 action_id；**加能力 = 注册 code + 写 Handler，回调入口零改动**；幂等（task_id）、链路（request_id）、错误映射（2xx/4xx/5xx）在 SDK 层统一处理，业务 handler 只关心 `params` 与返回值；
 - **params 存储与传输分离**：存储 = 入队时 Asynq payload + 执行记录 job_runs（taskrunner 内部持久化）；传输 = 回调 body（给执行端的唯一业务通道）——两者不混。
 
-### 能力目录（capability_registry）【方案待定 · 2026-09-04 记录，未拍板】
+### 能力目录（capability_registry）【✅ 定稿 2026-09-15 · 已排期 phase6（2026-10-29 所有者拍板提入）】
 
 **现状**：任务定义（job）携带**提交方指定**的 `callback_url`，taskrunner 直接回调——「能力 code → 服务端点」的路由由提交方手填，无跨服务能力发现。
 
@@ -160,9 +160,9 @@
 - 补充拍板：注册粒度**按能力一条**（含 owner_ak）；code **扁平命名** + 同 AK 可 upsert、跨 AK 抢注 409；注册 AK/SK **人工/env 发放**（对齐现有 aksk 口径）；**不做 TTL/心跳**（地址漂移靠启动自注册刷新，废弃=管理接口停用）；
 - 执行端 SDK（自注册 client + 统一 body 解包）：抽进 **zhuzhao-utils**（多执行端复用）。
 
-**实现触发条件（满足其一即立独立批次实现，预计 1–2 天；在此之前维持手填 `callback_url` 模式）**：① 第二个执行端服务接入动作体系；② zhuzhao 薄化（网关+IAM）启动、动作地址随部署动态化；③ 提交方手填/维护 URL 成为实际运维负担。
+**实现触发条件（满足其一即立独立批次实现，预计 1–2 天；在此之前维持手填 `callback_url` 模式）**：① 第二个执行端服务接入动作体系；② zhuzhao 薄化（网关+IAM）启动、动作地址随部署动态化；③ 提交方手填/维护 URL 成为实际运维负担。——**已关闭（2026-10-29）：所有者拍板提前提入 phase6**，全量三步同批（建表自注册/解析切换/可选清理不拆分，步骤 2 不留在触发条件后）+ 执行端 SDK 抽 zhuzhao-utils 同批不后置；上列三条件不再作为启动闸门（历史保留）；phase6 侧排期落位随启动批圈范围定。量级复核 ≈3–4 天单人工（三步 1–2 天 + SDK 批 ~1 天 + 拍板落档）。
 
-**命名口径（2026-09-08）**：载荷/回调/一次性提交域统一用 **`action`**（task.Payload、回调 body、/v1/tasks 入参）；任务定义域用 **`action_id`**（jobs 表字段、/v1/jobs 入参、Registry 键）——前者是"运行时标识"，后者是"定义字段"，历史形成、语义可区分，不作强行统一（API 已有消费方）；能力目录（未实现）将用 `action_code`，拍板时一并对齐。
+**命名口径（2026-09-08）**：载荷/回调/一次性提交域统一用 **`action`**（task.Payload、回调 body、/v1/tasks 入参）；任务定义域用 **`action_id`**（jobs 表字段、/v1/jobs 入参、Registry 键）——前者是"运行时标识"，后者是"定义字段"，历史形成、语义可区分，不作强行统一（API 已有消费方）；能力目录（已排期 phase6，2026-10-29）将用 `action_code`，对齐拍板随实现批。
 
 **演进平滑性（2026-09-07）**：从现状（提交方手填 `callback_url`）到目录是**纯增量演进**——执行链路（callback client、回调契约、执行端）零改动，因为路由信息从一开始就是数据而非代码：
 
@@ -414,3 +414,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-15 | **PG 列迁移对称落地（migrateColumns 双驱动）**：SQLite pragma_table_info / PG information_schema 判存补列，ALTER 通用；修复 PG 存在性查询占位符（?→$1/$2）；旧库升级回归测试 SQLite+PG 双侧覆盖——消除「PG 部署后首次加字段升级即计划外停机」缺口（对应场景：C11 式加列在 PG 旧库上报 column not exist 全量失败） |
 | 2026-09-16 | **服务间验签统一批（utils v0.4.0）**：自研 AKSKAuth（150 行：MaxBytesReader 读体+手工验签+authErrMsg 分档+credentialOf 归因）退役，/v1 组改挂 `aksk.GinMiddleware(&Verifier{Keys, Logger}, response.AKSKFail())`——失败响应统一信封+分档中文文案（码引 errcode 常量，原 10001 字面量消除），caller/operator 归因键由 GinMiddleware 验签后统一写入（AccessLog 提前读头退役，改 ctx 优先+头回退+system 兜底），失败现场落 Verifier.Logger 服务端日志；行为增强：无 Authorization 头请求在读体前即 401（不再读体）。middleware 单测适配（credentialOf/authErrMsg 用例随逻辑收编 utils，8MB 用例改带签名打 413）。验证：lint+全量单测绿 |
 | 2026-09-17 | **ADR-004 落地（feat/outbox-reclaim）：提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器）**。**取代 2026-09-03「先入队后落库防孤儿行」决策**（该取舍的「执行但无记录」隐性窗口由本批结构性关闭：插行失败=500 干净，入队失败=行在可修）。① submit 三步（查重→落库 queued=0+载荷快照→入队；UNIQUE 竞提复查幂等 F23；条件标记 0 行补偿撤销 F19）；② ReclaimLoop 三域（自动修复 queued=0+pending / 告警 pending+queued=1 按 State 分流 / 清理 canceled+queued=0 探针出域；「已投未标记」集合、失败计数 tick 聚合、id 游标轮转；config `reclaim.tick/stale_after/batch/retention` 四键）；③ worker 终态守卫（终态行被投递 → 不回调 + SkipRetry——关闭取消残余与重复投递副作用面）；④ CancelTask：completed/archived 命中 409 保指纹（F35）、queued=0 行 Redis 宕机降级取消（F58）、消亡容忍集含 ErrQueueNotFound（F64）；⑤ 受理语义更新（§5）：入队失败 200=已受理待入队，warning 不回传响应体。实现偏差与游标改 id 的实测依据见 ADR-004「实现记录」。验证：build/vet/全量单测/race 绿；PG 集成用例补齐（DSN 门控） |
+| 2026-10-29 | **能力目录提入 phase6（所有者三拍板）**：①范围=动作路由目录（design-decisions §26.2 Form B 权限申报目录为同名另物，排除）；②全量三步同批（不拆半提入——步骤 2 解析切换不留在触发条件后）；③执行端 SDK 抽 zhuzhao-utils 同批不后置（单执行端虽可先落 zhuzhao 内部，按定稿字面打包）。实现触发条件三闸门随之关闭（§4 已注）；随实现批待拍两件：**命名对齐**（action/action_id/action_code 三口径收敛）+ **ActionMeta 目录化 a/b**（自注册报文携带元数据扩目录列 vs 元数据留各服务读面——定稿表结构早于 S4 ActionMeta[params_schema 动态表单依赖]，是本批最优先设计点）。zhuzhao 侧登记：phase6/07 号 §3.5 + roadmap P5-S4 注 + design-decisions S4 追加注级联 |

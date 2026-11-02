@@ -20,7 +20,7 @@ ENV TZ=Asia/Shanghai
 VOLUME ["/data", "/logs"]
 ENV TASKRUNNER_DB_PATH=/data/taskrunner.db \
     TASKRUNNER_LOG_DIR=/logs \
-    TASKRUNNER_HTTP_ADDR=:8080
-EXPOSE 8080
+    TASKRUNNER_HTTP_ADDR=:18080
+EXPOSE 18080
 ENTRYPOINT ["taskrunner"]
 CMD ["serve"]

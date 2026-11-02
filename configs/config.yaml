@@ -1,6 +1,6 @@
 # taskrunner 配置（C6：yaml + env 展开，对齐 zhuzhao 模式；全 env 兼容见 internal/config）
 server:
-  addr: ":8080"           # env TASKRUNNER_HTTP_ADDR
+  addr: ":18080"           # env TASKRUNNER_HTTP_ADDR
 
 redis:
   addr: "127.0.0.1:6379"  # env TASKRUNNER_REDIS_ADDR（Asynq 队列，独立命名空间归属本服务）

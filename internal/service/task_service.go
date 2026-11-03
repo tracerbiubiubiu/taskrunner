@@ -122,6 +122,12 @@ type SubmitInput struct {
 type SubmitOutput struct {
 	TaskID   string `json:"task_id"`
 	Accepted bool   `json:"accepted"`
+	// Action/Params 回带真实快照（2026-11-03 trigger 回调修复）：网关 Trigger 记账需与
+	// 回调 body 同源值——回调快照一致性校验（jobs_callback W0b）比对 action+params，
+	// 旧合成键 "trigger:<job_id>" 每次必失配 409、运行记录失真标 failed + 死信累积。
+	// Submit 填请求入参，TriggerJob 填定义值；上游旧网关忽略新字段，向后兼容。
+	Action string          `json:"action"`
+	Params json.RawMessage `json:"params,omitempty"`
 }
 
 func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput, error) {
@@ -153,7 +159,7 @@ func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput
 		s.logger.Warn("submit: job_runs persisted but enqueue failed, reclaim loop will retry",
 			slog.String("task_id", in.TaskID), slog.Any("err", warning))
 	}
-	return &SubmitOutput{TaskID: in.TaskID, Accepted: accepted}, nil
+	return &SubmitOutput{TaskID: in.TaskID, Accepted: accepted, Action: in.Action, Params: in.Params}, nil
 }
 
 // ---- 查询 ----
@@ -596,5 +602,5 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 		s.logger.Warn("trigger: job_runs persisted but enqueue failed, reclaim loop will retry",
 			slog.String("task_id", taskID), slog.String("job_id", j.JobID), slog.Any("err", warning))
 	}
-	return &SubmitOutput{TaskID: taskID, Accepted: accepted}, nil
+	return &SubmitOutput{TaskID: taskID, Accepted: accepted, Action: j.ActionID, Params: []byte(j.Params)}, nil
 }

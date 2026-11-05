@@ -192,7 +192,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | `POST /v1/jobs/trigger`（原 `POST /v1/jobs/{id}/trigger`） | 手动执行一次：body 带 job_id（按定义提交任务，前端「立即执行」按钮） |
 | `POST /v1/tasks/cancel`（原 `POST /v1/tasks/{id}/cancel`） | 取消未开始的任务：body 带 task_id |
 | `POST /v1/tasks/retry`（原 `POST /v1/tasks/{id}/retry`） | 重试失败/死信任务：body 带 task_id |
-| `GET /v1/dead-letters` | 死信列表（配合 Asynq Inspector 重放，死信处理闭环） |
+| `GET /v1/dead-letters` | 死信列表（配合 Asynq Inspector 重放，死信处理闭环）；未创建队列/已有空队列均 200 + `list: []`，其他 Redis 故障保持 500 |
 | `GET /healthz` | 健康检查（存活） |
 | `GET /readyz` | 就绪探针（检 Redis ping + DB 按所选驱动探活——SQLite/PG 双驱动，C7） |
 
@@ -415,3 +415,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-16 | **服务间验签统一批（utils v0.4.0）**：自研 AKSKAuth（150 行：MaxBytesReader 读体+手工验签+authErrMsg 分档+credentialOf 归因）退役，/v1 组改挂 `aksk.GinMiddleware(&Verifier{Keys, Logger}, response.AKSKFail())`——失败响应统一信封+分档中文文案（码引 errcode 常量，原 10001 字面量消除），caller/operator 归因键由 GinMiddleware 验签后统一写入（AccessLog 提前读头退役，改 ctx 优先+头回退+system 兜底），失败现场落 Verifier.Logger 服务端日志；行为增强：无 Authorization 头请求在读体前即 401（不再读体）。middleware 单测适配（credentialOf/authErrMsg 用例随逻辑收编 utils，8MB 用例改带签名打 413）。验证：lint+全量单测绿 |
 | 2026-09-17 | **ADR-004 落地（feat/outbox-reclaim）：提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器）**。**取代 2026-09-03「先入队后落库防孤儿行」决策**（该取舍的「执行但无记录」隐性窗口由本批结构性关闭：插行失败=500 干净，入队失败=行在可修）。① submit 三步（查重→落库 queued=0+载荷快照→入队；UNIQUE 竞提复查幂等 F23；条件标记 0 行补偿撤销 F19）；② ReclaimLoop 三域（自动修复 queued=0+pending / 告警 pending+queued=1 按 State 分流 / 清理 canceled+queued=0 探针出域；「已投未标记」集合、失败计数 tick 聚合、id 游标轮转；config `reclaim.tick/stale_after/batch/retention` 四键）；③ worker 终态守卫（终态行被投递 → 不回调 + SkipRetry——关闭取消残余与重复投递副作用面）；④ CancelTask：completed/archived 命中 409 保指纹（F35）、queued=0 行 Redis 宕机降级取消（F58）、消亡容忍集含 ErrQueueNotFound（F64）；⑤ 受理语义更新（§5）：入队失败 200=已受理待入队，warning 不回传响应体。实现偏差与游标改 id 的实测依据见 ADR-004「实现记录」。验证：build/vet/全量单测/race 绿；PG 集成用例补齐（DSN 门控） |
 | 2026-10-29 | **能力目录提入 phase6（所有者三拍板）**：①范围=动作路由目录（design-decisions §26.2 Form B 权限申报目录为同名另物，排除）；②全量三步同批（不拆半提入——步骤 2 解析切换不留在触发条件后）；③执行端 SDK 抽 zhuzhao-utils 同批不后置（单执行端虽可先落 zhuzhao 内部，按定稿字面打包）。实现触发条件三闸门随之关闭（§4 已注）；随实现批待拍两件：**命名对齐**（action/action_id/action_code 三口径收敛）+ **ActionMeta 目录化 a/b**（自注册报文携带元数据扩目录列 vs 元数据留各服务读面——定稿表结构早于 S4 ActionMeta[params_schema 动态表单依赖]，是本批最优先设计点）。zhuzhao 侧登记：phase6/07 号 §3.5 + roadmap P5-S4 注 + design-decisions S4 追加注级联 |
+| 2026-11-05 | ECO-20261104-B07-F04：11-02 原P2空队列500在前端全量门禁实证升为功能P1；仅 ErrQueueNotFound（含包装）映射200空数组，真实Redis故障不吞；签名HTTP回归覆盖缺队列/已有空队列/非空分页/故障分档。 |

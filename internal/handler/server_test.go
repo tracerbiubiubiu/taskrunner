@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +58,7 @@ func (f *fakeSubmitter) Submit(ctx context.Context, p task.Payload) (bool, error
 type fakeInspector struct {
 	live    map[string]*asynq.TaskInfo
 	list    []*asynq.TaskInfo
+	listErr error
 	delErr  error
 	runErr  error
 	deleted []string
@@ -83,7 +86,7 @@ func (f *fakeInspector) RunTask(_, id string) error {
 	return nil
 }
 func (f *fakeInspector) ListArchivedTasks(string, ...asynq.ListOption) ([]*asynq.TaskInfo, error) {
-	return f.list, nil
+	return f.list, f.listErr
 }
 
 const (
@@ -666,5 +669,41 @@ func TestContractGuardrails(t *testing.T) {
 	list := m2["data"].(map[string]any)["list"].([]any)
 	if len(list) != 1 || list[0].(map[string]any)["request_id"] != "rg1" {
 		t.Fatalf("?id=%s 精确筛选应只含 rg1：%v", runID, list)
+	}
+}
+
+// ECO-20261104-B07-F04：新栈无队列为200空态，Redis故障不可被吞成空列表。
+func TestDeadLettersQueueClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		err                error
+		wantHTTP, wantCode int
+	}{
+		{"missing queue", asynq.ErrQueueNotFound, 200, 0},
+		{"wrapped missing queue", fmt.Errorf("inspector: %w", asynq.ErrQueueNotFound), 200, 0},
+		{"existing empty queue", nil, 200, 0},
+		{"redis failure", errors.New("redis network unavailable"), 500, 10000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.insp.listErr = tc.err
+			w := f.do(t, http.MethodGet, "/v1/dead-letters?page=2&page_size=25", nil)
+			code, body := decode(t, w)
+			if w.Code != tc.wantHTTP || code != tc.wantCode {
+				t.Fatalf("status=%d code=%d body=%s", w.Code, code, w.Body.String())
+			}
+			if tc.wantHTTP == 200 {
+				data := body["data"].(map[string]any)
+				list, ok := data["list"].([]any)
+				if !ok || len(list) != 0 {
+					t.Fatalf("empty list must be[], got%#v", data["list"])
+				}
+				if data["page"].(float64) != 2 || data["page_size"].(float64) != 25 {
+					t.Fatalf("pagination changed:%v", data)
+				}
+			} else if strings.Contains(w.Body.String(), "redis network unavailable") {
+				t.Fatalf("internal error leaked:%s", w.Body.String())
+			}
+		})
 	}
 }

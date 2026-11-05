@@ -288,6 +288,10 @@ func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) (
 		opts = append(opts, asynq.Page(page))
 	}
 	tasks, err := s.inspector.ListArchivedTasks(s.queue, opts...)
+	if errors.Is(err, asynq.ErrQueueNotFound) {
+		// 新栈尚未投递过任务，队列未注册等同死信为空；真实Redis故障仍向上报错。
+		return []DeadLetterView{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

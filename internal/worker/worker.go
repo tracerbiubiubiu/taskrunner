@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
 	"github.com/google/uuid"
@@ -111,7 +112,7 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		logger.Warn("mark running failed, continuing without job_runs update", slog.Any("err", err))
 	}
 
-	err := d.Callback.Do(ctx, p)
+	err := d.callCallback(ctx, p, logger)
 	switch {
 	case err == nil:
 		if err := d.finish(ctx, logger, p.TaskID, repository.StatusSucceeded, "", attempt, now, executionID); claimed && errors.Is(err, repository.ErrDeliverySuperseded) {
@@ -153,4 +154,17 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		}
 		return err // 交还 Asynq 按退避策略重试
 	}
+}
+
+// Catch a callback panic before Asynq's outer recovery: the error must pass the
+// same failed/dead/retry and execution fence paths as an ordinary callback 5xx.
+// Panics outside the callback boundary remain visible to Asynq's recovery.
+func (d Deps) callCallback(ctx context.Context, p task.Payload, logger *slog.Logger) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			logger.Error("callback panic", slog.Any("panic", v), slog.String("stack", string(debug.Stack())))
+			err = fmt.Errorf("worker: callback panic: %v", v)
+		}
+	}()
+	return d.Callback.Do(ctx, p)
 }

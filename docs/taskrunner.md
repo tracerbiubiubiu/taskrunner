@@ -213,6 +213,10 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 - **提交路径 DB-first（ADR-004，2026-09-17）**：Submit = 查重 → job_runs 落库（queued=0 + 载荷快照）→ 入队；行即事实源（SSOT），Redis 任务是可重建投影。配套 **ReclaimLoop 三域扫描器**（自动修复 queued=0+pending / 告警 pending+queued=1 / 清理 canceled+queued=0，config `reclaim.*`）与 **worker 终态守卫**（终态行被投递 → 不回调 + SkipRetry）。运行时边界口径见 §10。
 - **取消语义（ADR-004，2026-09-17）**：`queued=0` 行（未交付/交付未知）遇 Redis 可用性错误**降级取消**——照常标 canceled，Redis 键收尾交第三域探针；`queued=1` 行取消仍需 Redis 配合。留观中的 completed / archived 命中 → 409（保「已执行」告警指纹，需人工介入）。
 
+### 异常隔离（2026-11-06，ECO-B07-F08/F09）
+
+cron/reclaim以单tick为捕获边界，panic记组件与堆栈Error并回到循环，下一tick仍扫描，ctx取消仍正常停止；不是recover后退出后台循环。死信notifier按单个异步通知捕获并记task_id/堆栈，保持尽力而为、不新增重试队列，后续通知独立继续。业务回调panic在worker回调边界转普通可重试错误，走现有failed→重试/最终dead和execution_id终态栅栏，过期delivery不覆盖新执行、不发死信通知。此边界不宣称恢复进程致命错误、回调外任意程序故障或数据库持续写失败；后者仍按既存running空洞留日志/对账。
+
 ## 6. job_runs 存储与日志分工（2026-09-03 定稿）
 
 **执行记录落库**（不存文件、不依赖 Asynq/Redis 自带记录——Redis 只保队列运转，撑不起按 request_id/action/时间段的查询）：
@@ -418,3 +422,4 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-17 | **ADR-004 落地（feat/outbox-reclaim）：提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器）**。**取代 2026-09-03「先入队后落库防孤儿行」决策**（该取舍的「执行但无记录」隐性窗口由本批结构性关闭：插行失败=500 干净，入队失败=行在可修）。① submit 三步（查重→落库 queued=0+载荷快照→入队；UNIQUE 竞提复查幂等 F23；条件标记 0 行补偿撤销 F19）；② ReclaimLoop 三域（自动修复 queued=0+pending / 告警 pending+queued=1 按 State 分流 / 清理 canceled+queued=0 探针出域；「已投未标记」集合、失败计数 tick 聚合、id 游标轮转；config `reclaim.tick/stale_after/batch/retention` 四键）；③ worker 终态守卫（终态行被投递 → 不回调 + SkipRetry——关闭取消残余与重复投递副作用面）；④ CancelTask：completed/archived 命中 409 保指纹（F35）、queued=0 行 Redis 宕机降级取消（F58）、消亡容忍集含 ErrQueueNotFound（F64）；⑤ 受理语义更新（§5）：入队失败 200=已受理待入队，warning 不回传响应体。实现偏差与游标改 id 的实测依据见 ADR-004「实现记录」。验证：build/vet/全量单测/race 绿；PG 集成用例补齐（DSN 门控） |
 | 2026-10-29 | **能力目录提入 phase6（所有者三拍板）**：①范围=动作路由目录（design-decisions §26.2 Form B 权限申报目录为同名另物，排除）；②全量三步同批（不拆半提入——步骤 2 解析切换不留在触发条件后）；③执行端 SDK 抽 zhuzhao-utils 同批不后置（单执行端虽可先落 zhuzhao 内部，按定稿字面打包）。实现触发条件三闸门随之关闭（§4 已注）；随实现批待拍两件：**命名对齐**（action/action_id/action_code 三口径收敛）+ **ActionMeta 目录化 a/b**（自注册报文携带元数据扩目录列 vs 元数据留各服务读面——定稿表结构早于 S4 ActionMeta[params_schema 动态表单依赖]，是本批最优先设计点）。zhuzhao 侧登记：phase6/07 号 §3.5 + roadmap P5-S4 注 + design-decisions S4 追加注级联 |
 | 2026-11-05 | ECO-20261104-B07-F04：11-02 原P2空队列500在前端全量门禁实证升为功能P1；仅 ErrQueueNotFound（含包装）映射200空数组，真实Redis故障不吞；签名HTTP回归覆盖缺队列/已有空队列/非空分页/故障分档。 |
+| 2026-11-06 | ECO-B07-F08/F09：对README 11-02两个既有P2债实证后最小修复，后台panic保下一tick/通知可继续，callback panic转现有失败/重试链并服从delivery fence；不改reclaim三域、幂等或队列语义。 |

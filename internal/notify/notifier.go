@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
@@ -57,6 +58,14 @@ func (n *Notifier) NotifyDeadLetter(p Payload) {
 		return
 	}
 	go func() {
+		// A best-effort notification must not crash the worker/API process.
+		// Keep the failure visible; later notifications are independent goroutines.
+		defer func() {
+			if v := recover(); v != nil {
+				n.logger.Error("dead-letter notify: panic", slog.String("task_id", p.TaskID),
+					slog.Any("panic", v), slog.String("stack", string(debug.Stack())))
+			}
+		}()
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 8*time.Second)
 		defer cancel()
 		body, err := json.Marshal(p)

@@ -255,7 +255,7 @@ func TestReclaimFailStatTTLPruned(t *testing.T) {
 		t.Fatalf("counter should exist, got %+v", l.enqueueFailCnt)
 	}
 	// 行离开第一轮域（worker 取走 → running）
-	if err := st.MarkRunning(context.Background(), "p1", 1, time.Now()); err != nil {
+	if err := st.MarkRunning(context.Background(), "p1", 1, time.Now(), "fixture-delivery"); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
 	// 时钟快进超过 TTL：条目被回收（行已不在域内，无需人为再触发）

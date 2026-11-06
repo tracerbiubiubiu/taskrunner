@@ -204,6 +204,8 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 ### 执行模型（2026-09-07 补充）
 
+> 2026-11-06 ECO-B07-F05：Asynq停机预算到期重排任务时不增加retry count，因此旧的“status/attempts即可拒绝所有过期写者”断言不成立。worker每次delivery生成新的`execution_id`，MarkRunning原子写入，三种终态路径Finish均须匹配该身份；较旧attempt也不能重新索取较新执行权。手动retry允许计数重启，但新delivery身份不重用。过期终态写入被拒后不发死信通知。此栅栏保护本库执行状态，不将at-least-once回调改成exactly-once；动作属主仍负责幂等。既有MarkRunning缺行/DB故障时“继续回调并留日志”的受容边界维持，无法据此保证跨DB/HTTP原子。
+
 - **worker = 固定大小协程池**（asynq `Concurrency`，默认 10）：每取到一个任务，池内一个协程**同步**执行 handler（组装回调 → HTTP POST，受回调超时约束——协程占用时长有界）；并发上限即池大小，超出自然积压在 Redis 队列（`/monitor` 可见）；
 - **重试不是自循环**：handler 返回错误 → asynq 按退避策略把任务延迟重投递（`ProcessIn`），到期由池内任意协程再取——重试与首次是同一条消费路径；
 - **崩溃不丢**：执行中任务有租约（lease），协程存活即自动续期；进程挂 → 租约到期自动重新投递（at-least-once 的机制来源，也是回调幂等义务的来源）；

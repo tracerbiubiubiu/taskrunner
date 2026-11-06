@@ -1,5 +1,7 @@
 # ADR-004: 提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 扫描器）
 
+> 2026-11-06 ECO-B07-F05补正：终态守卫除status/attempt外还须匹配每delivery独立`execution_id`，Asynq停机重排可能不增加retry count。启动增列由`repository.migrateColumns`在PG/SQLite两驱动执行，不改变HTTP响应或reclaim三域。Stop/timeout/普通retry/手动retry均走同一worker赋新身份；旧终态被拒后不触发死信通知。故障时继续回调的既有受容边界与动作幂等义务维持，部署/回滚要求见deploy/README。
+
 ## 日期
 2026-09-17（同日完成评审修正合入；同日七审增补 F58–F63、八审增补 F64–F67，见评审修正记录）
 

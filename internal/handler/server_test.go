@@ -453,10 +453,10 @@ func TestCancelAndRetry(t *testing.T) {
 	// retry failed 任务：置 failed 后重试成功
 	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "c2", "action": "a"})
 	// C6 谓词适配：真实 worker 不变量 = Finish 前必 MarkRunning（running 态才可终态）
-	if err := f.st.MarkRunning(context.Background(), "c2", 1, time.Now()); err != nil {
+	if err := f.st.MarkRunning(context.Background(), "c2", 1, time.Now(), "fixture-delivery"); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.st.Finish(context.Background(), "c2", repository.StatusFailed, "boom", 1, time.Now(), time.Now()); err != nil {
+	if err := f.st.Finish(context.Background(), "c2", repository.StatusFailed, "boom", 1, time.Now(), time.Now(), "fixture-delivery"); err != nil {
 		t.Fatal(err)
 	}
 	w4 := f.do(t, http.MethodPost, "/v1/tasks/retry", map[string]any{"task_id": "c2"})
@@ -608,10 +608,10 @@ func TestErrorMessageDistinguishesState(t *testing.T) {
 	f.do(t, http.MethodPost, "/v1/tasks", map[string]any{
 		"task_id": "tk-done", "action": "a"})
 	now := time.Now()
-	if err := f.st.MarkRunning(context.Background(), "tk-done", 1, now); err != nil {
+	if err := f.st.MarkRunning(context.Background(), "tk-done", 1, now, "fixture-delivery"); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
-	if err := f.st.Finish(context.Background(), "tk-done", repository.StatusSucceeded, "", 1, now, now); err != nil {
+	if err := f.st.Finish(context.Background(), "tk-done", repository.StatusSucceeded, "", 1, now, now, "fixture-delivery"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	wConflict := f.do(t, http.MethodPost, "/v1/tasks/cancel", map[string]any{"task_id": "tk-done"})

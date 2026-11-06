@@ -79,10 +79,10 @@ func row(t *testing.T, s *TaskService, id, status string) {
 	}
 	switch status {
 	case repository.StatusRunning:
-		s.repo.MarkRunning(ctx, id, 1, timeNow())
+		s.repo.MarkRunning(ctx, id, 1, timeNow(), "fixture-delivery")
 	case repository.StatusFailed, repository.StatusDead:
-		s.repo.MarkRunning(ctx, id, 1, timeNow())
-		s.repo.Finish(ctx, id, status, "boom", 1, timeNow(), timeNow())
+		s.repo.MarkRunning(ctx, id, 1, timeNow(), "fixture-delivery")
+		s.repo.Finish(ctx, id, status, "boom", 1, timeNow(), timeNow(), "fixture-delivery")
 	}
 }
 
@@ -215,8 +215,8 @@ func TestRetryRaces(t *testing.T) {
 	// 模拟 worker 在 RunTask 与 ResetPending 之间完成：RunTask 回调里写终态
 	s.inspector = raceInspector{TaskInspector: ins, afterRun: func() {
 		ctx := context.Background()
-		_ = s.repo.MarkRunning(ctx, "r1", 2, timeNow())
-		_ = s.repo.Finish(ctx, "r1", repository.StatusSucceeded, "", 2, timeNow(), timeNow())
+		_ = s.repo.MarkRunning(ctx, "r1", 2, timeNow(), "fixture-delivery")
+		_ = s.repo.Finish(ctx, "r1", repository.StatusSucceeded, "", 2, timeNow(), timeNow(), "fixture-delivery")
 	}}
 	if err := s.RetryTask(ctx, "r1"); !isConflict(err) {
 		t.Fatalf("retry race want conflict, got %v", err)

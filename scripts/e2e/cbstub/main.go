@@ -1,10 +1,13 @@
-// cbstub E2E 回调桩：按路径分流响应——/cb404 恒 404（4xx 非重试终败）、
-// /cb500 前两次 500 之后 200（触发重试→死信→RetryTask 后成功）、其余 200。
+// cbstub E2E回调桩：按签名params.e2e_case选择合成响应，W0b后目标URL由服务端固定。
+// /cb404恒404、/cb500前两次500之后200，其余200。
 // 每次调用追加一行「时间 路径 body」到 $E2E_WORK/callbacks.log 供断言。
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
+	"io"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -22,12 +25,28 @@ func main() {
 	}
 	var c500 int64
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		buf := make([]byte, 4096)
-		n, _ := r.Body.Read(buf)
-		fmt.Fprintf(f, "%s %s %s\n", time.Now().Format("15:04:05.000"), r.URL.Path, string(buf[:n]))
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil {
+			http.Error(w, "fixture body read failed", 400)
+			return
+		}
+		if err := (&aksk.Verifier{Keys: map[string][]byte{"taskrunner": []byte("sk-e2e-self")}}).Verify(r, body); err != nil {
+			http.Error(w, "fixture signature rejected", 401)
+			return
+		}
+		var in struct {
+			Params struct {
+				Case string `json:"e2e_case"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal(body, &in); err != nil {
+			http.Error(w, "fixture JSON rejected", 400)
+			return
+		}
+		fmt.Fprintf(f, "%s %s %s\n", time.Now().Format("15:04:05.000"), r.URL.Path, string(body))
 		f.Sync()
 		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
+		switch in.Params.Case {
 		case "/cb404":
 			w.WriteHeader(http.StatusNotFound)
 		case "/cb500":

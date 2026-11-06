@@ -136,6 +136,16 @@ func TestCallbackPanicAsynqLifecycle(t *testing.T) {
 						}
 						info, e := inspector.GetTaskInfo(queue, id)
 						if e == nil && info.State == asynq.TaskStateArchived && r.Status == repository.StatusRunning {
+							// The earlier DB snapshot can precede Finish while this broker
+							// read follows archive. Re-read after archive before declaring
+							// the row stuck; these two stores are not an atomic snapshot.
+							r, err = st.GetByTaskID(ctx, id)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if r.Status != repository.StatusRunning {
+								continue
+							}
 							before := time.Now().Add(time.Hour)
 							a, _ := st.ListUnqueued(ctx, before, 100)
 							b, _ := st.ListStuckPending(ctx, before, 0, 100)

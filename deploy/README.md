@@ -27,7 +27,7 @@ EOF
 docker compose up -d --build
 
 # 3. zhuzhao 侧无须额外配置——其 deployments/docker-compose.yaml 默认
-#    TASKRUNNER_BASE_URL=http://taskrunner:8080（共享网服务名）
+#    TASKRUNNER_BASE_URL=http://taskrunner:18080（共享网服务名）
 ```
 
 ## 拓扑与隔离（C3，对齐 activelist D5）
@@ -38,7 +38,7 @@ docker compose up -d --build
 | postgres | taskrunner_internal（仅本栈） | **不发布** |
 | redis | taskrunner_internal（仅本栈） | **不发布** |
 
-- zhuzhao → taskrunner：`http://taskrunner:8080`（共享网，AK/SK 出站签名）
+- zhuzhao → taskrunner：`http://taskrunner:18080`（共享网，AK/SK 出站签名）
 - taskrunner → zhuzhao 回调：`http://zhuzhao:33333`（zhuzhao 在共享网注册别名；callback URL 由 zhuzhao 下发）
 - AK/SK 对值纪律：本栈 `TASKRUNNER_CALLER_ZHUZHAO_SK` = zhuzhao 侧 `TASKRUNNER_SK`；本栈 `TASKRUNNER_SELF_SK` = zhuzhao 侧 `INTERNAL_JOBS_SK`（**compose 无弱缺省，fail-closed 拒建**——2026-10-01 硬化，dev 对值经 .env 注入）
 
@@ -56,3 +56,5 @@ docker compose up -d --build
 镜像内 `/data`、`/logs` 已预建并归属运行用户（uid 100）；named volume 首挂继承镜像属主。
 改用宿主 bind mount 时，属主不受镜像控制——**启动期可写探针 fail-closed**（不可写即拒启并
 指引属主排查；负向实测：`TASKRUNNER_LOG_DIR=/etc` → `log 目录不可写 … uid 100`）。
+
+2026-11-06 ECO-B07-F11：容器/环境缺省/冻结yaml统一既定18080，生产compose探针与共享网地址均对齐；无宿主ports发布。覆盖监听端口时须同步探针与调用方，环境差异用env，不改冻结yaml。

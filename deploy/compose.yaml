@@ -3,7 +3,7 @@
 # 拓扑（C3 网络隔离，对齐 activelist D5 双 network 模式）：taskrunner 跨双网——
 # taskrunner_internal（PG/Redis 仅内网可达）与 zhuzhao_to_taskrunner（external，
 # 由部署侧预建：docker network create zhuzhao_to_taskrunner；zhuzhao app 容器须加入
-# 同一网络并以 http://taskrunner:8080 寻址本服务）。本栈全部服务【不对宿主发布端口】，
+# 同一网络并以 http://taskrunner:18080 寻址本服务）。本栈全部服务【不对宿主发布端口】，
 # zhuzhao 经共享网反代式调用；回调由本服务主动拨 zhuzhao（callback URL 由 zhuzhao 下发）。
 #
 # 环境变量（.env 或 export）——五项均必填，缺失 compose 直接报错拒建（fail-closed，
@@ -88,7 +88,7 @@ services:
       taskrunner_internal: {}
       zhuzhao_to_taskrunner:
         aliases:
-          - taskrunner # 供 zhuzhao 以 http://taskrunner:8080 稳定寻址
+          - taskrunner # 供 zhuzhao 以 http://taskrunner:18080 稳定寻址
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,11 +96,11 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:18080/healthz || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
-    # 无 ports 段——8080 不对宿主发布（C3）；R5 可写探测在镜像内 /data /logs
+    # 无 ports 段——18080 不对宿主发布（C3）；R5 可写探测在镜像内 /data /logs
     # 已预授权（named volume 首挂继承镜像属主 app），bind mount 改挂时依赖
     # 启动探针 fail-closed 暴露属主问题。
 

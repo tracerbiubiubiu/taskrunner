@@ -35,7 +35,7 @@ services:
       - taskrunner_internal
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U taskrunner -d taskrunner"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U taskrunner -d taskrunner"]
       interval: 5s
       timeout: 3s
       retries: 10

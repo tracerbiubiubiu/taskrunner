@@ -20,3 +20,6 @@ bin/
 # ai
 .workbuddy/
 .codebuddy/
+
+# Local audit workspace
+.codex/

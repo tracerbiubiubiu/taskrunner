@@ -1,94 +1,9 @@
 # taskrunner
 
-**事件/任务总线**：zhuzhao 网关下的「异步执行侧」——可靠地调度、触发并执行预置动作（HTTP 回调 zhuzhao 内网端点），并提供内部 HTTP API；独立仓库、独立部署、独立 Redis、独立 DB。
+独立部署的事件/任务执行服务：HTTP受理、DB-first记录、Redis/Asynq调度、固定目标回调、重试和死信查询。业务handler由能力属主持有，用户权限由zhuzhao网关判定。
 
-## 定位
+从 [文档导航](docs/README.md) 开始。接入查 [HTTP契约](docs/api/contract.md)，部署查 [部署](docs/ops/deployment.md) 和 [备份恢复](docs/ops/backup.md)，开发查 [验证与提交](docs/guides/development.md)。
 
-| | |
-|---|---|
-| 做什么 | 可靠任务队列（Asynq）+ 定时调度 + 触发回调 + 重试/超时/死信 + 自维护 `job_runs`（落库，SQLite/PostgreSQL 双驱动——C7）+ 内部 HTTP API（任务定义管理 / 提交 / 查询 / 取消 / 重试 / 死信） |
-| 不做什么 | 业务 handler（回调 zhuzhao）、用户上传脚本（🚦 降级）、事件源（L1 在 zhuzhao） |
-| 底座 | [Asynq](./docs/ADR-002-asynq-async-task-executor.md)（Go，Redis 队列，重启不丢） |
+当前候选源码不等于已合主线或部署；能力目录已批准但未实施，`/monitor`尚不存在。历史演进和审计结论在docs/review/archive保留。
 
-## 与 zhuzhao 的关系
-
-- zhuzhao = 网关（鉴权/编排/业务审计），**调 taskrunner API 提交任务 + 记任务提交日志**；
-- taskrunner = 通用调度/触发运行时，消费任务后 **HTTP 回调 zhuzhao 内网端点**执行预置动作；
-- 日志边界：zhuzhao 记「任务提交日志 + 业务审计」，taskrunner 自维护 `job_runs` 执行细节、**不传回 zhuzhao**，以 `request_id` 关联跨查（`GET /v1/runs?request_id=…`）。
-
-## 文档
-
-- [设计文档](./docs/taskrunner.md) —— SSOT：定位/职责/回调模型/HTTP API/日志边界/部署形态/实施计划
-- [zhuzhao 侧配套需求](./docs/zhuzhao-integration.md) —— 本设计引出的 zhuzhao 侧工作项清单（注册表/任务管理/部门策略等）
-- [ADR-002 契约快照](./docs/ADR-002-asynq-async-task-executor.md) —— Asynq 执行器决策（zhuzhao 侧为 SSOT）
-- [ADR-004 提交 DB-first](./docs/ADR-004-db-first-outbox-reclaim.md) —— job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器 + worker 终态守卫）
-
-## 快速开始
-
-```bash
-cp configs/config.yaml my.yaml   # 或纯 env（TASKRUNNER_* 全量兼容）
-export TASKRUNNER_CALLER_ZHUZHAO_SK=<zhuzhao侧分配的SK>   # 必填（API 验签）
-export TASKRUNNER_SELF_SK=<zhuzhao侧为本服务分配的SK>       # 必填（回调签名）
-./bin/taskrunner serve my.yaml   # 或纯 env 直接 serve
-
-# PG 部署（C7 双驱动；默认 SQLite）：TASKRUNNER_MAX_RETRY 等 env 均可覆盖
-export TASKRUNNER_DB_DRIVER=pg
-export TASKRUNNER_DB_HOST=127.0.0.1 TASKRUNNER_DB_PORT=5432
-export TASKRUNNER_DB_USER=taskrunner TASKRUNNER_DB_PASSWORD=... TASKRUNNER_DB_NAME=taskrunner
-```
-
-> 注：`enqueue` CLI 同样经 `config.Load`（含验签密钥环 fail-closed 校验）——调试机也需注入两个 SK 环境变量。
-
-## 验证
-
-```bash
-make lint                  # vet + gofmt
-make build                 # bin/taskrunner
-make test                  # 单测
-make e2e                   # E2E 端到端（需 docker；19 断言七场景，cron 场景 E2E_INCLUDE_CRON=1）
-TASKRUNNER_TEST_PG_DSN=... go test ./internal/repository/ -run TestPG   # PG 集成（需 PG）
-```
-
-CI（GitHub Actions）：push/PR 全触发——vet + gofmt + 单测（race）+ PG 集成（race，services 起 postgres:15-alpine）。
-
-## 状态
-
-- 2026-09-03：建仓 + 设计建档（独立仓库/部署/Redis，回调模型，日志边界定稿）；
-- 2026-09-03：设计增补定稿（提交走 API；任务三层模型与定义管理 API；结果以查询接口为唯一出口；job_runs 落库 SQLite；审计透传与部门归属过滤；回调契约；asynqmon 库嵌入；实施计划 M1–M4；zhuzhao 侧配套清单）；
-- 2026-09-03：环境决策（无日志平台——过程日志落文件、ES 演进路径入档；部署形态 Docker 单容器）；zhuzhao 侧配套需求拆出 [独立文档](./docs/zhuzhao-integration.md)；
-- 2026-09-03：M1 核心运行时完成（worker/回调/job_runs 落库/healthz/CLI/Dockerfile）；M2 HTTP API 完成（v1 全量端点 + cronloop 定时触发；鉴权后随结构重构迁 AK/SK）；
-- 2026-09-04：**微服务结构重构**（Wire DI / handler→service→repository 分层 / yaml+env 配置 / 统一 Makefile 门禁；C1/C2/C4/C5/C6/C9 收口——API 验签 AK/SK、/readyz、TZ、回调签名）。zhuzhao 侧预置动作体系已就绪（jobs Registry + audit_archive + /internal 回调端点 + 任务管理代理端点）；**C7 已落地（SQLite/PG 双驱动，2026-09-08/09）**；下一步 M3 部署联调（建 cron 定义 + 两侧对拉 + C3 网络拓扑）；
-- 2026-09-04：代码评审修复（提交幂等扩为终身；cancel 竞态三道防护，fix/idempotency-and-cancel-race）；§1 补「什么算一个任务」判定标准；
-- 首个预置动作：审计归档（B11②，定时回调 zhuzhao 导出 audit_logs JSONL）；
-- 2026-09-08/09：C7 存储双驱动落地（SQLite/PG，CLI enqueue 复用 OpenStore）+ 日志轮转 + 全面验证/二次审计修复批（读体上限/worker 终态 off-by-one/任务级 deadline）；
-- 2026-09-17：**ADR-004 落地（feat/outbox-reclaim，PR #1）**——提交改 DB-first（job_runs 兼任 Outbox：queued 标志 + Reclaim 三域扫描器 + worker 终态守卫 + 取消降级），取代「先入队后落库」取舍；单测 + race + PG 集成 + E2E（`scripts/e2e/e2e.sh`，19 断言含 cron）全绿；
-- 2026-09-29（P4 随批三件）：**W0b 四口同收对齐**（zhuzhao 出站不再拼接/预检 callback_url——提交链三处契约断裂修复，提交恒 400 根治）；**ListRuns 加 submitted_by 过滤**（「只看我提交的」，zhuzhao 代理把 me 换 actor）；**P4-2 死信终败通知**（notify 包：TASKRUNNER_NOTIFY_* env，死信→zhuzhao /internal/notify/dead-letter→webhook，异步尽力而为）。cron 收归注意：zhuzhao 侧 audit_archive 已可进程内调度（advisory lock）——启用则停本仓 audit_archive cron job 防双跑（zhuzhao deployments/CRON-MIGRATION.md）。
-- 2026-10-29：**能力目录提入 phase6**（所有者三拍板：动作路由目录 / 全量三步同批 / utils 执行端 SDK 同批——≈3–4 天，排期随 zhuzhao phase6 启动批圈定；SSOT=[docs/taskrunner.md](./docs/taskrunner.md) §4 / §12）；
-- 2026-11-02：四仓同类审计——本仓 **3 个 P2 原始登记**（死信列表对 asynq `ErrQueueNotFound` 直返 500[全新部署/清库后必现，2026-11-05 ECO-20261104-B07-F04 经前端真实门禁确认为功能 P1 并修复，返回 200 空数组] / cron·reclaim·notifier 三后台 goroutine 无 recover[panic=整进程崩，2026-11-06 ECO-B07-F08加单轮/单通知捕获并保留Error堆栈，后续tick/通知继续] / worker回调panic后 job_runs卡running且不在reclaim三域[2026-11-06 ECO-B07-F09在回调边界转普通可重试错误，遵既有failed/dead与execution fence；数据库持续失败等running残余不在此扩大承诺]）；提交规范与机械门禁遵 zhuzhao `docs/standards.md` §12-9（主题行 ≤50 字 + 三节正文），已随 RR-GIT-01 对齐，见下文「提交规范」；
-- 状态：M1/M2/C7/ADR-004 已落地；**P4 期随批三件已交付**（Phase 4 于 2026-09-29 收官）；下一步 = M3 部署联调（dev 三栈已由 zhuzhao `scripts/dev-stack.sh` 编排、compose 在位，生产形态随 zhuzhao 合 main 节奏）；工作区状态见 git status。
-
-## 提交规范
-
-遵 zhuzhao `docs/standards.md` §12-9 / §12-10；关联主仓复核报告
-`deliverables/software-company/zhuzhao-report-followup-2026-11-08.md` 的 **RR-GIT-01**（2026-11-08）。
-本仓脚本与主仓同源、自包含，仅依赖 Git + Python 3 标准库，不依赖主仓目录或新增 Go/npm 包。
-主题为 `type(scope): 摘要`（scope 可省略），摘要去前缀后最多 50 个 Unicode 字符、不得以句号结尾；
-主题与正文间须空行，正文不得为空或只有空白。所有新 merge 提交也须显式提供规范主题与正文。
-修复正文仍按公约填写「改动摘要 / 影响面 / 验证证据」与同类扫描，硬检查①–⑤不替代人工验证证据。
-
-```sh
-make hooks              # 新 clone / 新工作树开工时安装
-make commit-lint        # origin/当前分支..HEAD；初推无同名远端时从启用基线检查
-make test-commit-lint    # 临时独立仓库黑盒反例，不触碰业务栈
-# 显式历史审计（完整 SHA；不豁免历史）
-python3 scripts/commit-policy.py range --before <完整SHA> --after <完整SHA> --strict
-```
-
-`make hooks` 启用 Git 的 worktree 配置，仅在当前工作树设置相对 `.githooks`；common
-`core.hooksPath` 保留，尚未承接本批的 main/其它工作树不被改装。保留在途显影与跨主题纯重题
-amend 保护，`commit-msg` 先挡消息违规，`pre-push` 按 Git 提供的每个 ref 新旧 SHA 检查完整窗口。
-`GIT_INDEX_FILE` 保持原值，兼容显式 pathspec 提交，不暂存或重写其它会话文件。
-
-固定启用基线见 `scripts/commit-policy-baseline`：仅其祖先为已推送存量，不改史、不自动前移。
-CI push 使用事件 before/after，PR 使用真实 base/head SHA，初推与 force push 均有覆盖；
-缺对象精确获取仍失败、非法 SHA 或浅克隆一律拒绝，不回退近 20 笔。现有代码测试 CI 保持。
+许可：[MIT](LICENSE)。

@@ -1,6 +1,10 @@
+# zhuzhao 配套需求历史
+
+> 整理基准：2026-11-08。以下保留原需求、里程碑和审批→AL→TR方案；其中部门隔离、业务L2 Outbox、审批链并非当前实现。当前接入见 [集成说明](../../design/zhuzhao-integration.md)。
+
 # zhuzhao 侧配套需求（接入 taskrunner）
 
-> 本文档 = [taskrunner 设计](./taskrunner.md)引出的 **zhuzhao 侧工作项清单**，供 zhuzhao 仓库排期与实现参考。
+> 本文档 = [taskrunner 设计](../../design/taskrunner.md)引出的 **zhuzhao 侧工作项清单**，供 zhuzhao 仓库排期与实现参考。
 > taskrunner 侧设计 SSOT = `taskrunner.md`；zhuzhao 侧排期 SSOT = zhuzhao `docs/phase3/13-implementation-plan.md`。
 > 2026-09-03 从 taskrunner.md §11 拆出成档。
 
@@ -130,4 +134,3 @@ var registry = map[string]JobHandler{
 - 取取舍：最终一致（非强原子）——该场景无「同时读两状态」诉求，足够；
 - **唯一新设计点**：activelist 加值需业务唯一键幂等（activelist 是「每类型一张表 + data JSONB」，需业务唯一键约束或 zhuzhao 先查重再写）；
 - 本场景即 **L2 Outbox 落地触发信号**（「多消费者」= activelist + taskrunner 两个下游），落地全在 zhuzhao 侧（Outbox 表 + Relay），taskrunner / activelist 零改动。
-

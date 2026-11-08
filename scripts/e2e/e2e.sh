@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ADR-003 E2E 端到端验证（可独立复核）——真实进程 + 真 Redis + AK/SK 签名 HTTP。
+# ADR-004 E2E 端到端验证（可独立复核）——真实进程 + 真 Redis + AK/SK 签名 HTTP。
 #
 # 用法：scripts/e2e/e2e.sh   （可选 E2E_INCLUDE_CRON=1 追加 cron 到点场景，+≤70s）
 # 依赖：docker（起专用 Redis，不碰已有实例）、go、python3、curl

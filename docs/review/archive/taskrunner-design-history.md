@@ -1,7 +1,11 @@
+# taskrunner 原设计与实施历史
+
+> 整理基准：2026-11-08。以下为迁移前原设计快照，包含已被 W0b 固定回调覆盖的“用户指定 URL”、旧部门隔离设想及未实现 monitor 等。当前行为见 [运行设计](../../design/taskrunner.md)、[HTTP 契约](../../api/contract.md)；能力目录见 [已批准未实施方案](../../design/capability-registry.md)。原批号、失败与评审结论保留，不按历史待办重新立项。
+
 # taskrunner — 事件/任务总线（异步触发预置动作）
 
 > 独立仓库、独立部署、独立 Redis、独立 DB。zhuzhao 的「异步执行侧」：zhuzhao 只作网关（鉴权/编排/业务审计），taskrunner 负责可靠调度、触发与执行回调，并提供内部 HTTP API（提交任务 / 查询执行记录 / 死信管理）。
-> 设计 SSOT = 本文档；决策依据 = [ADR-002](./ADR-002-asynq-async-task-executor.md)（快照，zhuzhao 侧为 SSOT）。
+> 设计 SSOT = 本文档；决策依据 = [ADR-002](../../adr/adr-002-asynq-async-task-executor.md)（快照，zhuzhao 侧为 SSOT）。
 > 2026-09-03 收敛 + 形态定稿；同日增补定稿：提交方式（调 API）、任务三层模型与定义 API 管理、HTTP API v1（含 jobs 组与结果查询语义）、job_runs 落库与两路日志分工、审计透传与归属过滤、asynqmon 库嵌入、实施计划 M1–M4、zhuzhao 侧配套清单。
 
 ---
@@ -358,18 +362,18 @@ cron/reclaim以单tick为捕获边界，panic记组件与堆栈Error并回到循
 
 | 文档 | 位置 | 关系 |
 |---|---|---|
-| [ADR-002](./ADR-002-asynq-async-task-executor.md) | 本仓库 docs/（快照） | Asynq 执行器决策，zhuzhao 侧为 SSOT |
+| [ADR-002](../../adr/adr-002-asynq-async-task-executor.md) | 本仓库 docs/（快照） | Asynq 执行器决策，zhuzhao 侧为 SSOT |
 | [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils) | 独立仓库 | 通用工具库（logger / postgres / errcode+response），非反向依赖 |
 | zhuzhao `docs/adr/ADR-001-event-mechanism-l1-steady-state.md` | zhuzhao 仓库 | L1 事件源（taskrunner 不替代） |
 | zhuzhao `docs/phase3/13-implementation-plan.md` | zhuzhao 仓库 | 排期 SSOT（M-E 行 + 部署注记） |
 | zhuzhao `docs/phase3/14-planning-overview.md` | zhuzhao 仓库 | 规划视图 |
 | zhuzhao `docs/phase3/15-script-platform-dagu-vs-inhouse.md` | zhuzhao 仓库 | 脚本任务选型调研（🚦 按需再启参考） |
 | zhuzhao `docs/phase3/03-audit-l2.md` | zhuzhao 仓库 | 审计归档（B11②）设计 |
-| [zhuzhao-integration.md](./zhuzhao-integration.md) | 本仓库 docs/ | **zhuzhao 侧配套需求清单**（六项展开 + 契约摘要，见下） |
+| [zhuzhao-integration.md](../../design/zhuzhao-integration.md) | 本仓库 docs/ | **zhuzhao 侧配套需求清单**（六项展开 + 契约摘要，见下） |
 
 ### zhuzhao 侧配套需求（跨仓库依赖，勿遗漏）
 
-本设计引出的 zhuzhao 侧工作项已**拆出独立文档**：[zhuzhao-integration.md](./zhuzhao-integration.md)（动作注册表与内网端点、动作清单校验端点、任务管理功能、部门可见性策略及其存储、任务提交日志、后置的通知接收端点，含交互总览与回调契约摘要）。设计与排期以 zhuzhao 仓库为 SSOT，该文档供 zhuzhao 侧排期与实现参考。
+本设计引出的 zhuzhao 侧工作项已**拆出独立文档**：[zhuzhao-integration.md](../../design/zhuzhao-integration.md)（动作注册表与内网端点、动作清单校验端点、任务管理功能、部门可见性策略及其存储、任务提交日志、后置的通知接收端点，含交互总览与回调契约摘要）。设计与排期以 zhuzhao 仓库为 SSOT，该文档供 zhuzhao 侧排期与实现参考。
 
 ## 12. 状态与变更记录
 
@@ -381,7 +385,7 @@ cron/reclaim以单tick为捕获边界，panic记组件与堆栈Error并回到循
 | 2026-09-03 | 设计增补（模型与治理）：§4 三层模型（动作 action / 任务定义 job / 执行实例 run），job 管理定稿「存 taskrunner DB + API 管理」（关闭「配置文件 vs API」待定项）；角色分工澄清——发起 / 下发 cron / 查日志由 zhuzhao 发起，调度·触发·重试·记录归 taskrunner，zhuzhao 在执行环节仅被动接收回调；审计透传（`actor` 工号 / `source_ip`）与归属标签过滤（`dept`，部门可见性策略存 zhuzhao 侧）；§5 调用方身份（per-caller credential + slog 归因，`created_by` / `owner_service` 字段）；§8 部署形态补独立 DB 与 zhuzhao-utils 依赖；M4 定稿 asynqmon 以库嵌入 `/monitor`（read-only 起步） |
 | 2026-09-03 | 补充 §11 zhuzhao 侧配套清单（动作注册表与内网端点、动作清单校验端点、任务管理功能、部门可见性策略及其在 zhuzhao DB 的存储、任务提交日志、后置的通知接收端点），防跨仓库工作项遗漏 |
 | 2026-09-03 | 全文整理：修正 ADR-002 注记章节引用（§6→§8）；统一 `created_by` / `owner_service` 字段口径；对齐「结果归属」与「结果获取模型」表述；M3 去除 `job_config` 旧术语；M1/M2 补触发方式与透传字段；待细化项集中至 §10 ⚠️；变更记录按主题合并 |
-| 2026-09-03 | 环境决策与配套拆分：确认无日志平台（过程日志先落文件，§6 入档 ES 演进路径——slog JSON Lines，shipper 采集零改应用，字段稳定命名自 M1 约束）；部署形态定 **Docker**（单容器单进程、卷挂载 SQLite/日志、SQLite 单写者 → 单副本约束入档）；zhuzhao 侧配套需求拆出独立文档 [zhuzhao-integration.md](./zhuzhao-integration.md)，§11 改为链接；M4 补 `asynq.Retention` 留观口径 |
+| 2026-09-03 | 环境决策与配套拆分：确认无日志平台（过程日志先落文件，§6 入档 ES 演进路径——slog JSON Lines，shipper 采集零改应用，字段稳定命名自 M1 约束）；部署形态定 **Docker**（单容器单进程、卷挂载 SQLite/日志、SQLite 单写者 → 单副本约束入档）；zhuzhao 侧配套需求拆出独立文档 [zhuzhao-integration.md](../../design/zhuzhao-integration.md)，§11 改为链接；M4 补 `asynq.Retention` 留观口径 |
 | 2026-09-03 | M1 完成（feat/m1-runtime）：核心运行时落地——Asynq worker + 回调客户端（2xx/4xx/5xx·超时判定）+ job_runs SQLite（WAL）+ healthz + enqueue CLI + Dockerfile；端到端冒烟通过（成功 / 4xx 死信 / 幂等重提）；实现中修正：store 自动建目录、先入队后落库防孤儿行 |
 | 2026-09-03 | M2 完成（feat/m2-api）：HTTP API v1 全量落地——gin + utils `errcode`/`response` 统一响应；静态 Bearer 鉴权（未设 token 拒绝启动）；提交 / 查询（runs 条件分页 + live_state）/ jobs CRUD（dept 过滤、cron 校验）/ trigger / cancel / retry / 死信列表；`cronloop` 分钟级 tick 触发 cron 定义（§10 定案入档）；job_runs 增 `job_id` 列关联任务定义；API 层选型：token 取消用 asynq Scheduler 改自研 tick（静态 payload 限制）；单测 19 个 + 真 Redis 端到端冒烟（含 cron 到点自动触发、停用即不触发）|
 | 2026-09-04 | 代码评审修复（fix/idempotency-and-cancel-race）：**提交幂等扩为终身**——原仅靠 Asynq TaskID 冲突（succeeded 后 ID 释放，同 task_id 重提会重复执行并覆盖历史），Submit 入口先查 job_runs、行存在即幂等拒绝；**cancel 竞态三道防护**——删队列前 GetTaskInfo 查 active、DeleteTask 报 active 映射 409、MarkCanceled 改条件更新（WHERE status=pending）|

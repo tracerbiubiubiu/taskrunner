@@ -5,7 +5,7 @@
 ## 调用与数据归属
 
 ```mermaid
-flowchart LR
+flowchart TD
   Z[zhuzhao 网关] -->|签名 HTTP 提交/查询| A[taskrunner API]
   A -->|先记录受理事实| D[(job_runs / jobs)]
   A --> Q[(Redis / Asynq)]

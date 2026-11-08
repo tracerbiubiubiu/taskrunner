@@ -11,17 +11,33 @@
 
 ## 恢复步骤（pg_dump → 全量恢复）
 
+先确认本次恢复目标的 Compose 项目、`.env` 和数据库归属，保留原卷及恢复前备份。以下从仓库根 `cd deploy` 后执行，目标是该项目的 PG；不同环境使用自己已确认的项目参数。每一步成功后再进入下一步，不能在恢复命令失败后继续开写。
+
 ```sh
-# 均在 deploy/ 目录执行
-# 1. 停写（缩容或停 taskrunner 服务）
-docker compose stop taskrunner
-# 2. 恢复（dump → 库；--clean删除dump中对象后重建）
-docker compose exec -T postgres pg_restore -U taskrunner -d taskrunner --clean --if-exists < ../<备份文件>.dump
-#    备份文件从 backups 卷取出：
-docker run --rm -v taskrunner_backups:/backups -v "$PWD":/out alpine cp /backups/tr-<日期>.dump /out/
-# 3. 重启
+cd deploy
+# 1. 先查看已完成备份，再将实际文件复制到本机忽略目录；不要选 .part 临时文件
+docker compose exec -T pgbackup sh -c 'ls -lh /backups/tr-*.dump'
+backup_file=tr-YYYYMMDD.dump  # 替换为上一步已确认的实际文件名
+restore_dir="$PWD/../.codex/restore-check"
+mkdir -p "$restore_dir"
+docker compose cp "pgbackup:/backups/$backup_file" "$restore_dir/$backup_file"
+test -s "$restore_dir/$backup_file"
+docker compose exec -T postgres pg_restore --list < "$restore_dir/$backup_file" \
+  > "$restore_dir/$backup_file.list"
+
+# 2. 核对对象清单/备份日期；确认该目标可恢复后停全部writer与备份循环
+docker compose stop taskrunner pgbackup
+# --clean只重建dump内对象；恢复目标仍须核对无不应保留的额外对象
+docker compose exec -T postgres pg_restore -U taskrunner -d taskrunner \
+  --clean --if-exists --no-owner --exit-on-error < "$restore_dir/$backup_file"
+
+# 3. 恢复无错后再启服务，查看就绪及任务/定义计数，随后恢复备份循环
 docker compose start taskrunner
+docker compose exec -T taskrunner wget -qO- http://127.0.0.1:18080/readyz
+docker compose start pgbackup
 ```
+
+`compose cp` 从实际项目的 pgbackup 服务取出 `/backups` 文件，无需猜宿主目录或 `taskrunner_backups` 卷名。`pg_restore --list` 仅验证归档可解析并提供对象清单，不能代替恢复后数据抽验。恢复执行史不等于回滚外部业务动作；恢复旧库后仍按上文 DB/Redis 状态边界对账，避免盲目重放。
 
 
 文档迁移不改变命令工作目录、compose项目名或卷名。恢复前核对实际项目的卷路径，停写并保留原卷；同时备份新增execution_id列。升级/回滚耦合见 [部署](deployment.md)。

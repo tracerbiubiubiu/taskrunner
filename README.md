@@ -64,5 +64,31 @@ CI（GitHub Actions）：push/PR 全触发——vet + gofmt + 单测（race）+ 
 - 2026-09-17：**ADR-004 落地（feat/outbox-reclaim，PR #1）**——提交改 DB-first（job_runs 兼任 Outbox：queued 标志 + Reclaim 三域扫描器 + worker 终态守卫 + 取消降级），取代「先入队后落库」取舍；单测 + race + PG 集成 + E2E（`scripts/e2e/e2e.sh`，19 断言含 cron）全绿；
 - 2026-09-29（P4 随批三件）：**W0b 四口同收对齐**（zhuzhao 出站不再拼接/预检 callback_url——提交链三处契约断裂修复，提交恒 400 根治）；**ListRuns 加 submitted_by 过滤**（「只看我提交的」，zhuzhao 代理把 me 换 actor）；**P4-2 死信终败通知**（notify 包：TASKRUNNER_NOTIFY_* env，死信→zhuzhao /internal/notify/dead-letter→webhook，异步尽力而为）。cron 收归注意：zhuzhao 侧 audit_archive 已可进程内调度（advisory lock）——启用则停本仓 audit_archive cron job 防双跑（zhuzhao deployments/CRON-MIGRATION.md）。
 - 2026-10-29：**能力目录提入 phase6**（所有者三拍板：动作路由目录 / 全量三步同批 / utils 执行端 SDK 同批——≈3–4 天，排期随 zhuzhao phase6 启动批圈定；SSOT=[docs/taskrunner.md](./docs/taskrunner.md) §4 / §12）；
-- 2026-11-02：四仓同类审计——本仓 **3 个 P2 原始登记**（死信列表对 asynq `ErrQueueNotFound` 直返 500[全新部署/清库后必现，2026-11-05 ECO-20261104-B07-F04 经前端真实门禁确认为功能 P1 并修复，返回 200 空数组] / cron·reclaim·notifier 三后台 goroutine 无 recover[panic=整进程崩，2026-11-06 ECO-B07-F08加单轮/单通知捕获并保留Error堆栈，后续tick/通知继续] / worker回调panic后 job_runs卡running且不在reclaim三域[2026-11-06 ECO-B07-F09在回调边界转普通可重试错误，遵既有failed/dead与execution fence；数据库持续失败等running残余不在此扩大承诺]）；提交规范与机械门禁遵 zhuzhao `docs/standards.md` §12-9（主题行 ≤50 字 + 三节正文），随兄弟仓对齐批落地；
+- 2026-11-02：四仓同类审计——本仓 **3 个 P2 原始登记**（死信列表对 asynq `ErrQueueNotFound` 直返 500[全新部署/清库后必现，2026-11-05 ECO-20261104-B07-F04 经前端真实门禁确认为功能 P1 并修复，返回 200 空数组] / cron·reclaim·notifier 三后台 goroutine 无 recover[panic=整进程崩，2026-11-06 ECO-B07-F08加单轮/单通知捕获并保留Error堆栈，后续tick/通知继续] / worker回调panic后 job_runs卡running且不在reclaim三域[2026-11-06 ECO-B07-F09在回调边界转普通可重试错误，遵既有failed/dead与execution fence；数据库持续失败等running残余不在此扩大承诺]）；提交规范与机械门禁遵 zhuzhao `docs/standards.md` §12-9（主题行 ≤50 字 + 三节正文），已随 RR-GIT-01 对齐，见下文「提交规范」；
 - 状态：M1/M2/C7/ADR-004 已落地；**P4 期随批三件已交付**（Phase 4 于 2026-09-29 收官）；下一步 = M3 部署联调（dev 三栈已由 zhuzhao `scripts/dev-stack.sh` 编排、compose 在位，生产形态随 zhuzhao 合 main 节奏）；工作区状态见 git status。
+
+## 提交规范
+
+遵 zhuzhao `docs/standards.md` §12-9 / §12-10；关联主仓复核报告
+`deliverables/software-company/zhuzhao-report-followup-2026-11-08.md` 的 **RR-GIT-01**（2026-11-08）。
+本仓脚本与主仓同源、自包含，仅依赖 Git + Python 3 标准库，不依赖主仓目录或新增 Go/npm 包。
+主题为 `type(scope): 摘要`（scope 可省略），摘要去前缀后最多 50 个 Unicode 字符、不得以句号结尾；
+主题与正文间须空行，正文不得为空或只有空白。所有新 merge 提交也须显式提供规范主题与正文。
+修复正文仍按公约填写「改动摘要 / 影响面 / 验证证据」与同类扫描，硬检查①–⑤不替代人工验证证据。
+
+```sh
+make hooks              # 新 clone / 新工作树开工时安装
+make commit-lint        # origin/当前分支..HEAD；初推无同名远端时从启用基线检查
+make test-commit-lint    # 临时独立仓库黑盒反例，不触碰业务栈
+# 显式历史审计（完整 SHA；不豁免历史）
+python3 scripts/commit-policy.py range --before <完整SHA> --after <完整SHA> --strict
+```
+
+`make hooks` 启用 Git 的 worktree 配置，仅在当前工作树设置相对 `.githooks`；common
+`core.hooksPath` 保留，尚未承接本批的 main/其它工作树不被改装。保留在途显影与跨主题纯重题
+amend 保护，`commit-msg` 先挡消息违规，`pre-push` 按 Git 提供的每个 ref 新旧 SHA 检查完整窗口。
+`GIT_INDEX_FILE` 保持原值，兼容显式 pathspec 提交，不暂存或重写其它会话文件。
+
+固定启用基线见 `scripts/commit-policy-baseline`：仅其祖先为已推送存量，不改史、不自动前移。
+CI push 使用事件 before/after，PR 使用真实 base/head SHA，初推与 force push 均有覆盖；
+缺对象精确获取仍失败、非法 SHA 或浅克隆一律拒绝，不回退近 20 笔。现有代码测试 CI 保持。

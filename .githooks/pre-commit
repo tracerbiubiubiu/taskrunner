@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# §12-10 机械守卫①（2026-10-28 立——1418f33 索引互扫实证）：提交时刻「在途可见」。
+# 共享工作树多会话并行时，本笔之外的未暂存/未跟踪文件=潜在他会在途——提交前
+# 显影（软信号不阻断）；宽面提交（>15 文件）加提示。铁律提醒：提交只带本批路径，
+# 禁 add -A（standards §12-10）；本钩子不替代 `git show --stat` 回核。
+
+staged_n=$(git diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+[ "$staged_n" -eq 0 ] && exit 0
+
+# 在途 = staged 之外的工作区痕迹（未暂存修改 / 未跟踪）
+inflight=$(git status --porcelain | awk '{x=substr($0,1,1); y=substr($0,2,1)} x=="?" || (x==" " && y!=" ") {print substr($0,4)}')
+if [ -n "$inflight" ]; then
+  n=$(printf '%s\n' "$inflight" | wc -l | tr -d ' ')
+  echo "⚠️  [pre-commit] 本笔之外工作区还有 $n 个在途文件（可能是并行会话所出，勿 add -A 卷入）：" >&2
+  printf '%s\n' "$inflight" | head -10 | sed 's/^/     /' >&2
+  [ "$n" -gt 10 ] && echo "     …（共 $n 个）" >&2
+fi
+if [ "$staged_n" -gt 15 ]; then
+  echo "⚠️  [pre-commit] 宽面提交（$staged_n 文件）——核对 staged 清单确属本批：git diff --cached --stat" >&2
+fi
+exit 0

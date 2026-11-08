@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# §12-10 机械守卫②（2026-10-28 立——dcf005c amend 吞并实证）：跨主题纯重题 amend 拦截。
+# 纯重题（暂存树==HEAD 树、仅换消息）且新旧主题的 type(scope) 前缀不同 → 大概率
+# 在重题并行会话的提交 → 阻断。确属自己改错主题域：ZCODE_ALLOW_RETITLE=1 放行。
+
+msgfile="$1"
+# 先校验所有拟提交消息，不能被下方非重题早退绕过。
+root=$(git rev-parse --show-toplevel) || exit 1
+root=$(CDPATH= cd -- "$root" && pwd -P) || exit 1
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+case "$hook_dir/" in "$root/"*) external_hook=0 ;; *) external_hook=1 ;; esac
+if [ -f "$root/scripts/commit-policy.py" ]; then
+  # 仓库约定-F路径提交，字面Markdown正文不得被当作编辑器注释剥掉。
+  python3 "$root/scripts/commit-policy.py" message "$msgfile" --raw || exit 1
+elif [ "$external_hook" -eq 1 ] &&
+     [ ! -e "$root/scripts/commit-policy-baseline" ] &&
+     [ -f "$hook_dir/../scripts/commit-policy.py" ]; then
+  # 尚未承接的新main可能沿用主仓绝对钩子；保留旧守卫，不隐式改main。
+  echo "[WARN] inherited external hooks: this worktree has not adopted commit-policy" >&2
+else
+  echo "[FAIL] local commit-policy is missing; restore repository tooling" >&2
+  exit 1
+fi
+git diff --cached --quiet HEAD 2>/dev/null || exit 0   # 有内容变更=非纯重题，放行
+[ -n "$ZCODE_ALLOW_RETITLE" ] && exit 0
+
+old=$(git log -1 --format='%s' HEAD 2>/dev/null)
+new=$(head -n 1 "$msgfile")
+[ -z "$old" ] && exit 0
+
+scope_of() {
+  printf '%s' "$1" | sed -n 's/^\([a-z][a-z]*\)(\([^)]*\)).*/\1(\2)/p'
+}
+olds=$(scope_of "$old"); news=$(scope_of "$new")
+[ -z "$olds" ] && olds=$(printf '%s' "$old" | cut -d: -f1)
+[ -z "$news" ] && news=$(printf '%s' "$new" | cut -d: -f1)
+
+if [ -n "$olds" ] && [ "$olds" != "$news" ]; then
+  echo "❌ [commit-msg] 纯重题 amend 但主题域变了（${olds} → ${news}）。" >&2
+  echo "   HEAD 很可能是并行会话的提交——amend 会吞掉它（dcf005c 事故同型）。" >&2
+  echo "   先核对：git log --format='%h %ad %s' -1 是否本会话末笔。" >&2
+  echo "   确属自己改错主题域：ZCODE_ALLOW_RETITLE=1 git commit --amend ..." >&2
+  exit 1
+fi
+exit 0

@@ -10,6 +10,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  commit-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Commit policy negative checks
+        run: make test-commit-lint
+      - name: Exact push or PR commit window
+        run: python3 scripts/commit-policy.py ci --fetch-missing
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15 # testcontainers/PG 挂起时兜底（默认 6h）

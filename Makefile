@@ -1,4 +1,4 @@
-.PHONY: hooks commit-lint test-commit-lint lint test build
+.PHONY: hooks commit-lint test-commit-lint lint test build e2e
 
 lint:
 	go vet ./...

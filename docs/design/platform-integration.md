@@ -74,3 +74,7 @@ R03 在 P8 开工前给“复用外部/成熟组件/最小补建/退出”结论
 ## 按任务配置错失策略（同日问答候选）
 
 创建/编辑计划选择skip、coalesce_latest或catch_up_bounded，不能所有任务固定补一次。正常轮询迟到由grace区分；回补年龄/总量、每批数量、并发/速率和超限余项分别有界。逐时隙回补传原scheduled_for/业务时区/数据区间及明确生效参数版本；无历史数据不冒充补旧日报。仅补未物化时隙，已有failed/unknown走原ID重试/对账；策略/停启切换有barrier与旧时隙映射，不因加revision重复效果。详细权威见主仓[跨仓合同](../../../zhuzhao/docs/design/cross-repo-execution-contract.md)C03。owner提出按任务配置方向，具体默认/预算仍候选；未改API/schema/调度源码。
+
+按任务恢复的详细字段、模板默认、episode/水位、队列时效、预算、预览/迁移与验收统一见[调度恢复详设](../../../zhuzhao/docs/design/schedule-recovery-policy.md)。当前Job/API/loop没有这些字段或保证；描述/参数编辑重算next_run、Next零值校验等现态残留在C03同批核验，不用设计文字冒充修复。
+
+交付分界：C03/P6.0先稳定时隙/receipt和三策略合同/参考；I03/P7才交完整恢复执行、准入/时效/预算/preview/控制台与联合真实验收。owner已确认逐次补齐超限暂停并保留余项，模板数值仍候选；不能以C03样例通过宣布三策略已生效。

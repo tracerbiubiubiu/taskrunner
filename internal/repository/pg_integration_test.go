@@ -54,10 +54,10 @@ func TestPGFullLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := s.MarkRunning(ctx, "pg-1", 1, now.Add(time.Second)); err != nil {
+	if err := s.MarkRunning(ctx, "pg-1", 1, now.Add(time.Second), "fixture-delivery"); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
-	if err := s.Finish(ctx, "pg-1", StatusSucceeded, "", 1, now.Add(time.Second), now.Add(3*time.Second)); err != nil {
+	if err := s.Finish(ctx, "pg-1", StatusSucceeded, "", 1, now.Add(time.Second), now.Add(3*time.Second), "fixture-delivery"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	got, err := s.GetByTaskID(ctx, "pg-1")
@@ -152,17 +152,17 @@ func TestPGFinishPredicateRejectsStaleWriter(t *testing.T) {
 		}
 	}
 	must(s.InsertPending(ctx, Run{TaskID: id, RequestID: "r", Action: "a", EnqueuedAt: now}), "insert")
-	must(s.MarkRunning(ctx, id, 1, now), "mark running 1")
-	must(s.MarkRunning(ctx, id, 2, now), "mark running 2（模拟重投递的新执行推进 attempts）")
+	must(s.MarkRunning(ctx, id, 1, now, "fixture-delivery"), "mark running 1")
+	must(s.MarkRunning(ctx, id, 2, now, "fixture-delivery"), "mark running 2（模拟重投递的新执行推进 attempts）")
 
 	// 过期写者（attempt=1）：等值谓词拒绝
-	if err := s.Finish(ctx, id, StatusSucceeded, "stale", 1, now, now); err == nil {
+	if err := s.Finish(ctx, id, StatusSucceeded, "stale", 1, now, now, "fixture-delivery"); err == nil {
 		t.Fatal("过期 attempt 的 Finish 应被拒绝")
 	}
 	// 新执行终态（attempt=2）正常落库
-	must(s.Finish(ctx, id, StatusSucceeded, "", 2, now, now), "finish attempt 2")
+	must(s.Finish(ctx, id, StatusSucceeded, "", 2, now, now, "fixture-delivery"), "finish attempt 2")
 	// 终态后再次 Finish 亦被拒（status 已非 running）
-	if err := s.Finish(ctx, id, StatusFailed, "late", 2, now, now); err == nil {
+	if err := s.Finish(ctx, id, StatusFailed, "late", 2, now, now, "fixture-delivery"); err == nil {
 		t.Fatal("终态后的重复 Finish 应被拒绝")
 	}
 }
@@ -183,12 +183,12 @@ func TestPGMarkRunningRejectsSucceededResurrection(t *testing.T) {
 		}
 	}
 	must(s.InsertPending(ctx, Run{TaskID: id, RequestID: "r", Action: "a", EnqueuedAt: now}), "insert")
-	must(s.MarkRunning(ctx, id, 1, now), "mark running")
-	must(s.Finish(ctx, id, StatusSucceeded, "", 1, now, now), "finish succeeded")
+	must(s.MarkRunning(ctx, id, 1, now, "fixture-delivery"), "mark running")
+	must(s.Finish(ctx, id, StatusSucceeded, "", 1, now, now, "fixture-delivery"), "finish succeeded")
 
 	// succeeded 行不可被 MarkRunning 复活（failed→running 为重试周期正常路径，
 	// 由 asynq 重投递驱动；手动 RetryTask 走 ResetPendingIfTerminal 先归 pending）
-	if err := s.MarkRunning(ctx, id, 2, now); err == nil {
+	if err := s.MarkRunning(ctx, id, 2, now, "fixture-delivery"); err == nil {
 		t.Fatal("succeeded 行被 MarkRunning 复活——C6 防线失效")
 	}
 	got, err := s.GetByTaskID(ctx, id)
@@ -252,7 +252,7 @@ func TestPGReclaimColumnsAndQueries(t *testing.T) {
 	}
 
 	// MarkRunning 分类（F59）：canceled 复活 → ErrTerminalRejected
-	if err := s.MarkRunning(ctx, "pg-rq2", 1, now); !errors.Is(err, ErrTerminalRejected) {
+	if err := s.MarkRunning(ctx, "pg-rq2", 1, now, "fixture-delivery"); !errors.Is(err, ErrTerminalRejected) {
 		t.Fatalf("want ErrTerminalRejected, got %v", err)
 	}
 }

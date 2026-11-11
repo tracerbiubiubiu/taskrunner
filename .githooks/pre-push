@@ -1,0 +1,18 @@
+#!/bin/sh
+# Git stdin给出每个ref的准确旧/新OID；初推、force push亦检查新增窗口。
+set -eu
+root=$(git rev-parse --show-toplevel)
+root=$(CDPATH= cd -- "$root" && pwd -P)
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+case "$hook_dir/" in "$root/"*) external_hook=0 ;; *) external_hook=1 ;; esac
+if [ -f "$root/scripts/commit-policy.py" ]; then
+    exec python3 "$root/scripts/commit-policy.py" pre-push "$@"
+fi
+if [ "$external_hook" -eq 1 ] &&
+   [ ! -e "$root/scripts/commit-policy-baseline" ] &&
+   [ -f "$hook_dir/../scripts/commit-policy.py" ]; then
+    echo "[WARN] inherited external hooks: this worktree has not adopted commit-policy" >&2
+    exit 0
+fi
+echo "[FAIL] local commit-policy is missing; restore repository tooling" >&2
+exit 1

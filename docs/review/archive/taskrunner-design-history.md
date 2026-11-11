@@ -1,7 +1,11 @@
+# taskrunner 原设计与实施历史
+
+> 整理基准：2026-11-08。以下为迁移前原设计快照，包含已被 W0b 固定回调覆盖的“用户指定 URL”、旧部门隔离设想及未实现 monitor 等。当前行为见 [运行设计](../../design/taskrunner.md)、[HTTP 契约](../../api/contract.md)；能力目录见 [已批准未实施方案](../../design/capability-registry.md)。原批号、失败与评审结论保留，不按历史待办重新立项。
+
 # taskrunner — 事件/任务总线（异步触发预置动作）
 
 > 独立仓库、独立部署、独立 Redis、独立 DB。zhuzhao 的「异步执行侧」：zhuzhao 只作网关（鉴权/编排/业务审计），taskrunner 负责可靠调度、触发与执行回调，并提供内部 HTTP API（提交任务 / 查询执行记录 / 死信管理）。
-> 设计 SSOT = 本文档；决策依据 = [ADR-002](./ADR-002-asynq-async-task-executor.md)（快照，zhuzhao 侧为 SSOT）。
+> 设计 SSOT = 本文档；决策依据 = [ADR-002](../../adr/adr-002-asynq-async-task-executor.md)（快照，zhuzhao 侧为 SSOT）。
 > 2026-09-03 收敛 + 形态定稿；同日增补定稿：提交方式（调 API）、任务三层模型与定义 API 管理、HTTP API v1（含 jobs 组与结果查询语义）、job_runs 落库与两路日志分工、审计透传与归属过滤、asynqmon 库嵌入、实施计划 M1–M4、zhuzhao 侧配套清单。
 
 ---
@@ -192,7 +196,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | `POST /v1/jobs/trigger`（原 `POST /v1/jobs/{id}/trigger`） | 手动执行一次：body 带 job_id（按定义提交任务，前端「立即执行」按钮） |
 | `POST /v1/tasks/cancel`（原 `POST /v1/tasks/{id}/cancel`） | 取消未开始的任务：body 带 task_id |
 | `POST /v1/tasks/retry`（原 `POST /v1/tasks/{id}/retry`） | 重试失败/死信任务：body 带 task_id |
-| `GET /v1/dead-letters` | 死信列表（配合 Asynq Inspector 重放，死信处理闭环） |
+| `GET /v1/dead-letters` | 死信列表（配合 Asynq Inspector 重放，死信处理闭环）；未创建队列/已有空队列均 200 + `list: []`，其他 Redis 故障保持 500 |
 | `GET /healthz` | 健康检查（存活） |
 | `GET /readyz` | 就绪探针（检 Redis ping + DB 按所选驱动探活——SQLite/PG 双驱动，C7） |
 
@@ -204,12 +208,18 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 ### 执行模型（2026-09-07 补充）
 
+> 2026-11-06 ECO-B07-F05：Asynq停机预算到期重排任务时不增加retry count，因此旧的“status/attempts即可拒绝所有过期写者”断言不成立。worker每次delivery生成新的`execution_id`，MarkRunning原子写入，三种终态路径Finish均须匹配该身份；较旧attempt也不能重新索取较新执行权。手动retry允许计数重启，但新delivery身份不重用。过期终态写入被拒后不发死信通知。此栅栏保护本库执行状态，不将at-least-once回调改成exactly-once；动作属主仍负责幂等。既有MarkRunning缺行/DB故障时“继续回调并留日志”的受容边界维持，无法据此保证跨DB/HTTP原子。
+
 - **worker = 固定大小协程池**（asynq `Concurrency`，默认 10）：每取到一个任务，池内一个协程**同步**执行 handler（组装回调 → HTTP POST，受回调超时约束——协程占用时长有界）；并发上限即池大小，超出自然积压在 Redis 队列（`/monitor` 可见）；
 - **重试不是自循环**：handler 返回错误 → asynq 按退避策略把任务延迟重投递（`ProcessIn`），到期由池内任意协程再取——重试与首次是同一条消费路径；
 - **崩溃不丢**：执行中任务有租约（lease），协程存活即自动续期；进程挂 → 租约到期自动重新投递（at-least-once 的机制来源，也是回调幂等义务的来源）；
 - **多副本**：队列消费天然安全（多实例共享 Redis 队列、原子弹出，一条任务只被一个实例取走）；**cronloop tick 每实例独立跑——多副本部署前必须给 fireDue 加分布式锁**（Redis SETNX 即可），是 PG 解除单副本约束后的配套项，随多副本部署落地。
 - **提交路径 DB-first（ADR-004，2026-09-17）**：Submit = 查重 → job_runs 落库（queued=0 + 载荷快照）→ 入队；行即事实源（SSOT），Redis 任务是可重建投影。配套 **ReclaimLoop 三域扫描器**（自动修复 queued=0+pending / 告警 pending+queued=1 / 清理 canceled+queued=0，config `reclaim.*`）与 **worker 终态守卫**（终态行被投递 → 不回调 + SkipRetry）。运行时边界口径见 §10。
 - **取消语义（ADR-004，2026-09-17）**：`queued=0` 行（未交付/交付未知）遇 Redis 可用性错误**降级取消**——照常标 canceled，Redis 键收尾交第三域探针；`queued=1` 行取消仍需 Redis 配合。留观中的 completed / archived 命中 → 409（保「已执行」告警指纹，需人工介入）。
+
+### 异常隔离（2026-11-06，ECO-B07-F08/F09）
+
+cron/reclaim以单tick为捕获边界，panic记组件与堆栈Error并回到循环，下一tick仍扫描，ctx取消仍正常停止；不是recover后退出后台循环。死信notifier按单个异步通知捕获并记task_id/堆栈，保持尽力而为、不新增重试队列，后续通知独立继续。业务回调panic在worker回调边界转普通可重试错误，走现有failed→重试/最终dead和execution_id终态栅栏，过期delivery不覆盖新执行、不发死信通知。此边界不宣称恢复进程致命错误、回调外任意程序故障或数据库持续写失败；后者仍按既存running空洞留日志/对账。
 
 ## 6. job_runs 存储与日志分工（2026-09-03 定稿）
 
@@ -352,18 +362,18 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 
 | 文档 | 位置 | 关系 |
 |---|---|---|
-| [ADR-002](./ADR-002-asynq-async-task-executor.md) | 本仓库 docs/（快照） | Asynq 执行器决策，zhuzhao 侧为 SSOT |
+| [ADR-002](../../adr/adr-002-asynq-async-task-executor.md) | 本仓库 docs/（快照） | Asynq 执行器决策，zhuzhao 侧为 SSOT |
 | [zhuzhao-utils](https://github.com/tracerbiubiubiu/zhuzhao-utils) | 独立仓库 | 通用工具库（logger / postgres / errcode+response），非反向依赖 |
 | zhuzhao `docs/adr/ADR-001-event-mechanism-l1-steady-state.md` | zhuzhao 仓库 | L1 事件源（taskrunner 不替代） |
 | zhuzhao `docs/phase3/13-implementation-plan.md` | zhuzhao 仓库 | 排期 SSOT（M-E 行 + 部署注记） |
 | zhuzhao `docs/phase3/14-planning-overview.md` | zhuzhao 仓库 | 规划视图 |
 | zhuzhao `docs/phase3/15-script-platform-dagu-vs-inhouse.md` | zhuzhao 仓库 | 脚本任务选型调研（🚦 按需再启参考） |
 | zhuzhao `docs/phase3/03-audit-l2.md` | zhuzhao 仓库 | 审计归档（B11②）设计 |
-| [zhuzhao-integration.md](./zhuzhao-integration.md) | 本仓库 docs/ | **zhuzhao 侧配套需求清单**（六项展开 + 契约摘要，见下） |
+| [zhuzhao-integration.md](../../design/zhuzhao-integration.md) | 本仓库 docs/ | **zhuzhao 侧配套需求清单**（六项展开 + 契约摘要，见下） |
 
 ### zhuzhao 侧配套需求（跨仓库依赖，勿遗漏）
 
-本设计引出的 zhuzhao 侧工作项已**拆出独立文档**：[zhuzhao-integration.md](./zhuzhao-integration.md)（动作注册表与内网端点、动作清单校验端点、任务管理功能、部门可见性策略及其存储、任务提交日志、后置的通知接收端点，含交互总览与回调契约摘要）。设计与排期以 zhuzhao 仓库为 SSOT，该文档供 zhuzhao 侧排期与实现参考。
+本设计引出的 zhuzhao 侧工作项已**拆出独立文档**：[zhuzhao-integration.md](../../design/zhuzhao-integration.md)（动作注册表与内网端点、动作清单校验端点、任务管理功能、部门可见性策略及其存储、任务提交日志、后置的通知接收端点，含交互总览与回调契约摘要）。设计与排期以 zhuzhao 仓库为 SSOT，该文档供 zhuzhao 侧排期与实现参考。
 
 ## 12. 状态与变更记录
 
@@ -375,7 +385,7 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-03 | 设计增补（模型与治理）：§4 三层模型（动作 action / 任务定义 job / 执行实例 run），job 管理定稿「存 taskrunner DB + API 管理」（关闭「配置文件 vs API」待定项）；角色分工澄清——发起 / 下发 cron / 查日志由 zhuzhao 发起，调度·触发·重试·记录归 taskrunner，zhuzhao 在执行环节仅被动接收回调；审计透传（`actor` 工号 / `source_ip`）与归属标签过滤（`dept`，部门可见性策略存 zhuzhao 侧）；§5 调用方身份（per-caller credential + slog 归因，`created_by` / `owner_service` 字段）；§8 部署形态补独立 DB 与 zhuzhao-utils 依赖；M4 定稿 asynqmon 以库嵌入 `/monitor`（read-only 起步） |
 | 2026-09-03 | 补充 §11 zhuzhao 侧配套清单（动作注册表与内网端点、动作清单校验端点、任务管理功能、部门可见性策略及其在 zhuzhao DB 的存储、任务提交日志、后置的通知接收端点），防跨仓库工作项遗漏 |
 | 2026-09-03 | 全文整理：修正 ADR-002 注记章节引用（§6→§8）；统一 `created_by` / `owner_service` 字段口径；对齐「结果归属」与「结果获取模型」表述；M3 去除 `job_config` 旧术语；M1/M2 补触发方式与透传字段；待细化项集中至 §10 ⚠️；变更记录按主题合并 |
-| 2026-09-03 | 环境决策与配套拆分：确认无日志平台（过程日志先落文件，§6 入档 ES 演进路径——slog JSON Lines，shipper 采集零改应用，字段稳定命名自 M1 约束）；部署形态定 **Docker**（单容器单进程、卷挂载 SQLite/日志、SQLite 单写者 → 单副本约束入档）；zhuzhao 侧配套需求拆出独立文档 [zhuzhao-integration.md](./zhuzhao-integration.md)，§11 改为链接；M4 补 `asynq.Retention` 留观口径 |
+| 2026-09-03 | 环境决策与配套拆分：确认无日志平台（过程日志先落文件，§6 入档 ES 演进路径——slog JSON Lines，shipper 采集零改应用，字段稳定命名自 M1 约束）；部署形态定 **Docker**（单容器单进程、卷挂载 SQLite/日志、SQLite 单写者 → 单副本约束入档）；zhuzhao 侧配套需求拆出独立文档 [zhuzhao-integration.md](../../design/zhuzhao-integration.md)，§11 改为链接；M4 补 `asynq.Retention` 留观口径 |
 | 2026-09-03 | M1 完成（feat/m1-runtime）：核心运行时落地——Asynq worker + 回调客户端（2xx/4xx/5xx·超时判定）+ job_runs SQLite（WAL）+ healthz + enqueue CLI + Dockerfile；端到端冒烟通过（成功 / 4xx 死信 / 幂等重提）；实现中修正：store 自动建目录、先入队后落库防孤儿行 |
 | 2026-09-03 | M2 完成（feat/m2-api）：HTTP API v1 全量落地——gin + utils `errcode`/`response` 统一响应；静态 Bearer 鉴权（未设 token 拒绝启动）；提交 / 查询（runs 条件分页 + live_state）/ jobs CRUD（dept 过滤、cron 校验）/ trigger / cancel / retry / 死信列表；`cronloop` 分钟级 tick 触发 cron 定义（§10 定案入档）；job_runs 增 `job_id` 列关联任务定义；API 层选型：token 取消用 asynq Scheduler 改自研 tick（静态 payload 限制）；单测 19 个 + 真 Redis 端到端冒烟（含 cron 到点自动触发、停用即不触发）|
 | 2026-09-04 | 代码评审修复（fix/idempotency-and-cancel-race）：**提交幂等扩为终身**——原仅靠 Asynq TaskID 冲突（succeeded 后 ID 释放，同 task_id 重提会重复执行并覆盖历史），Submit 入口先查 job_runs、行存在即幂等拒绝；**cancel 竞态三道防护**——删队列前 GetTaskInfo 查 active、DeleteTask 报 active 映射 409、MarkCanceled 改条件更新（WHERE status=pending）|
@@ -415,3 +425,5 @@ taskrunner 形态 = **Asynq worker + 常驻 HTTP server**（同进程部署，�
 | 2026-09-16 | **服务间验签统一批（utils v0.4.0）**：自研 AKSKAuth（150 行：MaxBytesReader 读体+手工验签+authErrMsg 分档+credentialOf 归因）退役，/v1 组改挂 `aksk.GinMiddleware(&Verifier{Keys, Logger}, response.AKSKFail())`——失败响应统一信封+分档中文文案（码引 errcode 常量，原 10001 字面量消除），caller/operator 归因键由 GinMiddleware 验签后统一写入（AccessLog 提前读头退役，改 ctx 优先+头回退+system 兜底），失败现场落 Verifier.Logger 服务端日志；行为增强：无 Authorization 头请求在读体前即 401（不再读体）。middleware 单测适配（credentialOf/authErrMsg 用例随逻辑收编 utils，8MB 用例改带签名打 413）。验证：lint+全量单测绿 |
 | 2026-09-17 | **ADR-004 落地（feat/outbox-reclaim）：提交改 DB-first——job_runs 兼任 Outbox（queued 标志 + Reclaim 三域扫描器）**。**取代 2026-09-03「先入队后落库防孤儿行」决策**（该取舍的「执行但无记录」隐性窗口由本批结构性关闭：插行失败=500 干净，入队失败=行在可修）。① submit 三步（查重→落库 queued=0+载荷快照→入队；UNIQUE 竞提复查幂等 F23；条件标记 0 行补偿撤销 F19）；② ReclaimLoop 三域（自动修复 queued=0+pending / 告警 pending+queued=1 按 State 分流 / 清理 canceled+queued=0 探针出域；「已投未标记」集合、失败计数 tick 聚合、id 游标轮转；config `reclaim.tick/stale_after/batch/retention` 四键）；③ worker 终态守卫（终态行被投递 → 不回调 + SkipRetry——关闭取消残余与重复投递副作用面）；④ CancelTask：completed/archived 命中 409 保指纹（F35）、queued=0 行 Redis 宕机降级取消（F58）、消亡容忍集含 ErrQueueNotFound（F64）；⑤ 受理语义更新（§5）：入队失败 200=已受理待入队，warning 不回传响应体。实现偏差与游标改 id 的实测依据见 ADR-004「实现记录」。验证：build/vet/全量单测/race 绿；PG 集成用例补齐（DSN 门控） |
 | 2026-10-29 | **能力目录提入 phase6（所有者三拍板）**：①范围=动作路由目录（design-decisions §26.2 Form B 权限申报目录为同名另物，排除）；②全量三步同批（不拆半提入——步骤 2 解析切换不留在触发条件后）；③执行端 SDK 抽 zhuzhao-utils 同批不后置（单执行端虽可先落 zhuzhao 内部，按定稿字面打包）。实现触发条件三闸门随之关闭（§4 已注）；随实现批待拍两件：**命名对齐**（action/action_id/action_code 三口径收敛）+ **ActionMeta 目录化 a/b**（自注册报文携带元数据扩目录列 vs 元数据留各服务读面——定稿表结构早于 S4 ActionMeta[params_schema 动态表单依赖]，是本批最优先设计点）。zhuzhao 侧登记：phase6/07 号 §3.5 + roadmap P5-S4 注 + design-decisions S4 追加注级联 |
+| 2026-11-05 | ECO-20261104-B07-F04：11-02 原P2空队列500在前端全量门禁实证升为功能P1；仅 ErrQueueNotFound（含包装）映射200空数组，真实Redis故障不吞；签名HTTP回归覆盖缺队列/已有空队列/非空分页/故障分档。 |
+| 2026-11-06 | ECO-B07-F08/F09：对README 11-02两个既有P2债实证后最小修复，后台panic保下一tick/通知可继续，callback panic转现有失败/重试链并服从delivery fence；不改reclaim三域、幂等或队列语义。 |

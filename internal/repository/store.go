@@ -34,6 +34,10 @@ var ErrNotFound = errors.New("store: job_run not found")
 // ——重复投递或已取消任务被取走，消费端必须拦截副作用（不回调 + SkipRetry）。
 var ErrTerminalRejected = errors.New("store: terminal row rejects resurrection")
 
+// ErrDeliverySuperseded rejects a delivery which no longer owns job_runs.
+// Asynq retry count may be unchanged after shutdown requeue, so it is not a fence.
+var ErrDeliverySuperseded = errors.New("store: delivery superseded")
+
 // 存储驱动（C7）。
 const (
 	DriverSQLite = "sqlite"
@@ -85,6 +89,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	callback_url  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT 'pending',
 	attempts      INTEGER NOT NULL DEFAULT 0,
+	execution_id  TEXT NOT NULL DEFAULT '',
 	error         TEXT NOT NULL DEFAULT '',
 	duration_ms   INTEGER NOT NULL DEFAULT 0,
 	submitted_by  TEXT NOT NULL DEFAULT '',
@@ -186,6 +191,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
 	callback_url  TEXT NOT NULL DEFAULT '',
 	status        TEXT NOT NULL DEFAULT 'pending',
 	attempts      INTEGER NOT NULL DEFAULT 0,
+	execution_id  TEXT NOT NULL DEFAULT '',
 	error         TEXT NOT NULL DEFAULT '',
 	duration_ms   BIGINT NOT NULL DEFAULT 0,
 	submitted_by  TEXT NOT NULL DEFAULT '',
@@ -255,6 +261,9 @@ func migrateColumns(db *sql.DB, driver string) error {
 		// 事实正确；新行由 InsertPending 显式写 0。
 		{"job_runs", "queued", "ALTER TABLE job_runs ADD COLUMN queued INTEGER NOT NULL DEFAULT 1"},
 		{"job_runs", "enqueue_payload", "ALTER TABLE job_runs ADD COLUMN enqueue_payload TEXT NOT NULL DEFAULT ''"},
+		// Additive on both drivers. Empty legacy values are claimed by the first
+		// new delivery; mixed old writers cannot enforce this predicate.
+		{"job_runs", "execution_id", "ALTER TABLE job_runs ADD COLUMN execution_id TEXT NOT NULL DEFAULT ''"},
 	} {
 		rows, err := db.Query(existsQuery[driver], c.table, c.col)
 		if err != nil {
@@ -437,14 +446,18 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	return out, total, rows.Err()
 }
 
-// MarkRunning worker 取到任务时置 running 并记本次尝试序号与开始时间。
+// MarkRunning worker取任务时记尝试序号、开始时间与独立delivery身份。
+// executionID每次调用由worker重新生成，不能复用asynq的retry count。
 // 行不存在（入队成功但落库失败的残留）→ 返回错误——worker 侧据此记日志，
 // 避免任务执行全程无任何 job_runs 记录的「隐形任务」静默发生。
-func (s *Store) MarkRunning(ctx context.Context, taskID string, attempt int, startedAt time.Time) error {
+func (s *Store) MarkRunning(ctx context.Context, taskID string, attempt int, startedAt time.Time, executionID string) error {
+	if executionID == "" {
+		return errors.New("store: empty execution_id")
+	}
 	res, err := s.exec(ctx, `
-UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = ''
-WHERE task_id = ? AND status NOT IN (?, ?)`,
-		StatusRunning, attempt, startedAt, taskID, StatusSucceeded, StatusCanceled)
+UPDATE job_runs SET status = ?, attempts = ?, started_at = ?, error = '', execution_id = ?
+WHERE task_id = ? AND status NOT IN (?, ?) AND (status = ? OR attempts <= ?)`,
+		StatusRunning, attempt, startedAt, executionID, taskID, StatusSucceeded, StatusCanceled, StatusPending, attempt)
 	if err != nil {
 		return fmt.Errorf("store: mark running: %w", err)
 	}
@@ -453,12 +466,13 @@ WHERE task_id = ? AND status NOT IN (?, ?)`,
 		return fmt.Errorf("store: mark running rows: %w", err)
 	}
 	if n == 0 {
-		// 0 行 = 行缺失或 succeeded/canceled 复活被拒（C6：有意的终态不可被过期写者推翻；
-		// failed→running 为 asynq 重试周期正常路径，dead→running 仅供手动重置后）。
+		// 0行=行缺失、终态复活或较旧attempt索取执行权被拒；pending允许手动retry重启计数。
 		// 补查分类（ADR-004 F59：UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按
 		// 未知包装，worker 对未知维持「继续执行」旧口径）：
 		run, gerr := s.GetByTaskID(ctx, taskID)
 		switch {
+		case gerr == nil && run.Status != StatusSucceeded && run.Status != StatusCanceled:
+			return fmt.Errorf("store: mark running: %w (attempt=%d, current=%d)", ErrDeliverySuperseded, attempt, run.Attempts)
 		case gerr == nil:
 			return fmt.Errorf("store: mark running: %w (status=%s, task_id=%s)", ErrTerminalRejected, run.Status, taskID)
 		case errors.Is(gerr, ErrNotFound):
@@ -471,8 +485,12 @@ WHERE task_id = ? AND status NOT IN (?, ?)`,
 }
 
 // Finish 写终态：succeeded / failed（还将重试）/ dead（重试耗尽或 4xx 不重试）。
+// 必须持有当前executionID；attempt相同的停机重投/手动重试也不能由旧写者收尾。
 // duration 按本次尝试的 started→finished 计算（Go 侧算好传入，避免 SQLite 时间函数对绑定参数的解析差异）。
-func (s *Store) Finish(ctx context.Context, taskID, status, errMsg string, attempts int, startedAt, finishedAt time.Time) error {
+func (s *Store) Finish(ctx context.Context, taskID, status, errMsg string, attempts int, startedAt, finishedAt time.Time, executionID string) error {
+	if executionID == "" {
+		return errors.New("store: empty execution_id")
+	}
 	durationMS := finishedAt.Sub(startedAt).Milliseconds()
 	if durationMS < 0 {
 		durationMS = 0
@@ -480,8 +498,8 @@ func (s *Store) Finish(ctx context.Context, taskID, status, errMsg string, attem
 	res, err := s.exec(ctx, `
 UPDATE job_runs
 SET status = ?, attempts = ?, error = ?, finished_at = ?, duration_ms = ?
-WHERE task_id = ? AND status = ? AND attempts = ?`,
-		status, attempts, errMsg, finishedAt, durationMS, taskID, StatusRunning, attempts)
+WHERE task_id = ? AND status = ? AND attempts = ? AND execution_id = ?`,
+		status, attempts, errMsg, finishedAt, durationMS, taskID, StatusRunning, attempts, executionID)
 	if err != nil {
 		return fmt.Errorf("store: finish job_run: %w", err)
 	}
@@ -490,9 +508,13 @@ WHERE task_id = ? AND status = ? AND attempts = ?`,
 		return fmt.Errorf("store: finish job_run rows: %w", err)
 	}
 	if n == 0 {
-		// 0 行 = 过期写者（C6：租约失效重投递后，新执行已推进 status/attempts，
-		// 旧 goroutine 的终态写入被等值谓词拒绝）或行缺失
-		return fmt.Errorf("store: finish job_run: no running row with matching attempt (task_id=%s)", taskID)
+		// 0行=状态/attempt/execution_id任一不匹配或行缺失。
+		if _, err := s.GetByTaskID(ctx, taskID); errors.Is(err, ErrNotFound) {
+			return fmt.Errorf("store: finish job_run: %w (task_id=%s)", ErrNotFound, taskID)
+		} else if err != nil {
+			return fmt.Errorf("store: classify rejected completion: %w", err)
+		}
+		return fmt.Errorf("store: finish job_run: %w (task_id=%s)", ErrDeliverySuperseded, taskID)
 	}
 	return nil
 }

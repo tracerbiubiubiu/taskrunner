@@ -13,7 +13,7 @@ import (
 
 type Config struct {
 	Server struct {
-		Addr string `mapstructure:"addr"` // :8080
+		Addr string `mapstructure:"addr"` // :18080
 	}
 	Redis struct {
 		Addr     string `mapstructure:"addr"`
@@ -89,7 +89,7 @@ func Load(path string) (*Config, error) {
 			viper.SetDefault(key, def)
 		}
 	}
-	bind("server.addr", "TASKRUNNER_HTTP_ADDR", ":8080")
+	bind("server.addr", "TASKRUNNER_HTTP_ADDR", ":18080")
 	bind("redis.addr", "TASKRUNNER_REDIS_ADDR", "127.0.0.1:6379")
 	bind("redis.password", "TASKRUNNER_REDIS_PASSWORD", "")
 	viper.BindEnv("redis.db", "TASKRUNNER_REDIS_DB")

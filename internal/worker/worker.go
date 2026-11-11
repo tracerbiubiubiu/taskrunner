@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 
 	"github.com/tracerbiubiubiu/taskrunner/internal/callback"
@@ -50,13 +52,15 @@ func finishCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 }
 
 // finish 终态落库：落库失败仅记日志（job_runs 终态尽力而为，但 ctx 取消不再是失败原因）。
-// store 侧 status/attempts 谓词拒绝过期写者（租约双执行）——0 行命中同样走此日志。
-func (d Deps) finish(ctx context.Context, logger *slog.Logger, taskID, status, errMsg string, attempt int, startedAt time.Time) {
+// store侧status/attempt/execution_id谓词拒绝过期写者，包含同attempt停机重投。
+func (d Deps) finish(ctx context.Context, logger *slog.Logger, taskID, status, errMsg string, attempt int, startedAt time.Time, executionID string) error {
 	fctx, cancel := finishCtx(ctx)
 	defer cancel()
-	if ferr := d.Store.Finish(fctx, taskID, status, errMsg, attempt, startedAt, time.Now()); ferr != nil {
+	if ferr := d.Store.Finish(fctx, taskID, status, errMsg, attempt, startedAt, time.Now(), executionID); ferr != nil {
 		logger.Error("persist terminal state failed", slog.String("status", status), slog.Any("err", ferr))
+		return ferr
 	}
+	return nil
 }
 
 // handleCallback 单次尝试的执行流程：running → 回调 → succeeded / failed / dead。
@@ -87,9 +91,12 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		maxRetry = n
 	}
 	now := time.Now()
+	executionID := uuid.NewString() // one invocation, including equal-attempt shutdown redelivery
+	claimed := true
 
-	if err := d.Store.MarkRunning(ctx, p.TaskID, attempt, now); err != nil {
-		if errors.Is(err, repository.ErrTerminalRejected) {
+	if err := d.Store.MarkRunning(ctx, p.TaskID, attempt, now, executionID); err != nil {
+		claimed = false
+		if errors.Is(err, repository.ErrTerminalRejected) || errors.Is(err, repository.ErrDeliverySuperseded) {
 			// 终态守卫（ADR-004 决策 7）：行已 succeeded/canceled——重复投递或已取消任务
 			// 被取走，消费端拦截副作用：不执行回调、不写终态（行已是终态），SkipRetry 丢弃。
 			// F45/F58 窗口的「已取消任务产生回调」由此结构性关闭。
@@ -97,20 +104,27 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 				slog.Any("err", err))
 			return fmt.Errorf("worker: terminal row rejects resurrection: %w: %w", err, asynq.SkipRetry)
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		// 缺行（历史/手动残留——DB-first 下行先于任务存在，缺行只剩残留场景）或 DB 瞬时
 		// 错误：照常执行回调，仅记日志（ADR-004 决策 7 维持的旧口径容忍）
 		logger.Warn("mark running failed, continuing without job_runs update", slog.Any("err", err))
 	}
 
-	err := d.Callback.Do(ctx, p)
+	err := d.callCallback(ctx, p, logger)
 	switch {
 	case err == nil:
-		d.finish(ctx, logger, p.TaskID, repository.StatusSucceeded, "", attempt, now)
+		if err := d.finish(ctx, logger, p.TaskID, repository.StatusSucceeded, "", attempt, now, executionID); claimed && errors.Is(err, repository.ErrDeliverySuperseded) {
+			return fmt.Errorf("worker: stale completion: %w: %w", err, asynq.SkipRetry)
+		}
 		logger.Info("task succeeded", slog.Int("attempt", attempt))
 		return nil
 
 	case errors.Is(err, callback.ErrNonRetryable):
-		d.finish(ctx, logger, p.TaskID, repository.StatusFailed, err.Error(), attempt, now)
+		if ferr := d.finish(ctx, logger, p.TaskID, repository.StatusFailed, err.Error(), attempt, now, executionID); claimed && errors.Is(ferr, repository.ErrDeliverySuperseded) {
+			return fmt.Errorf("worker: stale completion: %w: %w", ferr, asynq.SkipRetry)
+		}
 		logger.Error("task failed terminally (non-retryable: 4xx or malformed request)", slog.Int("attempt", attempt), slog.Any("err", err))
 		return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
 
@@ -122,7 +136,9 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		if final {
 			status = repository.StatusDead
 		}
-		d.finish(ctx, logger, p.TaskID, status, err.Error(), attempt, now)
+		if ferr := d.finish(ctx, logger, p.TaskID, status, err.Error(), attempt, now, executionID); claimed && errors.Is(ferr, repository.ErrDeliverySuperseded) {
+			return fmt.Errorf("worker: stale completion: %w: %w", ferr, asynq.SkipRetry)
+		}
 		if final {
 			logger.Error("task dead (retries exhausted)", slog.Int("attempt", attempt), slog.Any("err", err))
 			// P4-2 死信告警：异步尽力而为（nil/未配置=空操作；失败不阻塞死信落库路径）
@@ -138,4 +154,17 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		}
 		return err // 交还 Asynq 按退避策略重试
 	}
+}
+
+// Catch a callback panic before Asynq's outer recovery: the error must pass the
+// same failed/dead/retry and execution fence paths as an ordinary callback 5xx.
+// Panics outside the callback boundary remain visible to Asynq's recovery.
+func (d Deps) callCallback(ctx context.Context, p task.Payload, logger *slog.Logger) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			logger.Error("callback panic", slog.Any("panic", v), slog.String("stack", string(debug.Stack())))
+			err = fmt.Errorf("worker: callback panic: %v", v)
+		}
+	}()
+	return d.Callback.Do(ctx, p)
 }

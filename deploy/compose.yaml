@@ -3,11 +3,11 @@
 # 拓扑（C3 网络隔离，对齐 activelist D5 双 network 模式）：taskrunner 跨双网——
 # taskrunner_internal（PG/Redis 仅内网可达）与 zhuzhao_to_taskrunner（external，
 # 由部署侧预建：docker network create zhuzhao_to_taskrunner；zhuzhao app 容器须加入
-# 同一网络并以 http://taskrunner:8080 寻址本服务）。本栈全部服务【不对宿主发布端口】，
+# 同一网络并以 http://taskrunner:18080 寻址本服务）。本栈全部服务【不对宿主发布端口】，
 # zhuzhao 经共享网反代式调用；回调由本服务主动拨 zhuzhao（callback URL 由 zhuzhao 下发）。
 #
 # 环境变量（.env 或 export）——五项均必填，缺失 compose 直接报错拒建（fail-closed，
-# 对齐 activelist compose.prod 与主仓 W0 三件套纪律；本地起栈的 .env 快配见 deploy/README.md）：
+# 对齐 activelist compose.prod 与主仓 W0 三件套纪律；本地起栈的 .env 快配见 docs/ops/deployment.md）：
 #   TASKRUNNER_PG_PASSWORD        taskrunner 专用 PG 口令
 #   TASKRUNNER_REDIS_PASSWORD     本栈 Redis 口令
 #   TASKRUNNER_CALLER_ZHUZHAO_SK  zhuzhao 出站签名 SK（须与 zhuzhao 侧 TASKRUNNER_SK 同值）；
@@ -17,7 +17,7 @@
 #   TASKRUNNER_CALLBACK_TARGET_URL  唯一出站回调目标（W0b SSRF 收口）
 #
 # 存储：job_runs/jobs 落专用 PG（C7 拍板，联调只用 PG）；asynq 队列落本栈 Redis。
-# 备份：每日 02:00 pg_dump（pgbackup 服务，保留 14 份；恢复见 deploy/backup/README.md）。
+# 备份：每日 02:00 pg_dump（pgbackup 服务，保留 14 份；恢复见 docs/ops/backup.md）。
 # job_runs 保留期口径 M4 一并拍——保留期调整=改 pgbackup 的 RETAIN_COUNT。
 name: taskrunner
 
@@ -35,7 +35,7 @@ services:
       - taskrunner_internal
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U taskrunner -d taskrunner"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U taskrunner -d taskrunner"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -88,7 +88,7 @@ services:
       taskrunner_internal: {}
       zhuzhao_to_taskrunner:
         aliases:
-          - taskrunner # 供 zhuzhao 以 http://taskrunner:8080 稳定寻址
+          - taskrunner # 供 zhuzhao 以 http://taskrunner:18080 稳定寻址
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,16 +96,16 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:18080/healthz || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
-    # 无 ports 段——8080 不对宿主发布（C3）；R5 可写探测在镜像内 /data /logs
+    # 无 ports 段——18080 不对宿主发布（C3）；R5 可写探测在镜像内 /data /logs
     # 已预授权（named volume 首挂继承镜像属主 app），bind mount 改挂时依赖
     # 启动探针 fail-closed 暴露属主问题。
 
   pgbackup:
-    # 每日 02:00 pg_dump 物理备份（对齐 activelist pgbackup 模式；恢复见 backup/README.md）
+    # 每日 02:00 pg_dump 逻辑备份（对齐 activelist pgbackup 模式；恢复见 docs/ops/backup.md）
     image: postgres:15-alpine
     environment:
       PGHOST: postgres

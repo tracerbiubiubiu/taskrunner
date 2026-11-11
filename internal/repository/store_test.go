@@ -46,14 +46,14 @@ func TestLifecycle(t *testing.T) {
 	if got.Status != StatusPending || got.SubmittedBy != "10086" || got.RequestID != "r1" {
 		t.Fatalf("unexpected pending row: %+v", got)
 	}
-	if err := s.MarkRunning(ctx, "t1", 1, enq.Add(time.Second)); err != nil {
+	if err := s.MarkRunning(ctx, "t1", 1, enq.Add(time.Second), "fixture-delivery"); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
 
 	// 成功 → succeeded，耗时按 started/finished 差值
 	started := enq.Add(time.Second)
 	fin := enq.Add(3 * time.Second)
-	if err := s.Finish(ctx, "t1", StatusSucceeded, "", 1, started, fin); err != nil {
+	if err := s.Finish(ctx, "t1", StatusSucceeded, "", 1, started, fin, "fixture-delivery"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	got, _ = s.GetByTaskID(ctx, "t1")
@@ -73,12 +73,12 @@ func TestRetryToDead(t *testing.T) {
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		started := start.Add(time.Duration(attempt) * time.Second)
-		s.MarkRunning(ctx, "t2", attempt, started)
+		s.MarkRunning(ctx, "t2", attempt, started, "fixture-delivery")
 		status := StatusFailed
 		if attempt == 3 { // 最后一次：重试耗尽 → dead
 			status = StatusDead
 		}
-		if err := s.Finish(ctx, "t2", status, "boom", attempt, started, started.Add(time.Second)); err != nil {
+		if err := s.Finish(ctx, "t2", status, "boom", attempt, started, started.Add(time.Second), "fixture-delivery"); err != nil {
 			t.Fatalf("finish attempt %d: %v", attempt, err)
 		}
 	}
@@ -158,10 +158,10 @@ func TestMissingRowVisible(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 
-	if err := s.MarkRunning(ctx, "ghost", 1, time.Now()); err == nil {
+	if err := s.MarkRunning(ctx, "ghost", 1, time.Now(), "fixture-delivery"); err == nil {
 		t.Fatal("MarkRunning on missing row must error")
 	}
-	if err := s.Finish(ctx, "ghost", StatusFailed, "boom", 1, time.Now(), time.Now()); err == nil {
+	if err := s.Finish(ctx, "ghost", StatusFailed, "boom", 1, time.Now(), time.Now(), "fixture-delivery"); err == nil {
 		t.Fatal("Finish on missing row must error")
 	}
 }
@@ -237,10 +237,10 @@ func TestListUnqueuedSafetyDomain(t *testing.T) {
 	}
 	// succeeded+queued=0 残留（F14 场景：内联标记失败 + DB 抖动在执行前恢复）
 	seedRun(t, s, "u-done", base, "")
-	if err := s.MarkRunning(ctx, "u-done", 1, base); err != nil {
+	if err := s.MarkRunning(ctx, "u-done", 1, base, "fixture-delivery"); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
-	if err := s.Finish(ctx, "u-done", StatusSucceeded, "", 1, base, base); err != nil {
+	if err := s.Finish(ctx, "u-done", StatusSucceeded, "", 1, base, base, "fixture-delivery"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	// pending+queued=1 → 排除（属于第二轮域）
@@ -328,22 +328,22 @@ func TestMarkRunningClassification(t *testing.T) {
 	if ok, _ := s.MarkCanceledIfPending(ctx, "m-cancel", "x", now); !ok {
 		t.Fatal("cancel")
 	}
-	if err := s.MarkRunning(ctx, "m-cancel", 1, now); !errors.Is(err, ErrTerminalRejected) {
+	if err := s.MarkRunning(ctx, "m-cancel", 1, now, "fixture-delivery"); !errors.Is(err, ErrTerminalRejected) {
 		t.Fatalf("canceled want ErrTerminalRejected, got %v", err)
 	}
 
 	seedRun(t, s, "m-done", now, "")
-	if err := s.MarkRunning(ctx, "m-done", 1, now); err != nil {
+	if err := s.MarkRunning(ctx, "m-done", 1, now, "fixture-delivery"); err != nil {
 		t.Fatalf("mark running: %v", err)
 	}
-	if err := s.Finish(ctx, "m-done", StatusSucceeded, "", 1, now, now); err != nil {
+	if err := s.Finish(ctx, "m-done", StatusSucceeded, "", 1, now, now, "fixture-delivery"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
-	if err := s.MarkRunning(ctx, "m-done", 2, now); !errors.Is(err, ErrTerminalRejected) {
+	if err := s.MarkRunning(ctx, "m-done", 2, now, "fixture-delivery"); !errors.Is(err, ErrTerminalRejected) {
 		t.Fatalf("succeeded want ErrTerminalRejected, got %v", err)
 	}
 
-	err := s.MarkRunning(ctx, "m-ghost", 1, now)
+	err := s.MarkRunning(ctx, "m-ghost", 1, now, "fixture-delivery")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing want ErrNotFound, got %v", err)
 	}

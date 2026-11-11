@@ -64,7 +64,7 @@ func (l *Loop) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			l.FireDue(ctx)
+			runBackgroundTick(l.Logger, "cron", func() { l.FireDue(ctx) })
 		}
 	}
 }

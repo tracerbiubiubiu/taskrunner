@@ -1,4 +1,4 @@
-.PHONY: lint test build
+.PHONY: hooks commit-lint test-commit-lint lint test build e2e
 
 lint:
 	go vet ./...
@@ -12,3 +12,13 @@ build:
 
 e2e:
 	scripts/e2e/e2e.sh
+
+# RR-GIT-01: self-contained commit checks; installation is worktree-scoped.
+hooks:
+	sh scripts/install-git-hooks.sh
+
+commit-lint:
+	python3 scripts/commit-policy.py pending
+
+test-commit-lint:
+	python3 scripts/test-commit-policy.py

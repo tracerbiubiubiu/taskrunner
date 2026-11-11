@@ -59,7 +59,7 @@ func (l *ReclaimLoop) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			l.ReclaimStalePending(ctx)
+			runBackgroundTick(l.Logger, "reclaim", func() { l.ReclaimStalePending(ctx) })
 		}
 	}
 }

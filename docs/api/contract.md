@@ -1,6 +1,6 @@
 # HTTP 与回调契约
 
-本页描述当前候选实现，路由依据 `internal/handler/server.go` 的 `New`，绑定结构与查询解析也在该文件。业务状态依据 `internal/service/task_service.go`。只读文档迁移不表示版本已合并或部署。
+本页描述当前实现，路由依据 `internal/handler/server.go` 的 `New`，绑定结构与查询解析也在该文件。业务状态依据 `internal/service/task_service.go`。源码整合与实际部署分别核对；后续合同见[平台集成](../design/platform-integration.md)，不能当作已有字段或路由。
 
 ## 接入与响应
 
@@ -32,6 +32,8 @@
 ```
 
 actor/source_ip 为可选归因字段；action 是运行时标识，job 定义字段仍叫 action_id。body 为唯一业务负载通道，不将业务参数散到URL。回调带服务自身AK/SK签名；有request_id则头与body贯通。对端以task_id实现幂等，并在动作完全成功后返回2xx；4xx不可重试、5xx/超时可重试。任务级结果由查询API获取；可选终败通知是告警，不是第二套执行或结果复制通道。
+
+**当前完成信号限制（C03 / P6.0）**：主仓在途重复回调可能回2xx，本仓当前按2xx写执行成功，存在受理/在途与业务完成不一致的路径。联合修正与兼容验收见[平台集成合同](../design/platform-integration.md)；上述“完全成功后返回2xx”是双方应满足的短动作合同，不能据此宣称当前所有分支已经满足。
 
 ## 源码定位与变更边界
 

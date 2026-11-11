@@ -4,7 +4,8 @@
 
 1. 新读者先看 [运行设计](design/taskrunner.md)，理解DB-first和动作归属。
 2. 接口调用查 [HTTP与回调契约](api/contract.md)，跨仓接入看 [zhuzhao集成](design/zhuzhao-integration.md)。
-3. 本地开发看 [指南](guides/README.md)，部署/升级/恢复看 [运维](ops/README.md)。
-4. 原因追溯看 [ADR](adr/README.md)，原失败与旧里程碑看 [历史](review/README.md)。
+3. 后续结果、身份、调度和专业平台协同看 [平台集成合同](design/platform-integration.md)，排期引用主仓唯一总账。
+4. 本地开发看 [指南](guides/README.md)，部署/升级/恢复看 [运维](ops/README.md)。
+5. 原因追溯看 [ADR](adr/README.md)，原失败与旧里程碑看 [历史](review/README.md)。
 
-能力目录 [已批准但尚未实施](design/capability-registry.md)。当前没有monitor路由；dept仅筛选标签，回调目标由服务配置固定。
+能力目录的[旧批准方案](design/capability-registry.md)尚未实施，业务目录与执行路由职责按本轮重规划承接。当前没有monitor路由；dept仅筛选标签，回调目标由服务配置固定。

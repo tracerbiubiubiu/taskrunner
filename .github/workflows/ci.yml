@@ -4,6 +4,9 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
 # 连续 push 只跑最新提交（过期 run 自动取消，省 runner 时长）
 concurrency:
   group: ci-${{ github.ref }}
@@ -14,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Commit policy negative checks
@@ -23,16 +26,18 @@ jobs:
         run: python3 scripts/commit-policy.py ci --fetch-missing
   test:
     runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
     timeout-minutes: 15 # testcontainers/PG 挂起时兜底（默认 6h）
     services:
       redis:
-        image: redis:7-alpine
+        image: redis:8.2.11-alpine3.22@sha256:da23c2478319ceb4903857d77a2fd7aa5137d9e9d4c8165dafbacedac6403e95
         ports:
           - 6379:6379
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
       postgres:
-        image: postgres:15-alpine
+        image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -42,8 +47,8 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: vet
@@ -57,3 +62,11 @@ jobs:
           TASKRUNNER_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/taskrunner_test?sslmode=disable
           TASKRUNNER_TEST_REDIS_ADDR: localhost:6379
         run: go test -race -count=1 ./...
+      - name: Vulnerability scan (current source and tests)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -test ./...
+      - name: Vulnerability scan (current binary)
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -o "$RUNNER_TEMP/taskrunner" ./cmd/taskrunner
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$RUNNER_TEMP/taskrunner"

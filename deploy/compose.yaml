@@ -23,14 +23,14 @@ name: taskrunner
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
     environment:
       POSTGRES_USER: taskrunner
       POSTGRES_PASSWORD: ${TASKRUNNER_PG_PASSWORD:?需注入 TASKRUNNER_PG_PASSWORD}
       POSTGRES_DB: taskrunner
       TZ: Asia/Shanghai
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata18:/var/lib/postgresql
     networks:
       - taskrunner_internal
     restart: unless-stopped
@@ -41,12 +41,12 @@ services:
       retries: 10
 
   redis:
-    image: redis:6.2-alpine
+    image: redis:8.2.11-alpine3.22@sha256:da23c2478319ceb4903857d77a2fd7aa5137d9e9d4c8165dafbacedac6403e95
     environment:
       REDIS_PASSWORD: ${TASKRUNNER_REDIS_PASSWORD:?需注入 TASKRUNNER_REDIS_PASSWORD}
     command: ["sh", "-c", "redis-server --requirepass \"$$REDIS_PASSWORD\""]
     volumes:
-      - redisdata:/data
+      - redisdata82:/data
     networks:
       - taskrunner_internal
     restart: unless-stopped
@@ -106,7 +106,7 @@ services:
 
   pgbackup:
     # 每日 02:00 pg_dump 逻辑备份（对齐 activelist pgbackup 模式；恢复见 docs/ops/backup.md）
-    image: postgres:15-alpine
+    image: postgres:18.6-trixie@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
     environment:
       PGHOST: postgres
       PGUSER: taskrunner
@@ -115,7 +115,7 @@ services:
       BACKUP_DIR: /backups
       RETAIN_COUNT: "14"
     volumes:
-      - backups:/backups
+      - backups18:/backups
       - ./backup/backup.sh:/usr/local/bin/backup.sh:ro
     entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
     networks:
@@ -131,6 +131,6 @@ networks:
     external: true
 
 volumes:
-  pgdata:
-  redisdata:
-  backups:
+  pgdata18:
+  redisdata82:
+  backups18:

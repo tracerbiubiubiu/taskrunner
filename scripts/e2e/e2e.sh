@@ -10,7 +10,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=$(mktemp -d /tmp/taskrunner-e2e.XXXXXX)
-RNAME=taskrunner-e2e-redis
+RNAME=taskrunner-e2e-redis-$(basename "$WORK")
+REDIS_CREATED=0
 export E2E_WORK="$WORK"
 PASS=0; FAIL=0
 SERVE_PID=""; STUB_PID=""
@@ -18,7 +19,9 @@ SERVE_PID=""; STUB_PID=""
 cleanup() {
   [ -n "$SERVE_PID" ] && kill "$SERVE_PID" 2>/dev/null || true
   [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null || true
-  docker rm -f "$RNAME" >/dev/null 2>&1 || true
+  if [ "$REDIS_CREATED" = "1" ]; then
+    docker rm -fv "$RNAME" >/dev/null 2>&1 || true
+  fi
   echo "—— 工作目录留存：$WORK"
 }
 trap cleanup EXIT
@@ -49,12 +52,13 @@ redis_down() { docker stop "$RNAME" >/dev/null; sleep 1; }
 echo "—— 构建 + 环境"
 go build -o "$WORK/taskrunner" "$ROOT/cmd/taskrunner" 
 (cd "$ROOT" && go build -o "$WORK/cbstub" ./scripts/e2e/cbstub && go build -o "$WORK/client" ./scripts/e2e/client)
-docker rm -f "$RNAME" >/dev/null 2>&1 || true
-docker run -d --name "$RNAME" -p 6399:6399 redis:7-alpine redis-server --port 6399 >/dev/null
+docker create --name "$RNAME" -p 127.0.0.1:6399:6399 redis:8.2.11-alpine3.22@sha256:da23c2478319ceb4903857d77a2fd7aa5137d9e9d4c8165dafbacedac6403e95 redis-server --port 6399 >/dev/null
+REDIS_CREATED=1
+docker start "$RNAME" >/dev/null
 sleep 2
 "$WORK/cbstub" & STUB_PID=$!
 export TASKRUNNER_HTTP_ADDR=":6397" TASKRUNNER_REDIS_ADDR="127.0.0.1:6399" \
-  TASKRUNNER_DB_PATH="$WORK/e2e.db" TASKRUNNER_RECLAIM_TICK="1s" \
+  TASKRUNNER_DB_DRIVER="sqlite" TASKRUNNER_DB_PATH="$WORK/e2e.db" TASKRUNNER_RECLAIM_TICK="1s" \
   TASKRUNNER_RECLAIM_STALE_AFTER="2s" TASKRUNNER_RECLAIM_BATCH="100" \
   TASKRUNNER_RECLAIM_RETENTION="30s" TASKRUNNER_CALLER_ZHUZHAO_SK="sk-e2e-zhuzhao" \
   TASKRUNNER_SELF_AK="taskrunner" TASKRUNNER_SELF_SK="sk-e2e-self" \

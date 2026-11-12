@@ -1,6 +1,6 @@
 # 开发与验证
 
-从仓库根目录执行以下命令。先安装 Go（版本由 `go.mod` 指定）与 Make；需要数据库或 Docker 的测试在独立测试环境运行。
+从仓库根目录执行以下命令。先安装 Go 1.27.4（版本由 `go.mod` 指定）与 Make；需要数据库或 Docker 的测试在独立测试环境运行。
 
 ```sh
 make hooks
@@ -9,7 +9,7 @@ make test
 make build
 ```
 
-PostgreSQL 集成使用 `TASKRUNNER_TEST_PG_DSN`；`make e2e` 需要 Docker，cron 场景由 `E2E_INCLUDE_CRON=1` 启用。
+PostgreSQL 集成使用 `TASKRUNNER_TEST_PG_DSN`；`make e2e` 需要 Docker，并创建本次独有的 Redis 8.2.11 容器；6397/6398/6399 须空闲，冲突时退出而不删除已有容器。cron 场景由 `E2E_INCLUDE_CRON=1` 启用。
 预期为命令退出码 0；门禁通过只证明该次指定环境，不表示候选已合并或部署。
 
 ## 宿主启动与验证

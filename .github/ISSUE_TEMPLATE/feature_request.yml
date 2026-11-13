@@ -1,0 +1,27 @@
+name: Feature request / 功能建议
+description: Describe a concrete user problem and a bounded outcome.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User and problem / 使用者与问题
+      description: Who needs this, and what is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Smallest useful scenario / 最小可用场景
+      description: Describe input, expected outcome, and a way to verify it.
+    validations:
+      required: true
+  - type: textarea
+    id: reuse
+    attributes:
+      label: Existing alternatives or providers / 现有替代与专业供给
+      description: Note whether an existing system or integration could provide the capability.
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and limits / 范围与边界
+      description: Include permission, data and operational constraints; use synthetic examples.

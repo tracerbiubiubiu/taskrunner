@@ -2,6 +2,8 @@
 
 > **2026-11-11 当前口径**：本页保留历史批准方案，作为重规划输入；不再单独作为当前排期或唯一目录归属合同。业务能力合同、执行路由与身份分别由[平台集成合同](platform-integration.md)的 I01/I02/I03 承接，排期与关闭证据归主仓[规划总账](../../../zhuzhao/docs/review/planning-backlog.md)。旧“Phase6三步同批/SDK必建”不覆盖新路线。
 
+> **2026-11-13词典补充**：静态能力身份采用`capability_id + contract_version`，OpenAPI `operationId`是接口元数据，`operation_id`留给动态业务效果幂等，见主仓[统一调用合同](../../../zhuzhao/docs/design/capability-invocation-contract.md)。以下历史`code/action_code`方案及现行`action/action_id`须有显式别名/版本映射，不直接全局改名或把旧路由键当新幂等身份；本页不选定新schema或更新旧预算。
+
 2026-10-29 所有者曾批准将能力目录整体提入 Phase 6；当前没有 `capability_registry` 表、自注册 API 或执行端 SDK。当前提交和任务定义仍由服务配置指定唯一回调目标，调用方不能传入地址。
 
 ## 历史批准范围（复核输入）

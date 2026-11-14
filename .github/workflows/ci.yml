@@ -62,6 +62,10 @@ jobs:
           TASKRUNNER_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/taskrunner_test?sslmode=disable
           TASKRUNNER_TEST_REDIS_ADDR: localhost:6379
         run: go test -race -count=1 ./...
+      - name: Real delivery E2E (SQLite, Redis, signed HTTP and cron)
+        env:
+          E2E_INCLUDE_CRON: "1"
+        run: make e2e
       - name: Vulnerability scan (current source and tests)
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -test ./...
       - name: Vulnerability scan (current binary)

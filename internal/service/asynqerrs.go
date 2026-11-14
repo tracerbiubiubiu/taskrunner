@@ -1,6 +1,6 @@
 // asynq 错误分类 helper（ADR-004 F60/F64/F65）：CancelTask 降级、A3/扫描器补偿撤销、
 // 第三域探针计数共用同一分类，避免各处字符串匹配漂移。
-// asynq v0.26.0 对 DeleteTask 的 active 态与 Lua 脏态 error_reply 无导出 sentinel，
+// asynq v0.26.0 对 DeleteTask/RunTask 的状态冲突与 Lua 脏态 error_reply 无导出 sentinel，
 // 只能匹配错误文本——原文钉死如下，升级 asynq 时必须回归（ADR-004 实施计划 6）。
 package service
 
@@ -23,6 +23,20 @@ const asynqDirtyStateErrText = "task is not found in "
 // isDeleteActiveErr DeleteTask 命中 active 态（检查后瞬间被 worker 取走）。
 func isDeleteActiveErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), asynqDeleteActiveErrText)
+}
+
+// isRunTaskStateConflictErr pins Inspector.RunTask's v0.26.0 pending/active
+// errors. Inspect complete errors down the wrapping chain, rather than matching
+// arbitrary messages mentioning pending/running or swallowing other Redis errors.
+func isRunTaskStateConflictErr(err error) bool {
+	for ; err != nil; err = errors.Unwrap(err) {
+		switch err.Error() {
+		case "asynq: FAILED_PRECONDITION: task is already running",
+			"asynq: FAILED_PRECONDITION: task is already in pending state":
+			return true
+		}
+	}
+	return false
 }
 
 // isRedisDirtyStateErr DeleteTask 遇 Lua 脏态——任务键仍可能执行，第三域须留域重探。

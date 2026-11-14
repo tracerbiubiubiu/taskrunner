@@ -389,6 +389,9 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID string) error {
 		return conflict("仅「执行失败」或「死信」状态的任务可重试，当前状态：%s", stateText(run.Status))
 	}
 	if err := s.inspector.RunTask(s.queue, taskID); err != nil {
+		if isRunTaskStateConflictErr(err) {
+			return conflict("任务已等待或开始执行，请刷新后查看")
+		}
 		if errors.Is(err, asynq.ErrTaskNotFound) {
 			return conflict("队列中已无该任务，无法重试（4xx 终败任务已被清理，如需重跑请修正参数后重新提交）")
 		}

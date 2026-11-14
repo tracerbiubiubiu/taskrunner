@@ -16,7 +16,7 @@
 | `POST /v1/jobs/update` | body `job_id` 定位；可更新定义字段，省略表示保留。 |
 | `POST /v1/jobs/trigger` | body `job_id`，按任务定义立即提交；停用定义409。 |
 | `POST /v1/tasks/cancel` | body `task_id`；仅未开始任务，已执行/不允许状态409。 |
-| `POST /v1/tasks/retry` | body `task_id`；仅 failed/dead，其他状态409。 |
+| `POST /v1/tasks/retry` | body `task_id`；仅 failed/dead，其他状态409；干预时队列已推进到pending/active也返回409，保留执行记录，真实Redis/未知错误仍500。 |
 | `GET /v1/dead-letters` | page/page_size；返回 list/page/page_size，无total。队列未创建或空队列返回200空列表；其他队列故障仍报错。 |
 
 `params` 必须合法 JSON、不得显式 null，最大64KiB；timeout_secs 为0或1–86400，0采用服务默认。一次性提交/新建定义的 callback_url 非空400；更新定义只要传该字段即拒绝（包括空值）。地址由 `Config.CallbackTargetURL` 确定。旧 POST/PATCH 带业务ID路径不属于本表现行路由；没有 jobs DELETE。

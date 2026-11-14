@@ -5,34 +5,114 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
 )
 
 const base = "http://127.0.0.1:6397"
 
+var fixtureHTTPClient = &http.Client{Timeout: requestTimeout}
+
+func signedRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	aksk.Sign(req, body, aksk.SignOptions{AK: "zhuzhao", SK: []byte("sk-e2e-zhuzhao"), Operator: "e2e"})
+	return req, nil
+}
+
+func send(req *http.Request) (int, []byte, error) {
+	resp, err := fixtureHTTPClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8193))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	if len(body) > 8192 {
+		return resp.StatusCode, nil, fmt.Errorf("fixture HTTP response exceeds 8192 bytes")
+	}
+	return resp.StatusCode, body, nil
+}
+
 func do(method, path string, body []byte) {
-	req, err := http.NewRequest(method, base+path, bytes.NewReader(body))
+	req, err := signedRequest(context.Background(), method, path, body)
 	if err != nil {
 		panic(err)
 	}
-	aksk.Sign(req, body, aksk.SignOptions{AK: "zhuzhao", SK: []byte("sk-e2e-zhuzhao"), Operator: "e2e"})
-	resp, err := http.DefaultClient.Do(req)
+	status, response, err := send(req)
 	if err != nil {
 		fmt.Println("0 ERR", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
-	b := make([]byte, 8192)
-	n, _ := resp.Body.Read(b)
-	fmt.Printf("%d %s\n", resp.StatusCode, string(b[:n]))
+	fmt.Printf("%d %s\n", status, response)
+}
+
+func fetchTask(taskID string) stateFetch {
+	return func(remaining time.Duration) (taskState, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), min(requestTimeout, remaining))
+		defer cancel()
+		req, err := signedRequest(ctx, http.MethodGet, "/v1/tasks/"+taskID, nil)
+		if err != nil {
+			return taskState{}, err
+		}
+		status, body, err := send(req)
+		if err != nil {
+			return taskState{}, err
+		}
+		if status != http.StatusOK {
+			return taskState{}, fmt.Errorf("get task returned HTTP %d: %s", status, body)
+		}
+		return decodeTaskState(body)
+	}
+}
+
+func waitCommand() {
+	var err error
+	switch os.Args[1] {
+	case "wait":
+		if len(os.Args) != 5 {
+			fmt.Fprintln(os.Stderr, "usage: client wait <id> <status> <seconds>")
+			os.Exit(2)
+		}
+		seconds, parseErr := strconv.Atoi(os.Args[4])
+		if parseErr != nil || seconds <= 0 {
+			fmt.Fprintln(os.Stderr, "wait seconds must be a positive integer")
+			os.Exit(2)
+		}
+		err = waitForState(fetchTask(os.Args[2]), func(s taskState) bool {
+			return s.Status == os.Args[3]
+		}, time.Duration(seconds)*time.Second, realClock{})
+	case "wait-dead-archived":
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: client wait-dead-archived <id>")
+			os.Exit(2)
+		}
+		err = waitForDeadArchived(fetchTask(os.Args[2]), realClock{})
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
 func main() {
+	if len(os.Args) < 2 {
+		os.Exit(2)
+	}
 	switch os.Args[1] {
+	case "wait", "wait-dead-archived":
+		waitCommand()
 	case "submit": // 服务端定callback目标；第三参数仅选择合成桩响应，放签名params。
 		fixtureCase := ""
 		if len(os.Args) > 3 {

@@ -29,15 +29,8 @@ trap cleanup EXIT
 ok()   { echo "✓ $1"; PASS=$((PASS+1)); }
 fail() { echo "✗ $1"; FAIL=$((FAIL+1)); }
 assert_eq() { [ "$2" = "$3" ] && ok "$1" || { fail "$1（期望 [$3] 实得 [$2]）"; }; }
-wait_status() { # id want timeout_s：轮询直至 status 匹配
-  local id=$1 want=$2 t=${3:-15} st=""
-  for ((i = 0; i < t; i++)); do
-    st=$("$WORK"/client get "$id" | sed 's/^[0-9]* //' |
-      python3 -c "import json,sys; print(json.load(sys.stdin)['data']['status'])" 2>/dev/null || echo "?")
-    [ "$st" = "$want" ] && return 0
-    sleep 1
-  done
-  return 1
+wait_status() { # id want timeout_s：HTTP耗时计入单调时钟deadline，每次请求至多5s。
+  "$WORK/client" wait "$1" "$2" "${3:-15}"
 }
 json_data() { sed 's/^[0-9]* //' | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print($1)"; }
 db() { python3 -c "
@@ -88,10 +81,24 @@ assert_eq "③attempts=1（SkipRetry）" "$att" "1"
 
 echo "—— ④ 5xx → 死信 → RetryTask 重放"
 $C submit e2e-3 /cb500 >/dev/null
-wait_status e2e-3 dead 40 && ok "④重试耗尽 → dead" || fail "④重试耗尽 → dead"
+# client先确认failed/attempts=1，再按钉住的Asynq退避上界等待dead+archived。
+# 终态未成立即退出，不能提前RunTask改变尚在自动重试中的场景。
+if ! "$C" wait-dead-archived e2e-3; then
+  fail "④重试耗尽 → dead（须同时archived）"
+  exit 1
+fi
+ok "④重试耗尽 → dead（同时archived）"
 dead=$($C dead | json_data "','.join(x['task_id'] for x in d['list'])")
-echo "$dead" | grep -q e2e-3 && ok "④死信列表在列" || fail "④死信列表缺 e2e-3"
-$C retry e2e-3 >/dev/null
+if echo "$dead" | grep -q e2e-3; then
+  ok "④死信列表在列"
+else
+  fail "④死信列表缺 e2e-3"
+  exit 1
+fi
+out=$("$C" retry e2e-3)
+http_status=${out%% *}
+assert_eq "④RetryTask HTTP=200" "$http_status" "200"
+[ "$http_status" = "200" ] || exit 1
 wait_status e2e-3 succeeded 15 && ok "④RetryTask 重放成功" || fail "④RetryTask 重放"
 
 echo "—— ⑤ reclaim 宕机修复"

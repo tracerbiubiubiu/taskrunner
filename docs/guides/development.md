@@ -12,11 +12,19 @@ make build
 PostgreSQL 集成使用 `TASKRUNNER_TEST_PG_DSN`；`make e2e` 需要 Docker，并创建本次独有的 Redis 8.2.11 容器；6397/6398/6399 须空闲，冲突时退出而不删除已有容器。cron 场景由 `E2E_INCLUDE_CRON=1` 启用。
 预期为命令退出码 0；门禁通过只证明该次指定环境，不表示候选已合并或部署。
 
+### 真实投递 E2E 的重试等待
+
+CI 在现有 race/PG/Redis 检查后执行 `E2E_INCLUDE_CRON=1 make e2e`，验证真实进程、签名 HTTP、队列和 cron；Go 夹具回归随 `go test ./...` 一起执行，也可单独运行 `make test-e2e-fixture`。
+
+场景④保留生产默认退避。当前固定 Asynq v0.26.0 的首次重试为 15–44 秒；以首次失败尝试为锚点，另计延迟队列检查 5 秒、worker 轮询 1 秒、测试 HTTP 上限 5 秒和观察轮询 1 秒，等待预算为 56 秒。等待使用实际截止时间，确认数据库为 `dead` 且队列为 `archived` 后，才检查死信列表并手工重放；重放还须确认 HTTP200 和最终成功，不能因瞬时数据库状态提前发起。
+
+首次实机核验中，旧 40 秒窗口导致三项级联失败，原样串行重跑仍可复现；旧失败日志、数据库和时间线保留在主仓本机 ignored `.codex/audits/main-verification-20261114/siblings/`。时限和双状态就绪条件另有虚拟时间正反例，真实链不可由这些夹具测试替代。升级 Asynq 时需重新核对默认退避、轮询周期及状态错误合同。
+
 ## 宿主启动与验证
 
 开发形态可用 SQLite 保存执行事实，但队列仍需要 Redis；它不是无需外部依赖的单进程模式。生产 Compose 使用独立 PG/Redis，见 [部署](../ops/deployment.md)，不要把未发布宿主端口的容器栈当作宿主 Redis。
 
-先按主仓[开发依赖与宿主联调](https://github.com/tracerbiubiubiu/zhuzhao/blob/phase5/docs/ops/deployment.md)确认端口、Redis 实例/DB/queue、SQLite 文件和回调接收方的归属。沿用已分配环境时保留原文件与连接；新隔离环境另选专属文件、队列和端口。不要为了试启动修改冻结的 `configs/config.yaml` 或替换存量数据源。
+先按主仓[开发依赖与宿主联调](https://github.com/tracerbiubiubiu/zhuzhao/blob/main/docs/ops/deployment.md)确认端口、Redis 实例/DB/queue、SQLite 文件和回调接收方的归属。沿用已分配环境时保留原文件与连接；新隔离环境另选专属文件、队列和端口。不要为了试启动修改冻结的 `configs/config.yaml` 或替换存量数据源。
 
 从本仓根目录，在本机专属终端或未跟踪的环境文件中注入下列配置；表中是变量含义，不是可直接使用的密钥：
 
@@ -44,7 +52,7 @@ curl --fail http://127.0.0.1:18080/readyz
 ## 提交规范
 
 
-遵 zhuzhao `docs/standards.md` §12-9 / §12-10；关联主仓[复核报告的 RR-GIT-01](https://github.com/tracerbiubiubiu/zhuzhao/blob/phase5/docs/review/reports/zhuzhao-report-followup-2026-11-08.md)（2026-11-08）。
+遵 zhuzhao `docs/standards.md` §12-9 / §12-10；关联主仓[复核报告的 RR-GIT-01](https://github.com/tracerbiubiubiu/zhuzhao/blob/main/docs/review/reports/zhuzhao-report-followup-2026-11-08.md)（2026-11-08）。
 本仓脚本与主仓同源、自包含，仅依赖 Git + Python 3 标准库，不依赖主仓目录或新增 Go/npm 包。
 主题为 `type(scope): 摘要`（scope 可省略），摘要去前缀后最多 50 个 Unicode 字符、不得以句号结尾；
 主题与正文间须空行，正文不得为空或只有空白。所有新 merge 提交也须显式提供规范主题与正文。

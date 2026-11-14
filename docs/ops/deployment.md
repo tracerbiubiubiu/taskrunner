@@ -8,6 +8,14 @@
 
 > 本文命令从仓库根目录进入 `deploy/` 后运行；compose文件仍在 `deploy/compose.yaml`，不是docs目录。
 
+## 运行基线升级（2026-11-12 候选）
+
+应用构建使用 Go 1.27.4 / Alpine 3.24，运行镜像 Alpine 3.24.4；PostgreSQL 18.6 使用 Debian trixie 官方镜像，备份工具与服务端同版本。镜像均钉完整版本和多架构摘要；本候选不自动修改已有实例。版本选择、依赖变化和验证边界见 [升级记录](version-upgrade.md)。
+
+PG18 的 `PGDATA=/var/lib/postgresql/18/docker`，Compose 将新的 `pgdata18` 卷挂到 `/var/lib/postgresql`。旧 PG15 `pgdata` 不能直接挂给 PG18；新卷为空不代表旧数据已迁移。已有开发/部署栈先盘点项目、容器、卷、备份与写者，停写后用逻辑备份恢复至独立 PG18，核验数据和业务再切连接。保留旧卷和旧环境；不要执行 `down -v`。切换后若新库已接收写入，回指旧库会丢新写，需重新安排数据迁移，不能称为无损回滚。
+
+队列使用 Redis 8.2.11 Extended / Alpine 3.22 的独立 `redisdata82` 卷，旧 `redisdata` 保留。PG 与 Redis 必须作为一致的迁移窗口处理：先停止新任务受理和全部 worker，核对 queued/pending/running、回调和死信，再按已核验的 Redis 升级路径迁移数据。不能把新空 Redis 当作已迁移队列；DB 快照不能自动恢复所有在途任务，沿用下文人工对账边界。
+
 ## 快速开始
 
 ```sh

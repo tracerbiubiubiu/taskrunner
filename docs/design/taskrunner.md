@@ -2,6 +2,8 @@
 
 当前实现 = 独立 HTTP API、PostgreSQL/SQLite 执行事实库与 Redis/Asynq 队列。服务负责调度、重试和记录，业务 handler 由回调对端持有。当前接入方为 zhuzhao。能力目录已获批准但未实施，见 [规划](capability-registry.md)；历史方案见 [归档](../review/archive/taskrunner-design-history.md)。
 
+2026-11-13新增的统一能力通道/数据互通愿景见[平台集成合同](platform-integration.md#统一能力通道中的tr边界)和主仓[权威合同](../../../zhuzhao/docs/design/capability-invocation-contract.md)，均为设计。TR继续作为业务任务调度与投递写主；统一入口不要求所有查询和本地短事务经队列，执行callback也不等于结果已回贴到工单或AL。当前源码和下述实现限制保持。
+
 ## 调用与数据归属
 
 ```mermaid

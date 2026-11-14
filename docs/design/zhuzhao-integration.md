@@ -1,6 +1,6 @@
 # 与 zhuzhao 接入
 
-当前 zhuzhao 代理用户操作并作认证、路由授权和业务审计；taskrunner 接收签名请求，保存执行事实并回调固定的能力端点。两仓不跨库访问、不互相 import 业务代码。调用字段见 [HTTP契约](../api/contract.md)，运行边界见 [设计](taskrunner.md)。
+当前 zhuzhao 代理用户操作并作认证、路由授权和业务审计；taskrunner 接收签名请求，保存执行事实并回调固定的能力端点。两仓不跨库访问、不互相 import 业务代码。调用字段见 [HTTP契约](../api/contract.md)，运行边界见 [设计](taskrunner.md)；完成语义、后续身份/结果/调度合同按 [平台集成](platform-integration.md) 承接，尚未因文档落档实现。
 
 ## 接入顺序
 

@@ -40,4 +40,4 @@ docker compose start pgbackup
 `compose cp` 从实际项目的 pgbackup 服务取出 `/backups` 文件，无需猜宿主目录或 `taskrunner_backups` 卷名。`pg_restore --list` 仅验证归档可解析并提供对象清单，不能代替恢复后数据抽验。恢复执行史不等于回滚外部业务动作；恢复旧库后仍按上文 DB/Redis 状态边界对账，避免盲目重放。
 
 
-文档迁移不改变命令工作目录、compose项目名或卷名。恢复前核对实际项目的卷路径，停写并保留原卷；同时备份新增execution_id列。升级/回滚耦合见 [部署](deployment.md)。
+PG18候选使用新的pgdata18/backups18与Redis的redisdata82，历史卷保留；版本迁移不能只换镜像，见部署升级。命令工作目录与compose项目名不变。恢复前核对实际项目的卷路径，停写并保留原卷；同时备份新增execution_id列。升级/回滚耦合见 [部署](deployment.md)。

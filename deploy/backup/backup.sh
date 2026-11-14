@@ -1,10 +1,10 @@
 #!/bin/sh
-# taskrunner 每日物理备份循环（对齐 activelist deploy/backup/backup.sh 模式）：
+# taskrunner 每日逻辑备份循环（对齐 activelist deploy/backup/backup.sh 模式）：
 #   - 每日 02:00 后执行一次 pg_dump -Fc（自定义压缩格式）
 #   - 保留最近 RETAIN_COUNT 份，超出轮转删除（文件名含日期，按名排序即按时间序）
-# job_runs/jobs 保留期口径 M4 一并拍——本脚本先兜底物理备份（保留期调整=改 RETAIN_COUNT）
+# job_runs/jobs 保留期口径 M4 一并拍——本脚本先兜底逻辑备份（保留期调整=改 RETAIN_COUNT）
 # 环境变量（compose 注入）：PGHOST/PGUSER/PGPASSWORD/PGDATABASE/BACKUP_DIR/RETAIN_COUNT
-# 恢复步骤见同目录 README.md。
+# 恢复步骤见 docs/ops/backup.md。
 set -eu
 
 BACKUP_DIR="${BACKUP_DIR:-/backups}"

@@ -14,7 +14,8 @@
 - 开工先`make hooks`，核对分支、工作树、在途文件及DB/Redis/queue/端口归属；写任务独立worktree。
 - 保留standards §11测试先行：当前批准批全量正/负/边界/权限用例先写，取得目标行为的红证据，再分批实现到绿。
 - 修复必带回归；并发修复遵§9/§12移除修复后连续至少8次稳定变红，不以`-race`全绿替代；红证据不等于允许提交红测试。
-- 现有命令从本仓根目录运行：`make lint`、`make test`、`make build`；真实链另跑`make e2e`（需Docker及独占端口）。
+- 从仓库根目录先跑`make quality-plan`审阅分档，再跑`make quality-check`；ordinary档须按输出在独占环境手工跑原完整门禁并留证，不以计划输出代替通过。`BASE`默认`origin/main`，本地含base到HEAD及暂存/未暂存/未跟踪文件。分类规则和完整产品验证命令见[开发指南](docs/guides/development.md#分档门禁)。
+- 纯说明/设计/报告走文档检查；候选Schema/规划JSON/隔离参考或工具加针对验证；业务、运行配置、依赖、迁移、正式协议、产品测试及CI/分类器/豁免规则走完整适用门禁。混合取最高档，未知从严；测试先行不变。
 - PG测试按[开发指南](docs/guides/development.md)设置专属`TASKRUNNER_TEST_PG_DSN`，执行CI同类的`go test -race -count=1 ./...`；未具备环境而跳过须披露。
 - cron E2E使用已有`E2E_INCLUDE_CRON=1 make e2e`；同任务稳定身份、重复/迟到、unknown、恢复及取消边界按变更范围验证。
 - 完整适用门禁未绿不标完成；mock/contract/real、首次失败、重试、skip及NOT_RUN分列，不削弱断言制造绿灯。

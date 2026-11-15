@@ -13,6 +13,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+      runtime: ${{ steps.classify.outputs.runtime }}
+      references: ${{ steps.classify.outputs.references }}
+      plan: ${{ steps.classify.outputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Tiered gate negative checks
+        run: python3 scripts/test-quality-gate.py
+      - name: Document checker negative checks
+        run: python3 scripts/test-check-docs.py
+      - name: Reference checker negative checks
+        run: python3 scripts/test-check-references.py
+      - name: Classify exact push or PR change window
+        id: classify
+        run: python3 scripts/quality-gate.py classify --kind taskrunner --event-path "$GITHUB_EVENT_PATH" --head "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+  document-check:
+    if: always()
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      QUALITY_PLAN: ${{ needs.changes.outputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check changed documents and local links
+        run: python3 scripts/check-docs.py --plan-env QUALITY_PLAN
+  reference-check:
+    if: needs.changes.outputs.references == 'true'
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      QUALITY_PLAN: ${{ needs.changes.outputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate affected candidate schemas and isolated references
+        run: python3 scripts/check-references.py --plan-env QUALITY_PLAN
   commit-policy:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -25,6 +72,8 @@ jobs:
       - name: Exact push or PR commit window
         run: python3 scripts/commit-policy.py ci --fetch-missing
   test:
+    needs: [changes]
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
@@ -48,6 +97,8 @@ jobs:
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -74,3 +125,17 @@ jobs:
         run: |
           go build -trimpath -o "$RUNNER_TEMP/taskrunner" ./cmd/taskrunner
           go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary "$RUNNER_TEMP/taskrunner"
+  quality-gate:
+    if: always()
+    needs: [changes, commit-policy, document-check, reference-check, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      QUALITY_PLAN: ${{ needs.changes.outputs.plan }}
+      NEEDS_JSON: ${{ toJSON(needs) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Require all applicable jobs to succeed
+        run: python3 scripts/quality-gate.py summarize --plan-env QUALITY_PLAN --needs-env NEEDS_JSON --runtime-jobs test

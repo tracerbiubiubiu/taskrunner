@@ -69,10 +69,11 @@ taskrunner 负责调度和执行账本，工单／风险状态、用户授权与
 
 ```sh
 make hooks
-make lint
-make test
-make build
+make quality-plan
+make quality-check
 ```
+
+先审阅计划再执行：quality-check完成文档/针对检查；ordinary档要求在独占环境手工跑完整门禁并留存证据，不自动运行产品测试。纯说明/设计/报告走文档检查；候选Schema/规划JSON/隔离参考或工具加针对验证；业务、正式协议及门禁规则等走完整产品检查，混合取最高档、未知从严。原lint/test/build与真实集成命令见[开发指南](docs/guides/development.md#分档门禁)，测试先行要求保持。
 
 PG 测试使用专属 `TASKRUNNER_TEST_PG_DSN`，E2E 使用上面的独立环境；不能用缺少依赖而跳过的测试证明真实集成通过。工具链／容器候选和迁移边界见 [版本升级记录](docs/ops/version-upgrade.md)，当前检出代码不等于 main 已发布或已部署。
 

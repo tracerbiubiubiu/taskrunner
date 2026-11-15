@@ -1,12 +1,12 @@
 # 开发与验证
 
-从仓库根目录执行以下命令。先安装 Go 1.27.4（版本由 `go.mod` 指定）与 Make；需要数据库或 Docker 的测试在独立测试环境运行。
+从仓库根目录执行以下命令。分档入口依赖 Git、Python 3 与 Make；ordinary 产品检查另需 Go 1.27.4（版本由 `go.mod` 指定）。需要数据库或 Docker 的测试在独立测试环境运行。
 
 ```sh
 make hooks
-make lint
-make test
-make build
+make quality-plan                 # 先审阅文件范围、档位与计划
+make quality-check                # 文档/针对检查；ordinary提示手工完整门禁后退出
+# 基线不是 origin/main 时显式指定：make quality-check BASE=<本地已存在的基线ref>
 ```
 
 PostgreSQL 集成使用 `TASKRUNNER_TEST_PG_DSN`；`make e2e` 需要 Docker，并创建本次独有的 Redis 8.2.11 容器；6397/6398/6399 须空闲，冲突时退出而不删除已有容器。cron 场景由 `E2E_INCLUDE_CRON=1` 启用。
@@ -14,11 +14,27 @@ PostgreSQL 集成使用 `TASKRUNNER_TEST_PG_DSN`；`make e2e` 需要 Docker，�
 
 ### 真实投递 E2E 的重试等待
 
-CI 在现有 race/PG/Redis 检查后执行 `E2E_INCLUDE_CRON=1 make e2e`，验证真实进程、签名 HTTP、队列和 cron；Go 夹具回归随 `go test ./...` 一起执行，也可单独运行 `make test-e2e-fixture`。
+ordinary 档 CI 在现有 race/PG/Redis 检查后执行 `E2E_INCLUDE_CRON=1 make e2e`，验证真实进程、签名 HTTP、队列和 cron；Go 夹具回归随 `go test ./...` 一起执行，也可单独运行 `make test-e2e-fixture`。
 
 场景④保留生产默认退避。当前固定 Asynq v0.26.0 的首次重试为 15–44 秒；以首次失败尝试为锚点，另计延迟队列检查 5 秒、worker 轮询 1 秒、测试 HTTP 上限 5 秒和观察轮询 1 秒，等待预算为 56 秒。等待使用实际截止时间，确认数据库为 `dead` 且队列为 `archived` 后，才检查死信列表并手工重放；重放还须确认 HTTP200 和最终成功，不能因瞬时数据库状态提前发起。
 
 首次实机核验中，旧 40 秒窗口导致三项级联失败，原样串行重跑仍可复现；旧失败日志、数据库和时间线保留在主仓本机 ignored `.codex/audits/main-verification-20261114/siblings/`。时限和双状态就绪条件另有虚拟时间正反例，真实链不可由这些夹具测试替代。升级 Asynq 时需重新核对默认退避、轮询周期及状态错误合同。
+
+## 分档门禁
+
+`make quality-plan`只输出计划，`make quality-check`执行同源分类及document/reference检查；ordinary档退出并指向指南中的原门禁，须在独占环境手工执行，不自动连接服务或把打印清单当验证通过。两者默认`BASE=origin/main`，对基线到HEAD的完整差异加暂存、未暂存、未跟踪文件分类，避免只看末次提交。正式push/PR由事件精确SHA窗口分类；base缺失强制ordinary并披露无法历史比较，异常计划或候选不一致拒绝，不猜测成文档豁免。
+
+- `document`：纯说明、设计草稿、报告与导航，仅跑文档/本地链接检查及始终启用的提交规范；不声称运行产品测试。
+- `reference`：候选Schema、规划JSON、已隔离参考或工具，增加受影响文件的Schema/JSON/工具语法与专属验证；不能据此认定产品集成已通过。
+- `ordinary`：业务代码、运行配置、依赖、迁移、正式协议、产品测试、CI、分类器、门禁/豁免规则及未知文件，运行完整适用产品门禁；混合改动取最高档。门禁改动自身也在此档，测试先行纪律保持。
+
+分类器以仓内明确路径规则判定，文件扩展名本身不豁免。`document-check`始终执行；`reference-check`按计划执行；原`test` job只在`runtime=true`执行。最终`quality-gate`以`always()`汇总实际job结果：应跑项缺失、失败、取消或skipped均拒绝，计划外产品job的skipped须明确。必需检查策略是否已在远端启用需另核，不能从本地配置推断。
+
+完整产品门禁保留以下既有命令与环境要求：
+
+- `make lint`、`make test`、`make build`；CI保留`go vet ./...`、gofmt、`go test -race ./...`。
+- 专属PG/Redis下运行`TASKRUNNER_TEST_PG_DSN=<独占PG> TASKRUNNER_TEST_REDIS_ADDR=<独占Redis> go test -race -count=1 ./...`，再运行`E2E_INCLUDE_CRON=1 make e2e`；只操作本次创建的环境。
+- `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -test ./...`；`CGO_ENABLED=0 go build -trimpath -o <临时目录>/taskrunner ./cmd/taskrunner`后运行同版本`govulncheck -mode=binary <临时目录>/taskrunner`。
 
 ## 宿主启动与验证
 
@@ -73,4 +89,4 @@ amend 保护，`commit-msg` 先挡消息违规，`pre-push` 按 Git 提供的每
 
 固定启用基线见 `scripts/commit-policy-baseline`：仅其祖先为已推送存量，不改史、不自动前移。
 CI push 使用事件 before/after，PR 使用真实 base/head SHA，初推与 force push 均有覆盖；
-缺对象精确获取仍失败、非法 SHA 或浅克隆一律拒绝，不回退近 20 笔。现有代码测试 CI 保持。
+缺对象精确获取仍失败、非法 SHA 或浅克隆一律拒绝，不回退近 20 笔。产品测试命令保留，按本页分档计划运行。

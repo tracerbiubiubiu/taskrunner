@@ -23,3 +23,5 @@
 ## 统一入口与Git保留范围
 
 全项目阅读从主仓[文档总入口](../../zhuzhao/docs/README.md)开始，当前计划统一在[planning](../../zhuzhao/docs/planning/README.md)；本仓继续维护随源码版本变化的合同、指南和正式结论。原始调研、执行卡、原日志、截图、备份与纯操作收据归仓库外项目档案，短期执行产物可留ignored `.codex/`；材料ID与保留决定见[材料目录](../../zhuzhao/docs/materials.md)。机器台账、冻结来源、Schema样例和必要验证依据继续Git跟踪，不按扩展名批量忽略。
+
+复用审计方法、空白模板及开发提示词见主仓[工作资料库](../../zhuzhao/docs/toolkit/README.md)；创建和收尾按[文档维护约定](../../zhuzhao/docs/documentation.md)执行，原件与执行实例分开保存。

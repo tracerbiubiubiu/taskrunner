@@ -21,11 +21,26 @@ bin/
 .workbuddy/
 .codebuddy/
 
-# Local audit workspace
-.codex/
+# Local-only references and execution artifacts: archive outside this repository.
+# Keep legacy paths excluded to prevent accidental copying back; maintained docs stay in docs/.
+/doc/
+/deliverables/
+/outputs/
+/audit-reports/
+/.codex/
+/archives/
+/private/
+/references/
+/evidence/
+/maintenance/
 
-# Local reference and execution artifacts; tracked documentation lives in docs/
+# Preserve existing nested legacy workspace exclusions.
+.codex/
 doc/
 deliverables/
 outputs/
 audit-reports/
+
+# Local secret overrides; keep versioned environment templates visible.
+/.env.local
+/.env.*.local

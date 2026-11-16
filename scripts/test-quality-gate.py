@@ -67,6 +67,25 @@ class ClassificationTests(unittest.TestCase):
                     self.assertEqual(other['mode'], 'document')
                     self.assertEqual(other['references'], [])
 
+    def test_registered_source_link_pages_require_planning_checks_only_in_core(self):
+        for path in ('docs/phase6/module-design-handoff.md',
+                     'docs/phase6/task-activelist-message-detail.md',
+                     'docs/design/extension-compatibility.md',
+                     'docs/design/authorization-model-and-engine-choice.md',
+                     'docs/design/rbac-inheritance-and-cascade.md'):
+            with self.subTest(path=path):
+                core = CLASSIFY([change(path)], 'core')
+                self.assertEqual(core['mode'], 'reference')
+                self.assertEqual(core['references'], ['planning'])
+                self.assertFalse(core['runtime'])
+                mixed = CLASSIFY([change(path), change('internal/new.go')], 'core')
+                self.assertEqual(mixed['mode'], 'ordinary')
+                self.assertEqual(mixed['references'], ['planning'])
+                renamed = CLASSIFY([change('docs/design/retired.md', status='R', old_path=path)], 'core')
+                self.assertEqual(renamed['references'], ['planning'])
+                for kind in ('ui', 'taskrunner', 'activelist', 'utils'):
+                    self.assertEqual(CLASSIFY([change(path)], kind)['mode'], 'document')
+
     def test_current_view_mixed_and_renamed_inputs_keep_required_checks(self):
         renamed = CLASSIFY([change('docs/design/explanation.md', status='R',
                                     old_path='docs/roadmap.md')], 'core')

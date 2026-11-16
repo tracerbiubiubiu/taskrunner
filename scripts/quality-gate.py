@@ -40,7 +40,12 @@ GOVERNANCE = {'AGENTS.md', 'docs/standards.md', 'docs/review/planning-document-s
               'docs/guides/development.md', 'docs/guides/testing.md',
               'docs/design/engineering-execution-design.md'}
 CORE_PLANNING_PAGES = {'docs/roadmap.md', 'docs/review/11-project-control.md',
-                       'docs/review/planning-backlog.md', 'docs/review/execution-schedule.md'}
+                       'docs/review/planning-backlog.md', 'docs/review/execution-schedule.md',
+                       'docs/phase6/module-design-handoff.md',
+                       'docs/phase6/task-activelist-message-detail.md',
+                       'docs/design/extension-compatibility.md',
+                       'docs/design/authorization-model-and-engine-choice.md',
+                       'docs/design/rbac-inheritance-and-cascade.md'}
 
 
 def safe_path(path):

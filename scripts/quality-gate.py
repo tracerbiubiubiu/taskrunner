@@ -39,6 +39,8 @@ PROTOTYPES = {'docs/design/prototypes/lifecycle-workspace.html',
 GOVERNANCE = {'AGENTS.md', 'docs/standards.md', 'docs/review/planning-document-scope.json',
               'docs/guides/development.md', 'docs/guides/testing.md',
               'docs/design/engineering-execution-design.md'}
+CORE_PLANNING_PAGES = {'docs/roadmap.md', 'docs/review/11-project-control.md',
+                       'docs/review/planning-backlog.md', 'docs/review/execution-schedule.md'}
 
 
 def safe_path(path):
@@ -47,13 +49,15 @@ def safe_path(path):
         or any(p in ('..', '.') for p in path.split('/')))
 
 
-def _path_policy(path, consumed):
+def _path_policy(path, consumed, kind='core'):
     if not safe_path(path):
         return 'ordinary', [], 'invalid or nonportable path'
     if PurePosixPath(path).name == 'AGENTS.md':
         return 'ordinary', [], 'scoped collaboration policy authority'
     if path in consumed or path in GOVERNANCE or path.startswith('docs/api/'):
         return 'ordinary', [], 'runtime input or policy authority'
+    if kind == 'core' and path in CORE_PLANNING_PAGES:
+        return 'reference', ['planning'], 'current planning view consumed by semantic drift checks'
     if path == 'scripts/test-reference-prototypes.mjs':
         return 'ordinary', ['prototype'], 'checker requires full gates and self-test'
     if path in PROTOTYPES:
@@ -97,7 +101,7 @@ def classify_changes(changes, kind, consumed_paths=()):
         modes_safe = all(item.get(key, '100644') in ('000000', '100644')
                          for key in ('old_mode', 'new_mode'))
         for path in paths:
-            tier, recipes, reason = _path_policy(path, consumed)
+            tier, recipes, reason = _path_policy(path, consumed, kind)
             if not modes_safe:
                 tier, reason = 'ordinary', 'executable or symlink mode'
             rank = max(rank, {'document': 0, 'reference': 1, 'ordinary': 2}[tier])
@@ -114,8 +118,9 @@ def classify_changes(changes, kind, consumed_paths=()):
             'consumed_paths': sorted(consumed), 'changes': changes}
 
 
-def git(repo, *args):
-    return subprocess.check_output(['git', '-C', str(repo), *args], stderr=subprocess.PIPE)
+def git(repo, *args, input_bytes=None):
+    return subprocess.check_output(['git', '-C', str(repo), *args],
+                                   input=input_bytes, stderr=subprocess.PIPE)
 
 
 def _diff(repo, *revisions):
@@ -244,7 +249,7 @@ def build_plan(repo, base, head, kind, worktree=False):
     except (subprocess.CalledProcessError, ValueError):
         resolved_base = None
         fallback = 'base unavailable: ordinary gates required; no exemption inferred'
-        empty = git(repo, 'hash-object', '-t', 'tree', '--stdin').decode().strip()
+        empty = git(repo, 'hash-object', '-t', 'tree', '--stdin', input_bytes=b'').decode().strip()
         changes = _diff(repo, empty, resolved_head)
     if worktree:
         changes.extend(_diff(repo, '--cached', resolved_head))

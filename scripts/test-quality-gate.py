@@ -53,6 +53,30 @@ class ClassificationTests(unittest.TestCase):
                 plan = self.assert_mode([path], 'document')
                 self.assertFalse(plan['helper_security'])
 
+    def test_core_current_view_pages_keep_planning_semantic_validation(self):
+        for path in ('docs/roadmap.md', 'docs/review/11-project-control.md',
+                     'docs/review/planning-backlog.md', 'docs/review/execution-schedule.md'):
+            with self.subTest(path=path):
+                plan = CLASSIFY([change(path)], 'core')
+                self.assertEqual(plan['mode'], 'reference')
+                self.assertEqual(plan['references'], ['planning'])
+                self.assertFalse(plan['runtime'])
+                self.assertFalse(plan['helper_security'])
+                for kind in ('ui', 'taskrunner', 'activelist', 'utils'):
+                    other = CLASSIFY([change(path)], kind)
+                    self.assertEqual(other['mode'], 'document')
+                    self.assertEqual(other['references'], [])
+
+    def test_current_view_mixed_and_renamed_inputs_keep_required_checks(self):
+        renamed = CLASSIFY([change('docs/design/explanation.md', status='R',
+                                    old_path='docs/roadmap.md')], 'core')
+        self.assertEqual(renamed['references'], ['planning'])
+        mixed = CLASSIFY([change('docs/roadmap.md'), change('internal/new.go')], 'core')
+        self.assertTrue(mixed['runtime'])
+        self.assertEqual(mixed['references'], ['planning'])
+        consumed = CLASSIFY([change('docs/roadmap.md')], 'core', ['docs/roadmap.md'])
+        self.assertEqual(consumed['mode'], 'ordinary')
+
     def test_registered_nonruntime_artifacts_need_reference_recipes(self):
         for path in ('docs/review/planning-backlog.json',
                      'docs/design/mcp-first-contract.schema.json',
@@ -213,6 +237,18 @@ class GitWindowTests(unittest.TestCase):
         plan = BUILD(self.repo, '0' * 40, self.base, KIND)
         self.assertEqual(plan['mode'], 'ordinary')
         self.assertTrue(plan['runtime'])
+
+    def test_missing_base_uses_empty_tree_without_consuming_caller_stdin(self):
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name('quality-gate.py')),
+             'classify', '--kind', 'core', '--base', '0' * 40, '--head', self.base],
+            cwd=self.repo, env=self.env, input='caller input is not a Git tree\n',
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan['mode'], 'ordinary')
+        self.assertIsNone(plan['base'])
+        self.assertEqual({item['path'] for item in plan['changes']}, {'README.md', 'main.go'})
 
     def test_snapshot_digest_binds_staged_blob_even_when_worktree_is_unchanged(self):
         self.write('README.md', 'staged version A\n')

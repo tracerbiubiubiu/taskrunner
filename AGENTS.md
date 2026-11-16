@@ -6,7 +6,7 @@
 
 - 本仓负责任务受理、计划调度、投递、重试及执行账本；业务handler/效果归能力属主，用户授权归主仓。
 - [文档导航](docs/README.md)区分现行实现、目标设计、运行验证与历史；当前wire字段看[HTTP/回调契约](docs/api/contract.md)和实际源码。
-- 全生态工程、API、安全和测试纪律遵[主仓standards](../zhuzhao/docs/standards.md)；新需求/状态/估算只回填[唯一总账](../zhuzhao/docs/review/planning-backlog.md)。
+- 全生态工程、API、安全和测试纪律遵[主仓standards](../zhuzhao/docs/standards.md)；新需求/状态/估算只回填[唯一总账](../zhuzhao/docs/planning/planning-backlog.md)。
 - [平台集成合同](docs/design/platform-integration.md)含C03/D12/I01–I03等未实施目标；执行callback不等于结果已回贴，2xx不能抹掉现有完成语义缺口。
 
 ## 开发与验证

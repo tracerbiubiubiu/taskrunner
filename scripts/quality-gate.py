@@ -36,10 +36,12 @@ PLANNING_FILES = {
 }
 PROTOTYPES = {'docs/design/prototypes/lifecycle-workspace.html',
               'docs/phase5/prototypes/s1-form-designer.html'}
-GOVERNANCE = {'AGENTS.md', 'docs/standards.md', 'docs/review/planning-document-scope.json',
+GOVERNANCE = {'AGENTS.md', 'docs/standards.md', 'docs/planning/planning-document-scope.json',
+              'docs/review/planning-document-scope.json',
               'docs/guides/development.md', 'docs/guides/testing.md',
               'docs/design/engineering-execution-design.md'}
 CORE_PLANNING_PAGES = {'docs/roadmap.md', 'docs/review/11-project-control.md',
+                       'docs/planning/planning-backlog.md', 'docs/planning/execution-schedule.md',
                        'docs/review/planning-backlog.md', 'docs/review/execution-schedule.md',
                        'docs/phase6/module-design-handoff.md',
                        'docs/phase6/task-activelist-message-detail.md',
@@ -80,7 +82,7 @@ def _path_policy(path, consumed, kind='core'):
             return 'reference', [recipe], 'registered isolated reference example'
     if fnmatch.fnmatchcase(path, 'docs/design/*.schema.json') and path.count('/') == 2:
         return 'reference', ['schema'], 'candidate schema format only; no registered behavioral proof'
-    if path.startswith('docs/review/') and path.count('/') == 2 and path.endswith('.json'):
+    if path.startswith(('docs/review/', 'docs/planning/')) and path.count('/') == 2 and path.endswith('.json'):
         stem = PurePosixPath(path).stem
         if stem.startswith('planning-') or stem in PLANNING_FILES:
             return 'reference', ['planning'], 'registered planning data'

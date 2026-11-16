@@ -31,7 +31,7 @@ class ReferenceRunnerTests(unittest.TestCase):
         self.git('init', '--quiet')
         files = {'README.md': 'Reference fixture\n',
                  'Makefile': 'planning-check:\n\t@true\n',
-                 'docs/review/planning-backlog.json': '{}\n',
+                 'docs/planning/planning-backlog.json': '{}\n',
                  'docs/design/examples/mcp-sdk-interop/go.mod': 'module reference.invalid/sdk\n',
                  'docs/phase5/prototypes/s1-form-designer.html': '<html><script>let a = 1;</script></html>\n'}
         for path, content in files.items():
@@ -46,7 +46,7 @@ class ReferenceRunnerTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(['git', '-C', str(self.repo), *args], env=self.env, text=True).strip()
 
-    def plan(self, references, path='docs/review/planning-backlog.json', kind='core'):
+    def plan(self, references, path='docs/planning/planning-backlog.json', kind='core'):
         base = self.git('rev-parse', 'HEAD')
         target = self.repo / path
         target.parent.mkdir(parents=True, exist_ok=True)

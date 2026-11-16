@@ -1,6 +1,6 @@
 # 平台集成与后续演进合同
 
-> 2026-11-11 重规划。本文区分当前实现与待实施合同；不新增 API、状态字段或部署承诺。跨仓排期、工作量和关闭证据唯一登记在主仓[规划总账](../../../zhuzhao/docs/review/planning-backlog.md)，本仓按编号承接，不再维护另一套估算。通用约束见主仓[工程公约](../../../zhuzhao/docs/standards.md)。
+> 2026-11-11 重规划。本文区分当前实现与待实施合同；不新增 API、状态字段或部署承诺。跨仓排期、工作量和关闭证据唯一登记在主仓[规划总账](../../../zhuzhao/docs/planning/planning-backlog.md)，本仓按编号承接，不再维护另一套估算。通用约束见主仓[工程公约](../../../zhuzhao/docs/standards.md)。
 
 > **2026-11-13设计增量**：核心及可插拔业务能力的对外API、内部统一逻辑调用通道和跨数据闭环，以主仓[统一能力调用合同](../../../zhuzhao/docs/design/capability-invocation-contract.md)为权威。本页只维护TR的调度、投递和执行记录边界。新增CE及旧子范围已扣重净估，权威见主仓补齐估算注册表；原包不自动包干新增能力。当前仅设计阶段，T0未启动。
 
@@ -121,6 +121,6 @@ R03在P7出口选首供给，P8交管理员提交/登记→发布审批→不可
 
 ## 2026-11-13逐操作与三链详设后继
 
-主仓[实际操作库存](../../../zhuzhao/docs/design/capability-operation-catalog.md)给出当前route/service/调用者/写主与明确例外；[三链详设](../../../zhuzhao/docs/design/capability-interconnect-detail.md)和[精确Schema](../../../zhuzhao/docs/design/capability-interconnect-detail.schema.json)为CE01–05的目标合同。本仓旧wire仍以API文档和源码为准，未因候选Schema改版。净增、最小UI/运维和测试由[唯一补齐估算](../../../zhuzhao/docs/review/planning-scope-estimates.json)扣重后入当前排程，不另维护平行数字。
+主仓[实际操作库存](../../../zhuzhao/docs/design/capability-operation-catalog.md)给出当前route/service/调用者/写主与明确例外；[三链详设](../../../zhuzhao/docs/design/capability-interconnect-detail.md)和[精确Schema](../../../zhuzhao/docs/design/capability-interconnect-detail.schema.json)为CE01–05的目标合同。本仓旧wire仍以API文档和源码为准，未因候选Schema改版。净增、最小UI/运维和测试由[唯一补齐估算](../../../zhuzhao/docs/planning/planning-scope-estimates.json)扣重后入当前排程，不另维护平行数字。
 
 TR继续拥有调度/投递/attempt，业务效果由能力属主出收据。链A随CE02-D/D12在P6.3接工单关联，不依完整I01；链B/C在P7由CE03/04/05接AL命令、源订阅及共享准入。worker进入原operation执行阶段，重投不递归创建新任务；unknown按原收据对账，结果投影失败只重试投影。用户JWT不存队列，持续写须I02当前grant；客户端断开/队列成功不证明副作用取消/完成。

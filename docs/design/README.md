@@ -8,9 +8,9 @@
 
 ## 目标设计与实施窗口
 
-[平台集成合同](platform-integration.md)承接C03/D12/I01–I03/R03/R04的状态写主、授权、失败及验收边界；排期、依赖和状态归主仓[唯一总账](../../../zhuzhao/docs/review/planning-backlog.md)，本页不维护第二份进度。
+[平台集成合同](platform-integration.md)承接C03/D12/I01–I03/R03/R04的状态写主、授权、失败及验收边界；排期、依赖和状态归主仓[唯一总账](../../../zhuzhao/docs/planning/planning-backlog.md)，本页不维护第二份进度。
 
-所有入口复用主仓[统一调用合同](../../../zhuzhao/docs/design/capability-invocation-contract.md)；本仓[承接边界](platform-integration.md#统一能力通道中的tr边界)说明不把同步查询/本地事务全改成任务，也不直写其他仓库表。新增互通范围见[增量册](../../../zhuzhao/docs/review/capability-interconnect-supplement.md)，未复估、不自动包含在原预算。
+所有入口复用主仓[统一调用合同](../../../zhuzhao/docs/design/capability-invocation-contract.md)；本仓[承接边界](platform-integration.md#统一能力通道中的tr边界)说明不把同步查询/本地事务全改成任务，也不直写其他仓库表。新增互通范围见[增量册](../../../zhuzhao/docs/planning/capability-interconnect-supplement.md)，未复估、不自动包含在原预算。
 
 ## 运行验证与历史
 

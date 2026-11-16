@@ -5,11 +5,37 @@ vendor/
 *.db
 .git/
 
-# Local audit workspace
-.codex/
+# Local-only references and execution artifacts: archive outside this repository.
+# Keep legacy paths excluded to prevent accidental copying back; maintained docs stay in docs/.
+/doc/
+/deliverables/
+/outputs/
+/audit-reports/
+/.codex/
+/archives/
+/private/
+/references/
+/evidence/
+/maintenance/
 
-# Local reference and execution artifacts; tracked documentation lives in docs/
+# Preserve existing nested legacy workspace exclusions.
+.codex/
 doc/
 deliverables/
 outputs/
 audit-reports/
+
+# Host state and local secrets are not Docker build inputs.
+/.git/
+/.hg/
+/.svn/
+/.zcode/
+/.codebuddy/
+/.workbuddy/
+/.opencode/
+/.env
+/.env.local
+/.env.*.local
+/bin/
+/logs/
+/data/

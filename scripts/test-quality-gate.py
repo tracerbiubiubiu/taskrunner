@@ -32,6 +32,26 @@ def change(path, *, status='M', old_path=None, old_mode='100644', new_mode='1006
 
 
 class ClassificationTests(unittest.TestCase):
+    def test_planning_migration_keeps_recipes_and_policy_boundaries(self):
+        for directory in ('docs/review/', 'docs/planning/'):
+            for filename in ('planning-backlog.json', 'owner-decision-agenda.json',
+                             'planning-backlog.md', 'execution-schedule.md'):
+                with self.subTest(directory=directory, filename=filename):
+                    plan = CLASSIFY([change(directory + filename)], 'core')
+                    self.assertEqual(plan['mode'], 'reference')
+                    self.assertEqual(plan['references'], ['planning'])
+            governance = CLASSIFY([change(directory + 'planning-document-scope.json')], 'core')
+            self.assertEqual(governance['mode'], 'ordinary')
+        for kind in ('core', 'ui', 'activelist', 'taskrunner', 'utils'):
+            for path in ('docs/planning/unregistered.json', 'docs/planning/runtime.py'):
+                self.assertEqual(CLASSIFY([change(path)], kind)['mode'], 'ordinary')
+        renamed = CLASSIFY([change('docs/planning/planning-backlog.json', status='R',
+                                   old_path='docs/review/planning-backlog.json')], 'core')
+        self.assertEqual(renamed['references'], ['planning'])
+        consumed = CLASSIFY([change('docs/planning/planning-backlog.json')], 'core',
+                            ['docs/planning/planning-backlog.json'])
+        self.assertEqual(consumed['mode'], 'ordinary')
+
     def assert_mode(self, paths, mode, *, consumed_paths=()):
         changes = [change(path) if isinstance(path, str) else path for path in paths]
         plan = CLASSIFY(changes, KIND, list(consumed_paths))
@@ -55,7 +75,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_core_current_view_pages_keep_planning_semantic_validation(self):
         for path in ('docs/roadmap.md', 'docs/review/11-project-control.md',
-                     'docs/review/planning-backlog.md', 'docs/review/execution-schedule.md'):
+                     'docs/planning/planning-backlog.md', 'docs/planning/execution-schedule.md'):
             with self.subTest(path=path):
                 plan = CLASSIFY([change(path)], 'core')
                 self.assertEqual(plan['mode'], 'reference')
@@ -97,7 +117,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(consumed['mode'], 'ordinary')
 
     def test_registered_nonruntime_artifacts_need_reference_recipes(self):
-        for path in ('docs/review/planning-backlog.json',
+        for path in ('docs/planning/planning-backlog.json',
                      'docs/design/mcp-first-contract.schema.json',
                      'docs/design/examples/ai-soc-reference/fixtures.json',
                      'docs/design/examples/mcp-sdk-interop/go.mod',
@@ -137,7 +157,7 @@ class ClassificationTests(unittest.TestCase):
         self.assert_mode(['README.md', 'internal/service/ticket/create.go'], 'ordinary')
 
     def test_reference_and_product_mixture_keeps_both_validation_sets(self):
-        plan = CLASSIFY([change('docs/review/planning-backlog.json'),
+        plan = CLASSIFY([change('docs/planning/planning-backlog.json'),
                          change('internal/service/ticket/create.go')], KIND)
         self.assertEqual(plan['mode'], 'ordinary')
         self.assertTrue(plan['runtime'])
@@ -244,8 +264,8 @@ class GitWindowTests(unittest.TestCase):
                         {item['path'] for item in plan['changes']})
 
     def test_local_reference_window_includes_staged_source(self):
-        self.write('docs/review/planning-backlog.json', '{}\n')
-        head = self.commit('reference only commit', 'docs/review/planning-backlog.json')
+        self.write('docs/planning/planning-backlog.json', '{}\n')
+        head = self.commit('reference only commit', 'docs/planning/planning-backlog.json')
         self.write('main.go', 'package main\nfunc main() {}\n')
         self.git('add', '--', 'main.go')
         plan = BUILD(self.repo, self.base, head, KIND, worktree=True)
@@ -394,7 +414,7 @@ class FixtureIsolationTests(unittest.TestCase):
 class ResultGuardTests(unittest.TestCase):
     def plan(self, mode='document', helper=False):
         path = {'document': 'README.md',
-                'reference': 'docs/review/planning-backlog.json',
+                'reference': 'docs/planning/planning-backlog.json',
                 'ordinary': 'internal/service/ticket/create.go'}[mode]
         paths = [change(path)]
         if helper:

@@ -61,9 +61,10 @@ type Config struct {
 	// （预期调用方 AK→SK，当前唯一调用方 zhuzhao）；Self = 本服务签名身份
 	//（回调 zhuzhao 时使用，AK 须与 zhuzhao internal_jobs.taskrunner_ak 一致）。
 	Security struct {
-		Callers map[string]string `mapstructure:"callers"`
-		SelfAK  string            `mapstructure:"self_ak"`
-		SelfSK  string            `mapstructure:"self_sk"`
+		Callers                map[string]string `mapstructure:"callers"`
+		TrustedOperatorCallers []string          `mapstructure:"trusted_operator_callers"`
+		SelfAK                 string            `mapstructure:"self_ak"`
+		SelfSK                 string            `mapstructure:"self_sk"`
 	}
 }
 
@@ -134,6 +135,8 @@ func Load(path string) (*Config, error) {
 	bind("security.self_sk", "TASKRUNNER_SELF_SK", "")
 	viper.BindEnv("security.callers.zhuzhao", "TASKRUNNER_CALLER_ZHUZHAO_SK")
 
+	viper.SetDefault("security.trusted_operator_callers", []string{"zhuzhao"})
+	viper.BindEnv("security.trusted_operator_callers", "TASKRUNNER_TRUSTED_OPERATOR_CALLERS")
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
@@ -153,6 +156,11 @@ func Load(path string) (*Config, error) {
 	// fail-closed：验签密钥环为空 = API 完全裸奔——拒绝启动（对齐 zhuzhao internal_jobs 拍板）
 	if len(cfg.Security.Callers) == 0 {
 		return nil, fmt.Errorf("security.callers 为空（env TASKRUNNER_CALLER_ZHUZHAO_SK 注入 zhuzhao 的 SK）——API 不允许无验签启动")
+	}
+	for _, caller := range cfg.Security.TrustedOperatorCallers {
+		if _, ok := cfg.Security.Callers[caller]; !ok {
+			return nil, fmt.Errorf("trusted operator caller %q has no configured signing credential", caller)
+		}
 	}
 	// fail-closed：driver=pg 但库名缺失 → DSN 无法定位库，拒绝启动
 	if cfg.DB.Driver == "pg" && cfg.DB.DBName == "" {

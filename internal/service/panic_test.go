@@ -123,3 +123,7 @@ func TestBackgroundPanicChild(t *testing.T) {
 	}
 	t.Log("AUDIT_ALIVE_NEXT_TICK")
 }
+
+func (p *panicSubmitter) SubmitCron(ctx context.Context, _ repository.Job, payload task.Payload, _, _ time.Time) (bool, error, error) {
+	return p.Submit(ctx, payload)
+}

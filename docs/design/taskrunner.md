@@ -29,11 +29,11 @@ Redis 丢失后仅 `queued=0 + pending` 可自动重建；`queued=1 + pending` �
 
 ## 执行、重试与并发
 
-worker 固定并发池同步等待 HTTP 回调。2xx 表示动作完全成功；4xx 为不可重试失败；5xx、超时和回调边界 panic 按既有重试策略处理，最终失败进入 dead。回调可能已执行却响应丢失，因此交付是 at-least-once，属主必须幂等。
+worker 固定并发池同步等待 HTTP 回调。2xx 表示动作完全成功；408/429为可重试，其余4xx为不可重试失败；5xx、超时和回调边界 panic 按既有重试策略处理，最终失败进入 dead。回调可能已执行却响应丢失，因此交付是 at-least-once，属主必须幂等。
 
-每次 delivery 生成新 `execution_id`；`internal/worker/worker.go` 的 `Deps.handleCallback` 取得执行权，终态更新通过 repository 的 `MarkRunning` / `Finish` 匹配身份、attempt 和状态。旧 delivery 被拒后不发送死信通知。此栅栏保护执行库，不保证跨 DB/HTTP exactly-once；MarkRunning 缺行或 DB 故障时继续回调并留日志的既有受容边界仍在。升级不能混跑旧 writer，见 [部署](../ops/deployment.md)。
+每次 delivery 生成新 `execution_id`；`internal/worker/worker.go` 的 `Deps.handleCallback` 取得执行权，终态更新通过 repository 的 `MarkRunning` / `Finish` 匹配身份、attempt 和状态。旧 delivery 被拒后不发送死信通知。此栅栏保护执行库，不保证跨 DB/HTTP exactly-once；MarkRunning缺行或DB故障时不执行回调；Finish写入失败不确认队列成功，过期delivery仍SkipRetry且不覆盖新终态。业务属主仍须处理效果已提交但响应丢失的重放。升级不能混跑旧 writer，见 [部署](../ops/deployment.md)。
 
-cron/reclaim 以单 tick 捕获 panic 并记 Error 堆栈，下一轮继续；notifier 以单通知捕获，后续通知独立。进程致命错误、任意回调外程序故障与数据库持续失败不在该恢复承诺内。多副本 worker 可共享队列；当前 cron tick 的多副本重复触发防护仍需部署前单独落实，不能将队列原子取任务等同定时生成任务防重。
+cron/reclaim 以单 tick 捕获 panic 并记 Error 堆栈，下一轮继续；notifier 以单通知捕获，后续通知独立。进程致命错误、任意回调外程序故障与数据库持续失败不在该恢复承诺内。当前正式支持画像为单实例；`App.Run`以事实DB的PG session advisory锁/SQLite同文件flock在服务及后台前互斥，所有权丢失或不可证取消停服。单例不是发生次去重；本候选cron以job_id+原due时隙的稳定ID，在同库事务内CAS next_run和写pending outbox，提交后才投队列；共享同一DB的loop不为同一due重复建任务。完整HA和跨独立SQLite文件去重未交付，支持画像仍须按部署限制验收，不能将队列原子取任务等同调度防重。
 
 ## 权限、标签与日志
 

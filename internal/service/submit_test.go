@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -226,5 +227,106 @@ func TestSubmitConcurrentSameTaskID(t *testing.T) {
 	// UNIQUE 约束保证至多一行；acceptedCount==1 保证至少一行
 	if _, err := st.GetByTaskID(context.Background(), "race"); err != nil {
 		t.Fatalf("row must exist: %v", err)
+	}
+}
+
+func TestSubmitInputConflictExactJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name, action, params string
+		conflict             bool
+	}{
+		{"key order", "a", `{"z":1.0,"id":9007199254740992}`, false},
+		{"different action", "b", `{"id":9007199254740992,"z":1}`, true},
+		{"adjacent large integer", "a", `{"id":9007199254740993,"z":1}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, enq, _ := newSubmitSvc(t)
+			p := submitPayload("exact")
+			p.Params = []byte(`{"id":9007199254740992,"z":1}`)
+			if _, _, err := svc.Submit(context.Background(), p); err != nil {
+				t.Fatal(err)
+			}
+			p.Action = tc.action
+			p.Params = []byte(tc.params)
+			accepted, _, err := svc.Submit(context.Background(), p)
+			var conflict *ConflictError
+			if tc.conflict && !errors.As(err, &conflict) {
+				t.Fatalf("different immutable input must conflict; accepted=%v err=%v", accepted, err)
+			}
+			if !tc.conflict && (err != nil || accepted) {
+				t.Fatalf("equivalent input must be idempotent: %v %v", accepted, err)
+			}
+			if enq.count() != 1 {
+				t.Fatalf("conflict/idempotent must not enqueue again: %d", enq.count())
+			}
+		})
+	}
+}
+
+func TestConcurrentSubmitDifferentInput(t *testing.T) {
+	svc, st, enq, _ := newSubmitSvc(t)
+	type result struct {
+		p        task.Payload
+		accepted bool
+		err      error
+	}
+	out := make(chan result, 8)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			p := submitPayload("competing-input")
+			if i%2 == 0 {
+				p.Params = []byte(`{"id":9007199254740992}`)
+			} else {
+				p.Params = []byte(`{"id":9007199254740993}`)
+			}
+			a, _, err := svc.Submit(context.Background(), p)
+			out <- result{p, a, err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(out)
+	row, err := st.GetByTaskID(context.Background(), "competing-input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := 0
+	for result := range out {
+		if result.accepted {
+			accepted++
+		}
+		same := string(result.p.Params) == row.Params
+		var conflict *ConflictError
+		if !same && !errors.As(result.err, &conflict) {
+			t.Fatalf("losing input did not conflict: %v", result.err)
+		}
+		if same && result.err != nil {
+			t.Fatalf("same winning input failed: %v", result.err)
+		}
+	}
+	if accepted != 1 || enq.count() != 1 {
+		t.Fatalf("one immutable operation: accepted=%d enqueue=%d", accepted, enq.count())
+	}
+}
+
+func TestNewTaskIDMatchesCoreCharacterWidth(t *testing.T) {
+	svc, _, enq, _ := newSubmitSvc(t)
+	for _, n := range []int{64, 65} {
+		p := submitPayload(strings.Repeat("字", n))
+		accepted, _, err := svc.Submit(context.Background(), p)
+		if n == 64 && (!accepted || err != nil) {
+			t.Fatalf("64 Unicode characters are valid: %v %v", accepted, err)
+		}
+		if n == 65 && (accepted || err == nil) {
+			t.Fatalf("65 characters must fail before persistence: %v %v", accepted, err)
+		}
+	}
+	if enq.count() != 1 {
+		t.Fatalf("oversize ID reached queue: %d", enq.count())
 	}
 }

@@ -70,3 +70,17 @@ docker compose up -d --build
 指引属主排查；负向实测：`TASKRUNNER_LOG_DIR=/etc` → `log 目录不可写 … uid 100`）。
 
 2026-11-06 ECO-B07-F11：容器/环境缺省/冻结yaml统一既定18080，生产compose探针与共享网地址均对齐；无宿主ports发布。覆盖监听端口时须同步探针与调用方，环境差异用env，不改冻结yaml。
+
+## 存量任务链修复候选的升级
+
+2026-11-17本地候选已完成独占环境验证，尚未合入main或部署：`go test -race -count=1 ./...`有226项通过，另2项仅供父测试启动的子进程helper在顶层跳过，其父测试已实际执行；PG/Redis路径未因缺环境跳过。`E2E_INCLUDE_CRON=1 make e2e`的20项通过，lint、test、build通过，source及本轮新编二进制的govulncheck均无发现。完整范围、首次失败和收据见[本轮正式报告](../../../zhuzhao/docs/review/reports/audit-baseline-repair-2026-11-17.md)，原材料ID为`maintenance/audit-baseline-repair-20261117/`；以下升级约束仍按单实例画像适用，不据此宣称TR HA已实现。
+
+本候选无新增DDL，沿原jobs/job_runs/Redis数据切换。先停旧scheduler及writer、备份执行库并核对pending/running/failed/dead；新旧loop不能混跑，因为旧loop为同一due生成随机task_id。新loop的原due稳定ID和CAS事务不重命名历史run。回退前同样停新writer/排空并保留备份，回退会失去该发生次保护。
+
+`security.trusted_operator_callers`默认`[zhuzhao]`，可用`TASKRUNNER_TRUSTED_OPERATOR_CALLERS`覆盖；每个受信caller须已有验签key。显式空列表关闭真人声明，只记录服务主体。首次升级核对主仓签名operator；旧body.created_by/owner_service/submitted_by/actor不再覆盖可信归因。历史归因不批量改写，不能拿历史可疑created_by作为执行授权。
+
+本候选`App.Run`在HTTP/ready、worker和cron/reclaim前取得事实库单例：PG持专用session advisory锁，SQLite对规范化同文件旁的`.instance.lock`取本机flock（symlink同源也互斥）；失败直接退出，不切换DB或新建备用SQLite。运行期每500ms核对session仍持锁/文件inode，单次核验上限2s；丢失或不可证明时取消后台，并先停止worker拉取新任务，再排空HTTP和既有任务，不能让在途HTTP阻塞期间继续拉新。锁文件不作为可删除临时文件，进程退出由内核释放flock；升级/备份按固定DB来源，不能运行中删除或替换锁文件。
+
+生命周期取消后，新HTTP请求（包括`/readyz`）在进入业务路由前返回503及错误码10008，并携带`Retry-After: 1`；已经进入的请求及任务按上述排空处理。停止worker拉取本身等待时，这道受理闸也保持关闭，不以监听端口尚可连接表示实例仍可接业务。
+
+共享同一事实库的双loop防重和启动互斥不代表多主机、独立SQLite文件或完整TR HA支持。PG锁只在同一事实DB内、文件锁只在同机同文件域内生效；复制出独立DB不是同一事实源，部署须固定来源。按本批单实例画像运行，主仓本地归档与TR归档只启一个。联合切换时先确认主仓在途/未确认终态回503，旧主仓的在途2xx不能靠TR单侧升级弥补。

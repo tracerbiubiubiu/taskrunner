@@ -105,3 +105,7 @@ func TestSSRF_UpdateJobRejectsCallbackURL(t *testing.T) {
 		t.Fatalf("patch callback_url must be rejected, got %v", err)
 	}
 }
+
+func (f *ssrfCapSubmitter) SubmitJob(ctx context.Context, _ repository.Job, p task.Payload) (bool, error, error) {
+	return f.Submit(ctx, p)
+}

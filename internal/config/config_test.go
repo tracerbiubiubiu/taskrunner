@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/spf13/viper"
 	"os"
 	"path/filepath"
 	"strings"
@@ -183,5 +184,30 @@ func TestLoadFailClosed(t *testing.T) {
 				t.Fatalf("want err containing %q, got %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestTrustedOperatorCallersExplicitEmpty(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	t.Setenv("TASKRUNNER_CALLER_ZHUZHAO_SK", "sk-z")
+	t.Setenv("TASKRUNNER_SELF_SK", "sk-t")
+	p := writeYaml(t, "security:\n  trusted_operator_callers: []\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Security.TrustedOperatorCallers) != 0 {
+		t.Fatalf("explicit empty list must trust no human declarations: %v", cfg.Security.TrustedOperatorCallers)
+	}
+}
+func TestTrustedOperatorCallersNeedCredential(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	t.Setenv("TASKRUNNER_CALLER_ZHUZHAO_SK", "sk-z")
+	t.Setenv("TASKRUNNER_SELF_SK", "sk-t")
+	p := writeYaml(t, "security:\n  trusted_operator_callers: [unknown]\n")
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "no configured signing credential") {
+		t.Fatalf("unconfigured trusted caller: %v", err)
 	}
 }

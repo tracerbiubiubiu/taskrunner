@@ -77,11 +77,12 @@ func stateText(status string) string {
 
 // TaskService 任务域服务。
 type TaskService struct {
-	repo      *repository.Store
-	submitter Submitter
-	inspector TaskInspector
-	queue     string
-	logger    *slog.Logger
+	repo             *repository.Store
+	trustedOperators map[string]bool
+	submitter        Submitter
+	inspector        TaskInspector
+	queue            string
+	logger           *slog.Logger
 	// callbackTarget 服务端回调目标（W0b SSRF 根治）：出站 URL 一律此值，
 	// 永不取自请求体/jobs 存量列——生态内回调唯一合法消费者 = zhuzhao
 	// /internal/jobs/callback（十七批：用户级 URL 无正当用途）。
@@ -100,7 +101,7 @@ func (s *TaskService) now() time.Time {
 func NewTaskService(repo *repository.Store, submitter Submitter,
 	inspector TaskInspector, queue string, logger *slog.Logger, callbackTarget string) *TaskService {
 	return &TaskService{repo: repo, submitter: submitter, inspector: inspector, queue: queue,
-		logger: logger, callbackTarget: callbackTarget}
+		logger: logger, callbackTarget: callbackTarget, trustedOperators: map[string]bool{"zhuzhao": true}}
 }
 
 // ---- 提交 ----
@@ -131,6 +132,9 @@ type SubmitOutput struct {
 }
 
 func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput, error) {
+	if err := validateParameters(in.Params); err != nil {
+		return nil, err
+	}
 	if in.Action == "" {
 		return nil, invalid("action 必填")
 	}
@@ -145,6 +149,10 @@ func (s *TaskService) Submit(ctx context.Context, in SubmitInput) (*SubmitOutput
 	if in.TaskID == "" {
 		in.TaskID = uuid.NewString()
 	}
+	if err := validateTaskID(in.TaskID); err != nil {
+		return nil, err
+	}
+	in.SubmittedBy, _ = s.attribution(ctx)
 	accepted, warning, err := s.submitter.Submit(ctx, task.Payload{
 		TaskID: in.TaskID, RequestID: in.RequestID, Action: in.Action, Dept: in.Dept,
 		CallbackURL: s.callbackTarget, Params: in.Params,
@@ -472,6 +480,9 @@ func jobView(j *repository.Job) JobView {
 }
 
 func (s *TaskService) CreateJob(ctx context.Context, in JobInput) (*JobView, error) {
+	if err := validateParameters(in.Params); err != nil {
+		return nil, err
+	}
 	if in.ActionID == "" || in.TriggerType == "" {
 		return nil, invalid("action_id / trigger_type 必填")
 	}
@@ -496,11 +507,12 @@ func (s *TaskService) CreateJob(ctx context.Context, in JobInput) (*JobView, err
 	if len(in.Params) > 0 {
 		params = string(in.Params)
 	}
-	if in.OwnerService == "" {
-		in.OwnerService = "zhuzhao"
-	}
+	in.CreatedBy, in.OwnerService = s.attribution(ctx)
 	now := s.now()
 	next, hasNext := NextRun(in.CronSpec, enabled && in.TriggerType == repository.TriggerCron, now)
+	if enabled && in.TriggerType == repository.TriggerCron && !hasNext {
+		return nil, invalid("cron_spec 没有可执行的未来时刻")
+	}
 	j := repository.Job{
 		JobID: uuid.NewString(), ActionID: in.ActionID, TriggerType: in.TriggerType,
 		CallbackURL: in.CallbackURL, CronSpec: in.CronSpec, Params: params, Dept: in.Dept,
@@ -530,6 +542,9 @@ func (s *TaskService) ListJobs(ctx context.Context, f repository.JobFilter) ([]J
 }
 
 func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (*JobView, error) {
+	if err := validateParameters(p.Params); err != nil {
+		return nil, err
+	}
 	// W0b：PATCH 拒改 callback_url（同 SSRF 收口）
 	if p.CallbackURL != nil {
 		return nil, invalid("callback_url 不再接受（回调地址由服务端配置决定）")
@@ -567,6 +582,9 @@ func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (
 	}
 	j.UpdatedAt = s.now()
 	next, hasNext := NextRun(j.CronSpec, j.Enabled && j.TriggerType == repository.TriggerCron, j.UpdatedAt)
+	if j.Enabled && j.TriggerType == repository.TriggerCron && !hasNext {
+		return nil, invalid("cron_spec 没有可执行的未来时刻")
+	}
 	j.NextRun.Valid, j.NextRun.Time = hasNext, next
 	if err := s.repo.UpdateJob(ctx, *j); err != nil {
 		return nil, err
@@ -577,9 +595,12 @@ func (s *TaskService) UpdateJob(ctx context.Context, jobID string, p JobPatch) (
 
 // TriggerInput 手动触发入参（body 可空）。
 type TriggerInput struct {
-	RequestID string
-	Actor     string
-	SourceIP  string
+	TaskID         string
+	ExpectedAction *string
+	ExpectedParams json.RawMessage
+	RequestID      string
+	Actor          string
+	SourceIP       string
 }
 
 // TriggerJob 手动执行一次：按定义组装参数走统一提交路径（「立即执行」按钮）。
@@ -594,13 +615,41 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 	if !j.Enabled {
 		return nil, conflict("任务定义已停用（enabled=false），请先启用后再触发")
 	}
-	taskID := uuid.NewString()
-	accepted, warning, err := s.submitter.Submit(ctx, task.Payload{
-		TaskID: taskID, RequestID: in.RequestID, Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
-		CallbackURL: s.callbackTarget, // W0b：读侧覆盖 jobs 列（SSRF 收口，存量行不迁）
-		Params:      []byte(j.Params),
-		SubmittedBy: in.Actor, SourceIP: in.SourceIP, TimeoutSecs: j.TimeoutSecs,
+
+	if (in.ExpectedAction == nil) != (in.ExpectedParams == nil) {
+		return nil, invalid("expected_action 与 expected_params 必须成对提供")
+	}
+	if in.ExpectedAction != nil {
+		if err := validateParameters(in.ExpectedParams); err != nil {
+			return nil, err
+		}
+		equal, err := task.EqualJSON([]byte(j.Params), in.ExpectedParams)
+		if err != nil {
+			return nil, conflict("任务定义参数无法安全比对")
+		}
+		if *in.ExpectedAction != j.ActionID || !equal {
+			return nil, conflict("任务定义与准入快照不一致")
+		}
+	}
+	taskID := in.TaskID
+	if taskID == "" {
+		taskID = uuid.NewString()
+	}
+	if err := validateTaskID(taskID); err != nil {
+		return nil, err
+	}
+	in.Actor, _ = s.attribution(ctx)
+	submitter, ok := s.submitter.(interface {
+		SubmitJob(context.Context, repository.Job, task.Payload) (bool, error, error)
 	})
+	if !ok {
+		return nil, fmt.Errorf("job submitter lacks transactional snapshot support")
+	}
+	accepted, warning, err := submitter.SubmitJob(ctx, *j, task.Payload{
+		TaskID: taskID, RequestID: in.RequestID, Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
+		CallbackURL: s.callbackTarget, Params: []byte(j.Params), SubmittedBy: in.Actor, SourceIP: in.SourceIP, TimeoutSecs: j.TimeoutSecs,
+	})
+
 	if err != nil {
 		return nil, err
 	}
@@ -610,4 +659,18 @@ func (s *TaskService) TriggerJob(ctx context.Context, jobID string, in TriggerIn
 			slog.String("task_id", taskID), slog.String("job_id", j.JobID), slog.Any("err", warning))
 	}
 	return &SubmitOutput{TaskID: taskID, Accepted: accepted, Action: j.ActionID, Params: []byte(j.Params)}, nil
+}
+
+// GetJob is the signed, service-side source lookup used before the core
+// authorizes an update/trigger. It is not proof of authorization or a lock.
+func (s *TaskService) GetJob(ctx context.Context, jobID string) (*JobView, error) {
+	j, err := s.repo.GetJob(ctx, jobID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, jobNotFound(jobID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	v := jobView(j)
+	return &v, nil
 }

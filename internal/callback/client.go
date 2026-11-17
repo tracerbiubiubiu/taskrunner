@@ -1,5 +1,5 @@
 // Package callback 执行对 zhuzhao 内网端点的 HTTP 回调（设计文档 §4 契约）：
-// 2xx = 受理成功；4xx = 不可重试失败；5xx / 超时 / 网络错误 = 可重试。
+// 2xx = 动作完成；408/429及5xx/超时/网络错误可重试，其余4xx不可重试。
 package callback
 
 import (
@@ -45,6 +45,7 @@ func New(cfg Config) *Client {
 // body 回调请求体（契约见 zhuzhao-integration.md §2.1）。
 type body struct {
 	TaskID    string    `json:"task_id"`
+	JobID     string    `json:"job_id,omitempty"`
 	RequestID string    `json:"request_id"`
 	Action    string    `json:"action"`
 	Params    paramJSON `json:"params,omitempty"`
@@ -75,6 +76,7 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 
 	b, err := json.Marshal(body{
 		TaskID:    p.TaskID,
+		JobID:     p.JobID,
 		RequestID: p.RequestID,
 		Action:    p.Action,
 		Params:    paramJSON(p.Params),
@@ -113,6 +115,8 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 		// 直接映射 4xx/5xx，本判定即最终行为）；body 不再解析，排障走 zhuzhao 侧日志。
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 		return nil
+	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests:
+		return fmt.Errorf("回调失败（可重试）：对端返回 HTTP %d，动作 %s，响应片段: %q", resp.StatusCode, p.Action, readSnippet(resp.Body))
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		// 4xx = 对端明确拒绝（动作不存在/参数错误/鉴权失败）：重试不改变结果，终败
 		return fmt.Errorf("%w：对端返回 HTTP %d（客户端错误），动作 %s，响应片段: %q",

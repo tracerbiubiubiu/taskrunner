@@ -93,14 +93,37 @@ func TestHandle5xxUnknownRetryBudgetGoesDead(t *testing.T) {
 	}
 }
 
-func TestHandleMissingRowStillExecutes(t *testing.T) {
-	d, mux := newDeps(t, fakeCB{})
-	ctx := context.Background()
-	if err := mux.ProcessTask(ctx, payload(t, "ghost")); err != nil {
-		t.Fatalf("missing row should not fail the task: %v", err)
+func TestHandleMissingRowBlocksCallback(t *testing.T) {
+	var calls int32
+	d, mux := newDeps(t, fakeCB{calls: &calls})
+	err := mux.ProcessTask(context.Background(), payload(t, "ghost"))
+	if err == nil || calls != 0 {
+		t.Fatalf("missing claim must fail without callback; err=%v calls=%d", err, calls)
 	}
-	if _, err := d.Store.GetByTaskID(ctx, "ghost"); !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("row must stay missing, got %v", err)
+	if _, err := d.Store.GetByTaskID(context.Background(), "ghost"); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatal(err)
+	}
+}
+
+type closeStoreCB struct {
+	store *repository.Store
+	calls int
+}
+
+func (c *closeStoreCB) Do(context.Context, task.Payload) error { c.calls++; return c.store.Close() }
+func TestFinishFailureIsNotAcknowledged(t *testing.T) {
+	st, err := repository.Open(filepath.Join(t.TempDir(), "finish.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb := &closeStoreCB{store: st}
+	d := Deps{Store: st, Callback: cb, Logger: slog.Default()}
+	if err := st.InsertPending(context.Background(), repository.Run{TaskID: "finish-failure", Action: "a", EnqueuedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	err = NewMux(d).ProcessTask(context.Background(), payload(t, "finish-failure"))
+	if err == nil || errors.Is(err, asynq.SkipRetry) || cb.calls != 1 {
+		t.Fatalf("unconfirmed finish must retry, not acknowledge: %v calls=%d", err, cb.calls)
 	}
 }
 

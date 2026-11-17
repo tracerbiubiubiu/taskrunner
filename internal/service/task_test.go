@@ -241,3 +241,23 @@ func TestRetryRaces(t *testing.T) {
 		t.Fatalf("status: %s", r.Status)
 	}
 }
+
+func TestCreateJobInternalBodyHasNoAttributionAuthority(t *testing.T) {
+	st, err := repository.Open(filepath.Join(t.TempDir(), "caller.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	svc := NewTaskService(st, nil, nil, "jobs", slog.Default(), "http://localhost/callback")
+	j, err := svc.CreateJob(context.Background(), JobInput{ActionID: "a", TriggerType: repository.TriggerManual, CreatedBy: "admin", OwnerService: "forged"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.CreatedBy != "service:taskrunner" || j.OwnerService != "taskrunner" {
+		t.Fatalf("internal body forged actor: %+v", j)
+	}
+}
+
+func (f fakeSubmitter) SubmitJob(ctx context.Context, _ repository.Job, p task.Payload) (bool, error, error) {
+	return f.Submit(ctx, p)
+}

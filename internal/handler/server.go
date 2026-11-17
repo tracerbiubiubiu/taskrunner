@@ -5,7 +5,6 @@ package handler
 
 import (
 	"io"
-	"strings"
 
 	"encoding/json"
 	"errors"
@@ -13,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -53,7 +53,16 @@ func New(d Deps) *gin.Engine {
 	// 服务间验签（2026-09-16 统一批）：utils GinMiddleware + AKSKFail——读体上限
 	// （默认 8MB）/分档中文失败响应/caller·operator 归因写入全部库内承接；
 	// 失败现场经 Logger 落统一日志。密钥环空 = 全部 401（启动级 fail-closed 在 config）。
-	v1 := r.Group("/v1", aksk.GinMiddleware(&aksk.Verifier{Keys: d.Keys, Logger: d.Logger}, response.AKSKFail()))
+	v1 := r.Group("/v1", aksk.GinMiddleware(&aksk.Verifier{Keys: d.Keys, Logger: d.Logger}, response.AKSKFail()), func(c *gin.Context) {
+		caller, operator := c.GetString(aksk.ContextKeyCaller), c.GetString(aksk.ContextKeyOperator)
+		if !utf8.ValidString(operator) || utf8.RuneCountInString(operator) > 64 {
+			response.BadRequest(c, "operator 超过上限（64）")
+			c.Abort()
+			return
+		}
+		c.Request = c.Request.WithContext(service.WithCaller(c.Request.Context(), caller, operator))
+		c.Next()
+	})
 	{
 		v1.POST("/tasks", d.submitTask)
 		v1.GET("/tasks/:id", d.getTask)
@@ -62,6 +71,7 @@ func New(d Deps) *gin.Engine {
 		v1.GET("/runs", d.listRuns)
 		v1.GET("/dead-letters", d.listDeadLetters)
 		v1.GET("/jobs", d.listJobs)
+		v1.GET("/jobs/:job_id", d.getJob)
 		v1.POST("/jobs", d.createJob)
 		v1.POST("/jobs/update", d.patchJob)
 		v1.POST("/jobs/trigger", d.triggerJob)
@@ -248,17 +258,7 @@ func (d *Deps) createJob(c *gin.Context) {
 		response.BadRequest(c, "params 不是合法 JSON，请检查后重试")
 		return
 	}
-	// created_by 服务端兜底（归因口径 2026-09-11）：body 缺省取验签头 X-Operator
-	//（中间件已入 ctx）——调用方无关，杜绝「创建人落空」；显式传值优先。
-	// 卫生约束：去空白防纯空格串；64 上限对齐 activelist operator 列
-	req.CreatedBy = strings.TrimSpace(req.CreatedBy)
-	if len(req.CreatedBy) > 64 {
-		response.BadRequest(c, "created_by 超过上限（64）")
-		return
-	}
-	if req.CreatedBy == "" {
-		req.CreatedBy = c.GetString(aksk.ContextKeyOperator)
-	}
+	// Body created_by/owner_service remain wire-compatible but have no authority.
 	v, err := d.Tasks.CreateJob(c.Request.Context(), service.JobInput{
 		ActionID: req.ActionID, CallbackURL: req.CallbackURL, TriggerType: req.TriggerType,
 		CronSpec: req.CronSpec, Params: req.Params, Dept: req.Dept, Enabled: req.Enabled,
@@ -331,10 +331,13 @@ func (d *Deps) patchJob(c *gin.Context) {
 }
 
 type triggerReq struct {
-	JobID     string `json:"job_id" binding:"required"`
-	RequestID string `json:"request_id"`
-	Actor     string `json:"actor"`
-	SourceIP  string `json:"source_ip"`
+	TaskID         string          `json:"task_id"`
+	ExpectedAction *string         `json:"expected_action"`
+	ExpectedParams json.RawMessage `json:"expected_params"`
+	JobID          string          `json:"job_id" binding:"required"`
+	RequestID      string          `json:"request_id"`
+	Actor          string          `json:"actor"`
+	SourceIP       string          `json:"source_ip"`
 }
 
 func (d *Deps) triggerJob(c *gin.Context) {
@@ -346,6 +349,7 @@ func (d *Deps) triggerJob(c *gin.Context) {
 		req.RequestID = c.GetString("request_id") // 同 submitTask：头值兜底
 	}
 	out, err := d.Tasks.TriggerJob(c.Request.Context(), req.JobID, service.TriggerInput{
+		TaskID: req.TaskID, ExpectedAction: req.ExpectedAction, ExpectedParams: req.ExpectedParams,
 		RequestID: req.RequestID, Actor: req.Actor, SourceIP: req.SourceIP,
 	})
 	if err != nil {
@@ -444,3 +448,12 @@ func atoi(s string, def int) int {
 // validTimeoutSecs 回调/任务超时上界（审计 M2）：0 = 沿用默认 30s；
 // 正值上限 1 天——无上界的 timeout 会经 asynq 占死 worker 槽位并阻塞优雅停机。
 func validTimeoutSecs(secs int) bool { return secs >= 0 && secs <= 86400 }
+
+func (d *Deps) getJob(c *gin.Context) {
+	v, err := d.Tasks.GetJob(c.Request.Context(), c.Param("job_id"))
+	if err != nil {
+		d.fail(c, err, "查询失败")
+		return
+	}
+	response.OK(c, v)
+}

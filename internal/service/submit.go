@@ -63,14 +63,21 @@ func buildEnqueueOpts(p task.Payload, queue string, maxRetry int, retention time
 	return opts
 }
 
-// Submit 受理任务。accepted=false 表示 task_id 已存在（幂等重提，非错误）。
+// Submit受理任务。accepted=false且无error仅表示同task_id/action/params幂等重提。
+// 同task_id异action/params返回ConflictError，保留原任务且零新增执行。
 // 入队失败（Redis 抖动）返回 warning：行已落库即 SSOT，reclaim 修复后执行——
 // 200 语义 =「已受理，待入队」；warning 仅进日志不回传响应体（F8）。
 func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, warning error, err error) {
+	if err := validateTaskID(p.TaskID); err != nil {
+		return false, nil, err
+	}
+	if err := validateParameters(p.Params); err != nil {
+		return false, nil, err
+	}
 	// A1：先查 job_runs。Asynq 的 TaskID 冲突只在任务还留在 Redis 时成立（succeeded 后 ID 被释放），
 	// job_runs 的行是终身的——以它为准关掉「完成后同 task_id 重提导致重复执行 + 覆盖历史」的窗口。
-	if _, err := s.Store.GetByTaskID(ctx, p.TaskID); err == nil {
-		return false, nil, nil
+	if existing, err := s.Store.GetByTaskID(ctx, p.TaskID); err == nil {
+		return false, nil, sameInput(existing, p)
 	} else if !errors.Is(err, repository.ErrNotFound) {
 		return false, nil, fmt.Errorf("submit: check existing: %w", err)
 	}
@@ -92,12 +99,18 @@ func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, wa
 		// UNIQUE 并发重复采用驱动无关判定（F23）：失败后复查 GetByTaskID——
 		// 命中 ⇒ 并发重提（幂等 200）；未命中（含复查失败）⇒ 真错误 → 500
 		//（此刻 Redis 无任务、DB 无行，干净失败）。
-		if _, cerr := s.Store.GetByTaskID(ctx, p.TaskID); cerr == nil {
-			return false, nil, nil
+		if existing, cerr := s.Store.GetByTaskID(ctx, p.TaskID); cerr == nil {
+			return false, nil, sameInput(existing, p)
 		}
 		return false, nil, fmt.Errorf("submit: insert pending: %w", err)
 	}
 
+	return s.enqueuePersisted(ctx, p, payload)
+}
+
+// enqueuePersisted projects a committed pending outbox row to Redis. Both
+// ordinary submissions and atomically claimed cron occurrences use this path.
+func (s *Service) enqueuePersisted(ctx context.Context, p task.Payload, payload []byte) (bool, error, error) {
 	// A3：入队。行已落库即 SSOT——此刻起任何失败都有可见、可修的记录。
 	if _, err := s.Client.Enqueue(asynq.NewTask(task.TypeCallback, payload),
 		buildEnqueueOpts(p, s.Queue, s.MaxRetry, s.Retention)...); err != nil {
@@ -129,4 +142,78 @@ func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, wa
 		}
 	}
 	return true, nil, nil
+}
+
+func sameInput(existing *repository.Run, p task.Payload) error {
+	equal, err := task.EqualJSON([]byte(existing.Params), p.Params)
+	if err != nil {
+		return conflict("task_id 已存在且原参数无法安全比对")
+	}
+	if existing.Action != p.Action || existing.JobID != p.JobID || !equal {
+		return conflict("task_id 已存在且 action/params 不一致")
+	}
+	return nil
+}
+
+// SubmitCron persists the original due slot and its next_run advance in one
+// local transaction before any queue call. Losing loop instances do no work.
+func (s *Service) SubmitCron(ctx context.Context, j repository.Job, p task.Payload, next, now time.Time) (bool, error, error) {
+	if err := validateParameters(p.Params); err != nil {
+		return false, nil, err
+	}
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return false, nil, err
+	}
+	params := string(p.Params)
+	if params == "" {
+		params = "{}"
+	}
+	claimed, err := s.Store.ClaimCronOccurrence(ctx, j, next, now, repository.Run{
+		TaskID: p.TaskID, Action: p.Action, JobID: p.JobID, Dept: p.Dept, Params: params, CallbackURL: p.CallbackURL,
+		SubmittedBy: p.SubmittedBy, EnqueuedAt: now, EnqueuePayload: string(payload),
+	})
+	if err != nil || !claimed {
+		return false, nil, err
+	}
+	return s.enqueuePersisted(ctx, p, payload)
+}
+
+// SubmitJob freezes the current enabled job execution snapshot and the original
+// task identity in one DB transaction before projecting it to the queue.
+func (s *Service) SubmitJob(ctx context.Context, j repository.Job, p task.Payload) (bool, error, error) {
+	equal, compareErr := task.EqualJSON([]byte(j.Params), p.Params)
+	if compareErr != nil || !equal || p.Action != j.ActionID || p.JobID != j.JobID || p.Dept != j.Dept || p.TimeoutSecs != j.TimeoutSecs {
+		return false, nil, conflict("冻结载荷与任务定义不一致")
+	}
+
+	if err := validateTaskID(p.TaskID); err != nil {
+		return false, nil, err
+	}
+	if err := validateParameters(p.Params); err != nil {
+		return false, nil, err
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return false, nil, err
+	}
+	params := string(p.Params)
+	if params == "" {
+		params = "{}"
+	}
+	inserted, err := s.Store.ClaimJobRun(ctx, j, repository.Run{TaskID: p.TaskID, RequestID: p.RequestID, Action: p.Action, JobID: p.JobID, Dept: p.Dept, Params: params, CallbackURL: p.CallbackURL, SubmittedBy: p.SubmittedBy, SourceIP: p.SourceIP, EnqueuedAt: time.Now(), EnqueuePayload: string(raw)})
+	if errors.Is(err, repository.ErrJobSnapshotChanged) {
+		return false, nil, conflict("任务定义已变化，请重新核验后触发")
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if !inserted {
+		existing, err := s.Store.GetByTaskID(ctx, p.TaskID)
+		if err != nil {
+			return false, nil, err
+		}
+		return false, nil, sameInput(existing, p)
+	}
+	return s.enqueuePersisted(ctx, p, raw)
 }

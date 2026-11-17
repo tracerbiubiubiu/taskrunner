@@ -1,5 +1,13 @@
 # taskrunner 部署（M3/D 阶段交付物）
 
+## 主线承接状态（2026-11-17，已合入main）
+
+本批已由[TR #8](https://github.com/tracerbiubiubiu/taskrunner/pull/8)合入main，分支/PR及功能main适用CI通过，未部署。准确主线状态统一见[主线合入报告](../../../zhuzhao/docs/review/reports/audit-baseline-main-merge-2026-11-17.md)，材料ID`maintenance/audit-baseline-main-merge-20261117/`。
+
+本页保留本地验证和支持画像；精确PR、head、merge及各CI在上述主报告统一维护，不复制第二份状态表。
+
+下文“本地候选”的验证记录及旧材料ID保留原时点，首失败、重试和helper skip边界继续可追溯。主线承接沿用单实例画像；此前组合验证中的同机PG/S3/JSONL恢复演练不等于跨介质一致快照、PITR或异机灾备，现有HA及完整receipt后继边界不变。
+
 ## 执行身份升级（ECO-B07-F05，2026-11-06）
 
 先备份DB、排空或停止全部旧taskrunner写实例，再启动新版本。`repository.migrateColumns`按既有启动迁移惯例给PG/SQLite的`job_runs`添加`execution_id TEXT NOT NULL DEFAULT ''`；保留存量任务/状态/attempt，旧行首次被新worker取得时写新身份。该列仅为内部并发栅栏，不进入API或载荷。每次delivery重新生成身份，终态写入同时匹配status/attempt/identity；旧实例忽略新谓词，混跑不满足修复条件。
@@ -73,7 +81,7 @@ docker compose up -d --build
 
 ## 存量任务链修复候选的升级
 
-2026-11-17本地候选已完成独占环境验证，尚未合入main或部署：`go test -race -count=1 ./...`有226项通过，另2项仅供父测试启动的子进程helper在顶层跳过，其父测试已实际执行；PG/Redis路径未因缺环境跳过。`E2E_INCLUDE_CRON=1 make e2e`的20项通过，lint、test、build通过，source及本轮新编二进制的govulncheck均无发现。完整范围、首次失败和收据见[本轮正式报告](../../../zhuzhao/docs/review/reports/audit-baseline-repair-2026-11-17.md)，原材料ID为`maintenance/audit-baseline-repair-20261117/`；以下升级约束仍按单实例画像适用，不据此宣称TR HA已实现。
+2026-11-17合入前本地验收记录（当时尚未合入main或部署）：`go test -race -count=1 ./...`有226项通过，另2项仅供父测试启动的子进程helper在顶层跳过，其父测试已实际执行；PG/Redis路径未因缺环境跳过。`E2E_INCLUDE_CRON=1 make e2e`的20项通过，lint、test、build通过，source及本轮新编二进制的govulncheck均无发现。完整范围、首次失败和收据见[本轮正式报告](../../../zhuzhao/docs/review/reports/audit-baseline-repair-2026-11-17.md)，原材料ID为`maintenance/audit-baseline-repair-20261117/`；以下升级约束仍按单实例画像适用，不据此宣称TR HA已实现。
 
 本候选无新增DDL，沿原jobs/job_runs/Redis数据切换。先停旧scheduler及writer、备份执行库并核对pending/running/failed/dead；新旧loop不能混跑，因为旧loop为同一due生成随机task_id。新loop的原due稳定ID和CAS事务不重命名历史run。回退前同样停新writer/排空并保留备份，回退会失去该发生次保护。
 

@@ -2,13 +2,14 @@
 // 职责归属说明：本文件在 service 包（业务编排层：触发决策依赖 jobs 表数据），
 // 与 internal/worker（队列消费执行层：回调执行）分层不同、非不对称——前者决定
 // 「何时发起」，后者负责「可靠执行」。
-// 每 tick 读出到期（next_run <= now）的 enabled cron 定义 → 走统一提交路径（新 task_id）→ 推进 next_run。
+// 每 tick 读出到期定义，以原due稳定身份，在同库事务内认领、推进并写pending，再投队列。
 // 定义经 API 增改停启后，下一个 tick 天然生效，无需维护内存注册表；进程宕机期间的错失触发
 // 在重启后首个 tick 至多补一次（next_run 已过期即触发），随后按新周期推进。
 package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -23,15 +24,18 @@ type Submitter interface {
 	Submit(ctx context.Context, p task.Payload) (accepted bool, warning error, err error)
 }
 
+type CronSubmitter interface {
+	SubmitCron(context.Context, repository.Job, task.Payload, time.Time, time.Time) (bool, error, error)
+}
+
 type Loop struct {
 	Store  *repository.Store
-	Submit Submitter
+	Submit CronSubmitter
 	Logger *slog.Logger
 	// CallbackTargetURL W0b：cron 触发的出站回调目标——忽略 jobs 列存量值
 	//（十七批「读侧覆盖不迁存量」），一律配置值。
 	CallbackTargetURL string
 	Tick              time.Duration // 默认 30s（cron 最细粒度 1 分钟，30s 轮询足够）
-	NewTaskID         func() string
 	Now               func() time.Time
 }
 
@@ -49,7 +53,8 @@ func NextRun(spec string, enabled bool, from time.Time) (time.Time, bool) {
 	if err != nil {
 		return time.Time{}, false
 	}
-	return sched.Next(from), true
+	next := sched.Next(from)
+	return next, !next.IsZero()
 }
 
 func (l *Loop) Run(ctx context.Context) {
@@ -77,47 +82,36 @@ func (l *Loop) FireDue(ctx context.Context) {
 		l.Logger.Error("cronloop: list due jobs failed", slog.Any("err", err))
 		return
 	}
+
 	for _, j := range due {
-		newID := l.newTaskID()
-		p := task.Payload{
-			TaskID: newID,
-			Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
-			CallbackURL: l.CallbackTargetURL, // W0b：读侧覆盖存量列
-			Params:      []byte(j.Params),
-			TimeoutSecs: j.TimeoutSecs,
-			// cron 触发无用户参与：request_id / submitted_by / source_ip 留空（§4）
-		}
-		if _, warn, err := l.Submit.Submit(ctx, p); err != nil {
-			l.Logger.Error("cronloop: submit failed",
-				slog.String("job_id", j.JobID), slog.String("action", j.ActionID), slog.Any("err", err))
-			continue // 不推进 next_run：下个 tick 重试本次触发
-		} else if warn != nil {
-			// ADR-004：warning = 行已落库但入队失败（语义较旧世界「落库失败」反转），reclaim 将重试
-			l.Logger.Warn("cronloop: job_runs persisted but enqueue failed, reclaim loop will retry",
-				slog.String("job_id", j.JobID), slog.String("task_id", newID), slog.Any("err", warn))
-		}
 		next, ok := NextRun(j.CronSpec, true, now)
 		if !ok {
-			// spec 已失效（不该发生，创建/更新时已校验）：真正落库停用（enabled=false +
-			// next_run=NULL）并告警——仅清 next_run 会因零值时间戳仍命中到期扫描，每 tick 重触发
-			if derr := l.Store.DisableJob(ctx, j.JobID, l.now()); derr != nil {
-				l.Logger.Error("cronloop: disable job failed, will retry disable next tick",
-					slog.String("job_id", j.JobID), slog.Any("err", derr))
-				continue
+			if err := l.Store.DisableCronSnapshot(ctx, *j, now); err != nil {
+				l.Logger.Error("cronloop: disable invalid spec failed", "job_id", j.JobID, "err", err)
 			}
-			l.Logger.Error("cronloop: invalid spec, job disabled",
-				slog.String("job_id", j.JobID), slog.String("spec", j.CronSpec))
 			continue
 		}
-		if uerr := l.Store.UpdateJobNextRun(ctx, j.JobID, next, l.now()); uerr != nil {
-			// 推进失败 → 下个 tick 以新 task_id 重触发同一动作（task_id 幂等拦不住），
-			// 显式告警供运维介入
-			l.Logger.Error("cronloop: advance next_run failed, duplicate fire risk",
-				slog.String("job_id", j.JobID), slog.Any("err", uerr))
+		p := task.Payload{TaskID: CronTaskID(j.JobID, j.NextRun.Time), Action: j.ActionID, JobID: j.JobID, Dept: j.Dept,
+			CallbackURL: l.CallbackTargetURL, Params: []byte(j.Params), TimeoutSecs: j.TimeoutSecs}
+		claimed, warn, err := l.Submit.SubmitCron(ctx, *j, p, next, now)
+		if err != nil {
+			l.Logger.Error("cronloop: occurrence transaction failed; retry original due slot", "job_id", j.JobID, "err", err)
+			continue
 		}
-		l.Logger.Info("cronloop: job fired",
-			slog.String("job_id", j.JobID), slog.String("action", j.ActionID), slog.String("task_id", newID))
+		if !claimed {
+			continue
+		}
+		if warn != nil {
+			l.Logger.Warn("cronloop: occurrence persisted; reclaim will enqueue", "task_id", p.TaskID, "err", warn)
+		}
+		l.Logger.Info("cronloop: occurrence committed", "job_id", j.JobID, "task_id", p.TaskID)
 	}
+}
+
+// CronTaskID is stable for the original scheduled slot, including process
+// restart and delayed ticks. Its 41 bytes fit the core's existing 64-byte key.
+func CronTaskID(jobID string, due time.Time) string {
+	return "cron:" + uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("%s\x00%s", jobID, due.UTC().Format(time.RFC3339Nano)))).String()
 }
 
 func (l *Loop) now() time.Time {
@@ -125,11 +119,4 @@ func (l *Loop) now() time.Time {
 		return l.Now()
 	}
 	return time.Now()
-}
-
-func (l *Loop) newTaskID() string {
-	if l.NewTaskID != nil {
-		return l.NewTaskID()
-	}
-	return uuid.NewString()
 }

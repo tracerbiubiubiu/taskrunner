@@ -400,8 +400,8 @@ func TestC11DeptFilterNegative(t *testing.T) {
 	}
 }
 
-// 归因口径（2026-09-11）回归：created_by 服务端兜底——body 缺省取验签头
-// X-Operator（fixture 签名固定 Operator=10086），显式传值优先。
+// 归因修复：受信caller的验签Operator是唯一真人来源，body不能覆盖。
+// fixture签名固定Operator=10086；旧created_by字段只兼容读取。
 func TestCreateJobCreatedByFallback(t *testing.T) {
 	f := newFixture(t)
 	w := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{
@@ -424,8 +424,8 @@ func TestCreateJobCreatedByFallback(t *testing.T) {
 	})
 	_, m2 := decode(t, w2)
 	job2 := m2["data"].(map[string]any)
-	if job2["created_by"] != "bob" {
-		t.Fatalf("body 显式传值应优先于头: %v", job2["created_by"])
+	if job2["created_by"] != "10086" {
+		t.Fatalf("body 伪造值不得覆盖可信operator: %v", job2["created_by"])
 	}
 }
 
@@ -705,5 +705,115 @@ func TestDeadLettersQueueClassification(t *testing.T) {
 				t.Fatalf("internal error leaked:%s", w.Body.String())
 			}
 		})
+	}
+}
+
+func TestGetJobDefinitionAuthenticated(t *testing.T) {
+	f := newFixture(t)
+	w := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{"action_id": "a", "trigger_type": "manual", "params": map[string]any{"n": 1}})
+	_, m := decode(t, w)
+	job := m["data"].(map[string]any)
+	w = f.do(t, http.MethodGet, "/v1/jobs/"+job["job_id"].(string), nil)
+	if w.Code != 200 {
+		t.Fatalf("single job definition must be readable: %d %s", w.Code, w.Body.String())
+	}
+	_, m = decode(t, w)
+	if m["data"].(map[string]any)["action_id"] != "a" {
+		t.Fatal(m)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+job["job_id"].(string), nil)
+	out := httptest.NewRecorder()
+	f.engine.ServeHTTP(out, req)
+	if out.Code != 401 {
+		t.Fatalf("unsigned definition read: %d", out.Code)
+	}
+}
+
+func TestUnapprovedCallerCannotDeclareHuman(t *testing.T) {
+	f := newFixture(t)
+	svc := service.NewTaskService(f.st, f.sub, f.insp, "jobs", slog.Default(), "http://test-zhuzhao/internal/jobs/callback")
+	svc.SetTrustedOperatorCallers([]string{"zhuzhao"})
+	f.engine = New(Deps{Tasks: svc, Keys: map[string][]byte{"other": []byte("other-sk")}, Logger: slog.Default()})
+	raw := []byte(`{"action_id":"a","trigger_type":"manual","created_by":"admin","owner_service":"zhuzhao"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	aksk.Sign(req, raw, aksk.SignOptions{AK: "other", SK: []byte("other-sk"), Operator: "admin"})
+	w := httptest.NewRecorder()
+	f.engine.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("signed service request: %d %s", w.Code, w.Body.String())
+	}
+	_, m := decode(t, w)
+	j := m["data"].(map[string]any)
+	if j["created_by"] != "service:other" || j["owner_service"] != "other" {
+		t.Fatalf("unapproved caller must remain service principal: %v", j)
+	}
+}
+func TestSubmitBodyActorCannotOverrideVerifiedOperator(t *testing.T) {
+	f := newFixture(t)
+	w := f.do(t, http.MethodPost, "/v1/tasks", map[string]any{"task_id": "actor", "action": "a", "submitted_by": "admin"})
+	if w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	r, err := f.st.GetByTaskID(context.Background(), "actor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.SubmittedBy != "10086" {
+		t.Fatalf("body actor overrode verified caller: %s", r.SubmittedBy)
+	}
+}
+
+func TestTriggerExpectedInputAndPreallocatedID(t *testing.T) {
+	f := newFixture(t)
+	created := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{"action_id": "a", "trigger_type": "manual", "params": json.RawMessage(`{"id":9007199254740992}`)})
+	_, m := decode(t, created)
+	id := m["data"].(map[string]any)["job_id"]
+	w := f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": id, "task_id": "core-before-callback", "expected_action": "a", "expected_params": json.RawMessage(`{"id":9007199254740993}`)})
+	if w.Code != 409 || len(f.sub.submitted) != 0 {
+		t.Fatalf("changed expected input must reject before Submit: %d count=%d %s", w.Code, len(f.sub.submitted), w.Body.String())
+	}
+	w = f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": id, "task_id": "core-before-callback", "expected_action": "a", "expected_params": json.RawMessage(`{"id":9007199254740992}`)})
+	if w.Code != 200 {
+		t.Fatalf("matching frozen input: %d %s", w.Code, w.Body.String())
+	}
+	_, m = decode(t, w)
+	if m["data"].(map[string]any)["task_id"] != "core-before-callback" {
+		t.Fatalf("preallocated core identity lost: %v", m)
+	}
+	if len(f.sub.submitted) != 1 || f.sub.submitted[0].JobID != id {
+		t.Fatalf("job association lost: %+v", f.sub.submitted)
+	}
+}
+func TestTriggerExpectedFieldsMustBePaired(t *testing.T) {
+	f := newFixture(t)
+	w := f.do(t, http.MethodPost, "/v1/jobs", map[string]any{"action_id": "a", "trigger_type": "manual"})
+	_, m := decode(t, w)
+	id := m["data"].(map[string]any)["job_id"]
+	w = f.do(t, http.MethodPost, "/v1/jobs/trigger", map[string]any{"job_id": id, "expected_action": "a"})
+	if w.Code != 400 || len(f.sub.submitted) != 0 {
+		t.Fatalf("unpaired expectation must reject: %d %+v", w.Code, f.sub.submitted)
+	}
+}
+
+func (f *fakeSubmitter) SubmitJob(ctx context.Context, _ repository.Job, p task.Payload) (bool, error, error) {
+	return f.Submit(ctx, p)
+}
+
+func TestSignedOperatorUsesCharacterLimit(t *testing.T) {
+	f := newFixture(t)
+	for _, n := range []int{64, 65} {
+		raw := []byte(`{"action_id":"a","trigger_type":"manual"}`)
+		req := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		aksk.Sign(req, raw, aksk.SignOptions{AK: callerAK, SK: []byte(callerSK), Operator: strings.Repeat("字", n)})
+		w := httptest.NewRecorder()
+		f.engine.ServeHTTP(w, req)
+		if n == 64 && w.Code != 200 {
+			t.Fatalf("64-character signed actor rejected: %d %s", w.Code, w.Body.String())
+		}
+		if n == 65 && w.Code != 400 {
+			t.Fatalf("oversized signed actor accepted: %d", w.Code)
+		}
 	}
 }

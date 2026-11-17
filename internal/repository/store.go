@@ -45,8 +45,9 @@ const (
 )
 
 type Store struct {
-	db *sql.DB
-	pg bool // true = PostgreSQL：执行前做 ?→$n 占位符转换
+	db     *sql.DB
+	target string
+	pg     bool // true = PostgreSQL：执行前做 ?→$n 占位符转换
 }
 
 // Run job_runs 一行。
@@ -173,7 +174,7 @@ func open(driver, target string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: migrate indexes: %w", err)
 	}
-	return &Store{db: db, pg: driver == DriverPG}, nil
+	return &Store{db: db, pg: driver == DriverPG, target: target}, nil
 }
 
 // schemaFor 按驱动返回建表 DDL（列集一致，仅自增/类型方言差异）。
@@ -468,7 +469,7 @@ WHERE task_id = ? AND status NOT IN (?, ?) AND (status = ? OR attempts <= ?)`,
 	if n == 0 {
 		// 0行=行缺失、终态复活或较旧attempt索取执行权被拒；pending允许手动retry重启计数。
 		// 补查分类（ADR-004 F59：UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按
-		// 未知包装，worker 对未知维持「继续执行」旧口径）：
+		// 未知包装，worker 对未知拒绝执行回调）：
 		run, gerr := s.GetByTaskID(ctx, taskID)
 		switch {
 		case gerr == nil && run.Status != StatusSucceeded && run.Status != StatusCanceled:

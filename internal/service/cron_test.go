@@ -16,6 +16,7 @@ import (
 type recSubmitter struct {
 	submitted []task.Payload
 	fail      bool
+	store     *repository.Store
 }
 
 func (r *recSubmitter) Submit(_ context.Context, p task.Payload) (bool, error, error) {
@@ -42,16 +43,16 @@ func TestFireDueAdvancesNextRun(t *testing.T) {
 		NextRun: sql.NullTime{Valid: true, Time: past}, // 已到期
 	})
 
-	sub := &recSubmitter{}
+	sub := &recSubmitter{store: st}
 	loop := &service.Loop{Store: st, Submit: sub, Logger: slog.Default(),
-		NewTaskID: func() string { return "cron-tk-1" }, Now: func() time.Time { return time.Now() }}
+		Now: func() time.Time { return time.Now() }}
 	loop.FireDue(context.Background())
 
 	if len(sub.submitted) != 1 {
 		t.Fatalf("want 1 submission, got %d", len(sub.submitted))
 	}
 	p := sub.submitted[0]
-	if p.JobID != "j1" || p.Action != "audit_archive" || p.TaskID != "cron-tk-1" {
+	if p.JobID != "j1" || p.Action != "audit_archive" || p.TaskID != service.CronTaskID("j1", past) {
 		t.Fatalf("payload: %+v", p)
 	}
 	if p.SubmittedBy != "" || p.RequestID != "" {
@@ -62,8 +63,7 @@ func TestFireDueAdvancesNextRun(t *testing.T) {
 	}
 
 	// next_run 已推进到未来：再次 fireDue 不应重复触发
-	loop2 := &service.Loop{Store: st, Submit: sub, Logger: slog.Default(),
-		NewTaskID: func() string { return "cron-tk-2" }}
+	loop2 := &service.Loop{Store: st, Submit: sub, Logger: slog.Default()}
 	loop2.FireDue(context.Background())
 	if len(sub.submitted) != 1 {
 		t.Fatalf("advanced next_run should not refire, got %d", len(sub.submitted))
@@ -71,7 +71,7 @@ func TestFireDueAdvancesNextRun(t *testing.T) {
 
 	// 推进后的 next_run 落在下一个 03:00（未来、时分为 3:00）
 	j, _ := st.GetJob(context.Background(), "j1")
-	if !j.NextRun.Valid || !j.NextRun.Time.After(time.Now()) || j.NextRun.Time.Hour() != 3 || j.NextRun.Time.Minute() != 0 {
+	if !j.NextRun.Valid || !j.NextRun.Time.After(time.Now()) || j.NextRun.Time.In(past.Location()).Hour() != 3 || j.NextRun.Time.In(past.Location()).Minute() != 0 {
 		t.Fatalf("next_run not advanced properly: %+v", j.NextRun)
 	}
 }
@@ -86,8 +86,8 @@ func TestSubmitFailureDoesNotAdvance(t *testing.T) {
 		CallbackURL: "http://x", Enabled: true, CreatedAt: past, UpdatedAt: past,
 		NextRun: sql.NullTime{Valid: true, Time: past},
 	})
-	sub := &recSubmitter{fail: true}
-	loop := &service.Loop{Store: st, Submit: sub, Logger: slog.Default(), NewTaskID: func() string { return "t" }}
+	sub := &recSubmitter{fail: true, store: st}
+	loop := &service.Loop{Store: st, Submit: sub, Logger: slog.Default()}
 	loop.FireDue(context.Background())
 
 	j, _ := st.GetJob(context.Background(), "j2")
@@ -102,5 +102,19 @@ func TestNextRunDisabled(t *testing.T) {
 	}
 	if _, ok := service.NextRun("0 3 * * *", true, time.Now()); !ok {
 		t.Fatal("enabled cron job should have next_run")
+	}
+}
+
+func (r *recSubmitter) SubmitCron(ctx context.Context, j repository.Job, p task.Payload, next, now time.Time) (bool, error, error) {
+	accepted, warn, err := r.Submit(ctx, p)
+	if err != nil {
+		return false, warn, err
+	}
+	return accepted, warn, r.store.UpdateJobNextRun(ctx, j.JobID, next, now)
+}
+
+func TestNextRunUnsatisfiableSpec(t *testing.T) {
+	if next, ok := service.NextRun("0 0 30 2 *", true, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)); ok || !next.IsZero() {
+		t.Fatalf("impossible cron must not produce an enabled zero occurrence: %v %v", next, ok)
 	}
 }

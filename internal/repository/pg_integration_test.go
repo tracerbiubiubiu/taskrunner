@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -304,5 +305,102 @@ CREATE TABLE job_runs (
 	}
 	if r, err := s.GetByTaskID(ctx, "pg-lg"); err != nil || r.Dept != "audit" || r.JobID != "j" {
 		t.Fatalf("pg migrated columns round-trip: %+v %v", r, err)
+	}
+}
+
+// Concurrent due claims use the real PG row lock and one atomic outbox/advance
+// transaction; a trigger proves rollback when the pending insert cannot commit.
+func TestPGCronOccurrenceAtomicClaim(t *testing.T) {
+	st := openTestStorePG(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	j := Job{JobID: "pg-occurrence", ActionID: "a", TriggerType: TriggerCron, CronSpec: "* * * * *", Params: "{}", Enabled: true, NextRun: sql.NullTime{Valid: true, Time: now.Add(-time.Minute)}, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)}
+	if err := st.CreateJob(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	r := Run{TaskID: "cron:fixed-original-due", Action: "a", JobID: j.JobID, Params: "{}", EnqueuedAt: now, EnqueuePayload: "{}"}
+	if _, err := st.db.Exec(`CREATE FUNCTION reject_occurrence() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected pending failure'; END $$; CREATE TRIGGER reject_pending BEFORE INSERT ON job_runs FOR EACH ROW EXECUTE FUNCTION reject_occurrence()`); err != nil {
+		t.Fatal(err)
+	}
+	defer st.db.Exec(`DROP TRIGGER IF EXISTS reject_pending ON job_runs; DROP FUNCTION IF EXISTS reject_occurrence()`)
+	if ok, err := st.ClaimCronOccurrence(ctx, j, now.Add(time.Minute), now, r); err == nil || ok {
+		t.Fatalf("pending failure must reject claim: %v %v", ok, err)
+	}
+	after, err := st.GetJob(ctx, j.JobID)
+	if err != nil || !after.NextRun.Time.Equal(j.NextRun.Time) {
+		t.Fatalf("next_run advanced without pending: %+v %v", after, err)
+	}
+	if _, err := st.db.Exec(`DROP TRIGGER reject_pending ON job_runs; DROP FUNCTION reject_occurrence()`); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	type outcome struct {
+		ok  bool
+		err error
+	}
+	out := make(chan outcome, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := st.ClaimCronOccurrence(ctx, j, now.Add(time.Minute), now, r)
+			out <- outcome{ok, err}
+		}()
+	}
+	wg.Wait()
+	close(out)
+	winners := 0
+	for result := range out {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.ok {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("one due occurrence must have one owner: %d", winners)
+	}
+	if _, err := st.GetByTaskID(ctx, r.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	_, total, err := st.ListRuns(ctx, RunFilter{})
+	if err != nil || total != 1 {
+		t.Fatalf("pending outbox count: %d %v", total, err)
+	}
+}
+
+func TestPGManualJobSnapshotCommit(t *testing.T) {
+	st := openTestStorePG(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	j := Job{JobID: "manual-freeze", ActionID: "a", TriggerType: TriggerManual, Params: "{}", Enabled: true, CreatedAt: now, UpdatedAt: now}
+	if err := st.CreateJob(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := st.GetJob(ctx, j.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := *stale
+	changed.Params = `{"v":2}`
+	changed.UpdatedAt = now.Add(time.Second)
+	if err := st.UpdateJob(ctx, changed); err != nil {
+		t.Fatal(err)
+	}
+	r := Run{TaskID: "preallocated", Action: "a", JobID: j.JobID, Params: "{}", EnqueuedAt: now, EnqueuePayload: "{}"}
+	if ok, err := st.ClaimJobRun(ctx, *stale, r); ok || !errors.Is(err, ErrJobSnapshotChanged) {
+		t.Fatalf("stale snapshot did not reject: %v %v", ok, err)
+	}
+	current, err := st.GetJob(ctx, j.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Params = current.Params
+	if ok, err := st.ClaimJobRun(ctx, *current, r); !ok || err != nil {
+		t.Fatalf("current snapshot did not freeze: %v %v", ok, err)
+	}
+	if ok, err := st.ClaimJobRun(ctx, *current, r); ok || err != nil {
+		t.Fatalf("same task should not freeze twice: %v %v", ok, err)
 	}
 }

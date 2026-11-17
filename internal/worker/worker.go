@@ -51,7 +51,7 @@ func finishCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 }
 
-// finish 终态落库：落库失败仅记日志（job_runs 终态尽力而为，但 ctx 取消不再是失败原因）。
+// finish 终态落库：失败必须返回队列处理者，不将未确认终态当成功。
 // store侧status/attempt/execution_id谓词拒绝过期写者，包含同attempt停机重投。
 func (d Deps) finish(ctx context.Context, logger *slog.Logger, taskID, status, errMsg string, attempt int, startedAt time.Time, executionID string) error {
 	fctx, cancel := finishCtx(ctx)
@@ -92,10 +92,8 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 	}
 	now := time.Now()
 	executionID := uuid.NewString() // one invocation, including equal-attempt shutdown redelivery
-	claimed := true
 
 	if err := d.Store.MarkRunning(ctx, p.TaskID, attempt, now, executionID); err != nil {
-		claimed = false
 		if errors.Is(err, repository.ErrTerminalRejected) || errors.Is(err, repository.ErrDeliverySuperseded) {
 			// 终态守卫（ADR-004 决策 7）：行已 succeeded/canceled——重复投递或已取消任务
 			// 被取走，消费端拦截副作用：不执行回调、不写终态（行已是终态），SkipRetry 丢弃。
@@ -107,23 +105,24 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// 缺行（历史/手动残留——DB-first 下行先于任务存在，缺行只剩残留场景）或 DB 瞬时
-		// 错误：照常执行回调，仅记日志（ADR-004 决策 7 维持的旧口径容忍）
-		logger.Warn("mark running failed, continuing without job_runs update", slog.Any("err", err))
+		// DB-first 下缺行或DB故障都不能证明本次取得执行权；
+		// 返回错误，恢复后重投，不允许无账callback。
+		logger.Error("mark running failed; callback not executed", slog.Any("err", err))
+		return fmt.Errorf("worker: claim required before callback: %w", err)
 	}
 
 	err := d.callCallback(ctx, p, logger)
 	switch {
 	case err == nil:
-		if err := d.finish(ctx, logger, p.TaskID, repository.StatusSucceeded, "", attempt, now, executionID); claimed && errors.Is(err, repository.ErrDeliverySuperseded) {
-			return fmt.Errorf("worker: stale completion: %w: %w", err, asynq.SkipRetry)
+		if err := d.finish(ctx, logger, p.TaskID, repository.StatusSucceeded, "", attempt, now, executionID); err != nil {
+			return completionError(err)
 		}
 		logger.Info("task succeeded", slog.Int("attempt", attempt))
 		return nil
 
 	case errors.Is(err, callback.ErrNonRetryable):
-		if ferr := d.finish(ctx, logger, p.TaskID, repository.StatusFailed, err.Error(), attempt, now, executionID); claimed && errors.Is(ferr, repository.ErrDeliverySuperseded) {
-			return fmt.Errorf("worker: stale completion: %w: %w", ferr, asynq.SkipRetry)
+		if ferr := d.finish(ctx, logger, p.TaskID, repository.StatusFailed, err.Error(), attempt, now, executionID); ferr != nil {
+			return completionError(ferr)
 		}
 		logger.Error("task failed terminally (non-retryable: 4xx or malformed request)", slog.Int("attempt", attempt), slog.Any("err", err))
 		return fmt.Errorf("%w: %w", err, asynq.SkipRetry)
@@ -136,8 +135,8 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		if final {
 			status = repository.StatusDead
 		}
-		if ferr := d.finish(ctx, logger, p.TaskID, status, err.Error(), attempt, now, executionID); claimed && errors.Is(ferr, repository.ErrDeliverySuperseded) {
-			return fmt.Errorf("worker: stale completion: %w: %w", ferr, asynq.SkipRetry)
+		if ferr := d.finish(ctx, logger, p.TaskID, status, err.Error(), attempt, now, executionID); ferr != nil {
+			return completionError(ferr)
 		}
 		if final {
 			logger.Error("task dead (retries exhausted)", slog.Int("attempt", attempt), slog.Any("err", err))
@@ -167,4 +166,11 @@ func (d Deps) callCallback(ctx context.Context, p task.Payload, logger *slog.Log
 		}
 	}()
 	return d.Callback.Do(ctx, p)
+}
+
+func completionError(err error) error {
+	if errors.Is(err, repository.ErrDeliverySuperseded) {
+		return fmt.Errorf("worker: stale completion: %w: %w", err, asynq.SkipRetry)
+	}
+	return fmt.Errorf("worker: terminal persistence unconfirmed: %w", err)
 }

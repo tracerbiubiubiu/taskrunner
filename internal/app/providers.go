@@ -81,7 +81,9 @@ func provideInspector(opt asynq.RedisClientOpt) (*asynq.Inspector, func(), error
 // provideTaskService 任务域服务。
 func provideTaskService(cfg *config.Config, st *repository.Store,
 	sub *service.Service, ins *asynq.Inspector, logger *slog.Logger) *service.TaskService {
-	return service.NewTaskService(st, sub, ins, cfg.Queue, logger, cfg.CallbackTargetURL)
+	svc := service.NewTaskService(st, sub, ins, cfg.Queue, logger, cfg.CallbackTargetURL)
+	svc.SetTrustedOperatorCallers(cfg.Security.TrustedOperatorCallers)
+	return svc
 }
 
 // provideCron cron 定时触发（分钟级 tick 扫 DB，设计 §10 定案）。

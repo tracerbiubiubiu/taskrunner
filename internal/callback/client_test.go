@@ -2,7 +2,9 @@ package callback
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -152,5 +154,37 @@ func TestC9SignedCallback(t *testing.T) {
 		TaskID: "t9b", Action: "a", CallbackURL: srv.URL,
 	}); err == nil {
 		t.Fatal("bad sk must be rejected (401 → retryable error)")
+	}
+}
+
+func TestTransient4xxRetryable(t *testing.T) {
+	for _, status := range []int{408, 429} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+			defer srv.Close()
+			err := New(Config{Timeout: time.Second}).Do(context.Background(), payload(srv.URL))
+			if err == nil || errors.Is(err, ErrNonRetryable) {
+				t.Fatalf("HTTP%d must retry: %v", status, err)
+			}
+		})
+	}
+}
+
+func TestCallbackCarriesJobAssociation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if body["job_id"] != "trusted-job" {
+			t.Errorf("missing originating job_id: %v", body)
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	p := payload(srv.URL)
+	p.JobID = "trusted-job"
+	if err := New(Config{Timeout: time.Second}).Do(context.Background(), p); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -39,6 +39,7 @@ log:
   max_age_days: 90        # 保留天数（访问/执行日志含工号与 IP，勿无界累积；env TASKRUNNER_LOG_MAX_AGE_DAYS）
 
 security:
+  trusted_operator_callers: [zhuzhao] # 仅这些已验签caller可声明真人operator；只归因不授业务权
   # 验签密钥环（C2）：预期调用方 AK→SK；当前唯一调用方 zhuzhao
   callers:
     zhuzhao: ""           # env TASKRUNNER_CALLER_ZHUZHAO_SK（必填——空密钥环拒绝启动）

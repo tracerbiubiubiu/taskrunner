@@ -25,8 +25,7 @@ type Enqueuer interface {
 	Enqueue(t *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error)
 }
 
-// TaskDelete 补偿撤销能力（ADR-004 决策 3 A3：入队后行已离开 pending 时立即撤销刚投递的
-// 任务；*asynq.Inspector 即满足；最小接口便于单测注入）。
+// TaskDelete 撤销已取消任务的残留投递（ADR-004 决策 3 A3）。
 type TaskDelete interface {
 	DeleteTask(queue, id string) error
 }
@@ -34,7 +33,7 @@ type TaskDelete interface {
 type Service struct {
 	Store     *repository.Store
 	Client    Enqueuer
-	Inspector TaskDelete   // A3 补偿撤销（0 行三义处置，F39/F44）；nil 时跳过撤销
+	Inspector TaskDelete   // A3 已确认取消的残留投递；nil 时跳过撤销
 	Logger    *slog.Logger // A3 标记失败 Warn（nil 时静默——reclaim 冲突分支兜底）
 	Queue     string
 	MaxRetry  int
@@ -133,15 +132,32 @@ func (s *Service) enqueuePersisted(ctx context.Context, p task.Payload, payload 
 		return true, nil, nil
 	}
 	if n == 0 {
-		// F39 三义：并发取消（撤销即取消生效）/ 已被 worker 取走 running（active 撤销失败，
-		// 无害放弃——MarkRunning 复活拒绝 + 决策 7 终态守卫兜底）/ 已达终态（仅清 Retention
-		// 留观副本）。容忍 ErrTaskNotFound/ErrQueueNotFound（F44/F64）；其余撤销失败同样
-		// 不影响受理口径——canceled 行由第三域探针兜底，running/终态行本就会正常执行。
-		if s.Inspector != nil {
-			_ = s.Inspector.DeleteTask(s.Queue, p.TaskID)
-		}
+		compensateCanceledDelivery(ctx, s.Store, s.Inspector, s.Logger, s.Queue, p.TaskID)
 	}
 	return true, nil, nil
+}
+
+// A worker may execute or schedule a retry before MarkQueued. Cancel is final,
+// so the Redis copy may be withdrawn only after the ledger confirms cancellation.
+func compensateCanceledDelivery(ctx context.Context, store *repository.Store, inspector TaskDelete, logger *slog.Logger, queue, taskID string) {
+	if inspector == nil {
+		return
+	}
+	run, err := store.GetByTaskID(ctx, taskID)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("outbox: cannot confirm cancellation; retained delivery",
+				slog.String("task_id", taskID), slog.Any("err", err))
+		}
+		return
+	}
+	if run.Status != repository.StatusCanceled {
+		return
+	}
+	if err := inspector.DeleteTask(queue, taskID); err != nil && !isKeyGoneErr(err) && logger != nil {
+		logger.Warn("outbox: could not withdraw canceled delivery",
+			slog.String("task_id", taskID), slog.Any("err", err))
+	}
 }
 
 func sameInput(existing *repository.Run, p task.Payload) error {

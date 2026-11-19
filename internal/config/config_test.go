@@ -31,6 +31,16 @@ func TestLoadEnvOnlyAndRotationDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsUnknownDatabaseDriver(t *testing.T) {
+	t.Setenv("TASKRUNNER_CALLER_ZHUZHAO_SK", "sk-z")
+	t.Setenv("TASKRUNNER_SELF_SK", "sk-t")
+	t.Setenv("TASKRUNNER_DB_DRIVER", "postgres")
+	_, err := Load("")
+	if err == nil || !strings.Contains(err.Error(), "db.driver") {
+		t.Fatalf("explicit unknown driver should fail before opening a store, got %v", err)
+	}
+}
+
 func writeYaml(t *testing.T, content string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "config.yaml")

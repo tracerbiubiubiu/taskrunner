@@ -39,7 +39,11 @@ func New(cfg Config) *Client {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	return &Client{cfg: cfg, http: &http.Client{}} // 超时走 per-request context
+	return &Client{cfg: cfg, http: &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse // 由配置的签名回调端点直接给出结果。
+		},
+	}}
 }
 
 // body 回调请求体（契约见 zhuzhao-integration.md §2.1）。
@@ -122,8 +126,8 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 		return fmt.Errorf("%w：对端返回 HTTP %d（客户端错误），动作 %s，响应片段: %q",
 			ErrNonRetryable, resp.StatusCode, p.Action, readSnippet(resp.Body))
 	default:
-		// 5xx 及其他 = 对端暂时异常：退避重试
-		return fmt.Errorf("回调失败（可重试）：对端返回 HTTP %d（服务端错误），动作 %s，响应片段: %q",
+		// 3xx、5xx 及其他未确认的响应沿用有界退避重试。
+		return fmt.Errorf("回调失败（可重试）：对端返回 HTTP %d，动作 %s，响应片段: %q",
 			resp.StatusCode, p.Action, readSnippet(resp.Body))
 	}
 }

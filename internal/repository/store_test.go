@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -198,14 +199,14 @@ func TestQueuedFlagLifecycle(t *testing.T) {
 
 	// MarkQueued 条件标记（F19 回归）：canceled 行 → 0 行、queued 不被翻动
 	seedRun(t, s, "q2", time.Now(), "")
-	if ok, err := s.MarkCanceledIfPending(ctx, "q2", "canceled via API", time.Now()); !ok || err != nil {
+	if ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: "q2"}, "canceled via API", time.Now(), false); !ok || err != nil {
 		t.Fatalf("cancel: %v %v", ok, err)
 	}
 	if n, err := s.MarkQueued(ctx, "q2"); err != nil || n != 0 {
 		t.Fatalf("mark queued on canceled must be 0 rows: n=%d err=%v", n, err)
 	}
 	if q, _ := s.GetQueued(ctx, "q2"); q {
-		t.Fatal("canceled row must keep queued=0（F37：取消不翻标志）")
+		t.Fatal("canceled row must stay in the cleanup scope until confirmation")
 	}
 
 	// MarkCleanupDone（F48 条件回归）：pending 行 → 0 行；canceled+queued=0 → 1 行；重复 → 0 行
@@ -213,7 +214,7 @@ func TestQueuedFlagLifecycle(t *testing.T) {
 	if n, err := s.MarkCleanupDone(ctx, "q3"); err != nil || n != 0 {
 		t.Fatalf("cleanup on pending must be 0 rows: n=%d err=%v", n, err)
 	}
-	if ok, err := s.MarkCanceledIfPending(ctx, "q3", "x", time.Now()); !ok {
+	if ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: "q3"}, "x", time.Now(), false); !ok {
 		t.Fatalf("cancel q3: %v %v", ok, err)
 	}
 	if n, err := s.MarkCleanupDone(ctx, "q3"); err != nil || n != 1 {
@@ -232,7 +233,7 @@ func TestListUnqueuedSafetyDomain(t *testing.T) {
 
 	seedRun(t, s, "u-ok", base, `{"k":1}`) // pending+queued=0 → 入选
 	seedRun(t, s, "u-cancel", base, "")    // canceled+queued=0 → 排除（F1）
-	if ok, _ := s.MarkCanceledIfPending(ctx, "u-cancel", "x", time.Now()); !ok {
+	if ok, _ := s.MarkCanceledIfPending(ctx, &Run{TaskID: "u-cancel"}, "x", time.Now(), false); !ok {
 		t.Fatal("cancel u-cancel")
 	}
 	// succeeded+queued=0 残留（F14 场景：内联标记失败 + DB 抖动在执行前恢复）
@@ -249,7 +250,7 @@ func TestListUnqueuedSafetyDomain(t *testing.T) {
 		t.Fatalf("mark queued: %v", err)
 	}
 
-	rows, err := s.ListUnqueued(ctx, time.Now(), 100)
+	rows, err := s.ListUnqueued(ctx, time.Now(), 0, math.MaxInt64, 100)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -262,7 +263,7 @@ func TestListUnqueuedSafetyDomain(t *testing.T) {
 
 	// LIMIT 批位上界（F66）
 	seedRun(t, s, "u-ok2", base, "")
-	rows, _ = s.ListUnqueued(ctx, time.Now(), 1)
+	rows, _ = s.ListUnqueued(ctx, time.Now(), 0, math.MaxInt64, 1)
 	if len(rows) != 1 {
 		t.Fatalf("limit: %+v", rows)
 	}
@@ -300,7 +301,7 @@ func TestListCursorRotation(t *testing.T) {
 	// 第三域同款（先出域的行不再入选）
 	for i, id := range []string{"x1", "x2"} {
 		seedRun(t, s, id, base.Add(time.Duration(i)*time.Minute), "")
-		if ok, err := s.MarkCanceledIfPending(ctx, id, "x", time.Now()); !ok {
+		if ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: id}, "x", time.Now(), false); !ok {
 			t.Fatalf("cancel %s: %v %v", id, ok, err)
 		}
 	}
@@ -325,7 +326,7 @@ func TestMarkRunningClassification(t *testing.T) {
 	now := time.Now()
 
 	seedRun(t, s, "m-cancel", now, "")
-	if ok, _ := s.MarkCanceledIfPending(ctx, "m-cancel", "x", now); !ok {
+	if ok, _ := s.MarkCanceledIfPending(ctx, &Run{TaskID: "m-cancel"}, "x", now, false); !ok {
 		t.Fatal("cancel")
 	}
 	if err := s.MarkRunning(ctx, "m-cancel", 1, now, "fixture-delivery"); !errors.Is(err, ErrTerminalRejected) {

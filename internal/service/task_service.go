@@ -334,10 +334,7 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 	if run.Status != repository.StatusPending {
 		return conflict("仅「等待执行」状态的任务可取消，当前状态：%s", stateText(run.Status))
 	}
-	queued, err := s.repo.GetQueued(ctx, taskID)
-	if err != nil {
-		return err
-	}
+	queued := run.Queued
 
 	degraded := false // F58：Redis 可用性错误下 queued=0 行的降级取消
 	if info, err := s.inspector.GetTaskInfo(s.queue, taskID); err == nil {
@@ -358,28 +355,19 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID string) error {
 			return err
 		}
 	}
-	// isKeyGoneErr：DB 为 pending 但队列已无此任务（queued=0 时属常态），直接标 canceled
-	if !degraded {
-		if err := s.inspector.DeleteTask(s.queue, taskID); err != nil {
-			switch {
-			case isKeyGoneErr(err): // F44/F64：键已消亡，照常取消
-			case isDeleteActiveErr(err): // 检查后瞬间被 worker 取走
-				return conflict("任务已开始执行，无法取消（仅等待执行的任务可取消）")
-			case !queued: // F58：交付未知的行降级，第三域探针收尾
-				degraded = true
-				s.logger.Warn("cancel degraded (redis delete failed, queued=0)",
-					slog.String("task_id", taskID), slog.Any("err", err))
-			default:
-				return err
-			}
-		}
-	}
-	ok, err := s.repo.MarkCanceledIfPending(ctx, taskID, "canceled via API", s.now())
+	ok, err := s.repo.MarkCanceledIfPending(ctx, run, "canceled via API", s.now(), degraded)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return conflict("任务状态已变化（可能刚开始执行），请刷新后重试")
+	}
+	// The row is now terminal. If cleanup fails or a worker just dequeued
+	// the task, the worker guard and the persisted cleanup sweep still apply.
+	if !degraded {
+		if err := s.inspector.DeleteTask(s.queue, taskID); err != nil && !isKeyGoneErr(err) {
+			s.logger.Warn("cancel committed, redis cleanup deferred", slog.String("task_id", taskID), slog.Any("err", err))
+		}
 	}
 	return nil
 }
@@ -405,9 +393,9 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID string) error {
 		}
 		return err
 	}
-	// RunTask 后 worker 可能已瞬间完成并写入终态——条件更新 0 行即状态已变，
-	// 返回冲突而非覆盖（与 CancelTask 同类的竞态防护；此时任务在真实执行中，以 job_runs 后续终态为准）
-	ok, err := s.repo.ResetPendingIfTerminal(ctx, taskID)
+	// Worker may complete before RunTask returns. Preserve its outcome,
+	// including when the new execution has already reached the same status.
+	ok, err := s.repo.ResetPendingIfTerminal(ctx, run)
 	if err != nil {
 		return err
 	}

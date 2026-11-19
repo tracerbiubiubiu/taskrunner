@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -147,7 +148,7 @@ func TestCallbackPanicAsynqLifecycle(t *testing.T) {
 								continue
 							}
 							before := time.Now().Add(time.Hour)
-							a, _ := st.ListUnqueued(ctx, before, 100)
+							a, _ := st.ListUnqueued(ctx, before, 0, math.MaxInt64, 100)
 							b, _ := st.ListStuckPending(ctx, before, 0, 100)
 							c, _ := st.ListCanceledUnqueued(ctx, before, 0, 100)
 							t.Fatalf("panic archived but DB still running; reclaim domains=%d/%d/%d attempts=%d", len(a), len(b), len(c), r.Attempts)

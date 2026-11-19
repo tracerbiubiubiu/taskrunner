@@ -45,7 +45,7 @@ ordinary 档 CI 在现有 race/PG/Redis 检查后执行 `E2E_INCLUDE_CRON=1 make
 从本仓根目录，在本机专属终端或未跟踪的环境文件中注入下列配置；表中是变量含义，不是可直接使用的密钥：
 
 - `TASKRUNNER_HTTP_ADDR`：本次已分配的监听地址，例如 `127.0.0.1:18080`；改端口时同步网关 `TASKRUNNER_BASE_URL`。
-- `TASKRUNNER_DB_DRIVER=sqlite` 与 `TASKRUNNER_DB_PATH`：本次确认的 SQLite 文件；日志目录由 `TASKRUNNER_LOG_DIR` 指定。
+- `TASKRUNNER_DB_DRIVER=sqlite` 与 `TASKRUNNER_DB_PATH`：本次确认的 SQLite 文件；日志目录由 `TASKRUNNER_LOG_DIR` 指定。显式驱动只接受 `sqlite` 或 `pg`，未知值拒绝启动。
 - `TASKRUNNER_REDIS_ADDR` / `TASKRUNNER_REDIS_PASSWORD` / `TASKRUNNER_REDIS_DB` / `TASKRUNNER_QUEUE`：已确认的队列数据源与命名空间。
 - `TASKRUNNER_CALLER_ZHUZHAO_SK`：与主仓出站 `TASKRUNNER_SK` 对值；`TASKRUNNER_SELF_SK`：与主仓入站 `INTERNAL_JOBS_SK` 对值。
 - `TASKRUNNER_CALLBACK_TARGET_URL`：宿主可达的固定回调地址；主仓宿主默认端口形态为 `http://127.0.0.1:33333/internal/jobs/callback`。容器内的 `zhuzhao` DNS 名不能直接当作宿主地址。

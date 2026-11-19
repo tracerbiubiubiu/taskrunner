@@ -162,9 +162,14 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("trusted operator caller %q has no configured signing credential", caller)
 		}
 	}
-	// fail-closed：driver=pg 但库名缺失 → DSN 无法定位库，拒绝启动
-	if cfg.DB.Driver == "pg" && cfg.DB.DBName == "" {
-		return nil, fmt.Errorf("db.driver=pg 需配置 db.dbname（env TASKRUNNER_DB_NAME）")
+	switch cfg.DB.Driver {
+	case "sqlite":
+	case "pg":
+		if cfg.DB.DBName == "" {
+			return nil, fmt.Errorf("db.driver=pg 需配置 db.dbname（env TASKRUNNER_DB_NAME）")
+		}
+	default:
+		return nil, fmt.Errorf("db.driver %q 无效（env TASKRUNNER_DB_DRIVER 仅允许 sqlite 或 pg）", cfg.DB.Driver)
 	}
 	// fail-closed：C9 回调签名身份缺失 = 每次回调被 zhuzhao /internal 验签 401 → 无限重试
 	if cfg.Security.SelfAK == "" || cfg.Security.SelfSK == "" {

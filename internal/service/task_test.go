@@ -16,12 +16,13 @@ import (
 
 // fakeInspector 可编程 asynq 检视（干预路径竞态验证）。
 type fakeInspector struct {
-	state   asynq.TaskState // GetTaskInfo 返回的状态
-	exists  bool
-	getErr  error // GetTaskInfo 返回的错误（模拟 Redis 可用性故障 / ErrQueueNotFound，F58/F64）
-	delErr  error
-	runErr  error
-	deleted []string // DeleteTask 调用记录
+	state    asynq.TaskState // GetTaskInfo 返回的状态
+	exists   bool
+	getErr   error // GetTaskInfo 返回的错误（模拟 Redis 可用性故障 / ErrQueueNotFound，F58/F64）
+	delErr   error
+	runErr   error
+	deleted  []string // DeleteTask 调用记录
+	onDelete func()
 }
 
 func (f *fakeInspector) GetTaskInfo(_, _ string) (*asynq.TaskInfo, error) {
@@ -35,6 +36,9 @@ func (f *fakeInspector) GetTaskInfo(_, _ string) (*asynq.TaskInfo, error) {
 }
 func (f *fakeInspector) DeleteTask(_, id string) error {
 	f.deleted = append(f.deleted, id)
+	if f.onDelete != nil {
+		f.onDelete()
+	}
 	return f.delErr
 }
 func (f *fakeInspector) RunTask(_, _ string) error { return f.runErr }
@@ -53,7 +57,15 @@ func timeNow() time.Time { return time.Now() }
 // raceInspector RunTask 时注入「worker 瞬间完成」的中间态（竞态验证）。
 type raceInspector struct {
 	TaskInspector
-	afterRun func()
+	afterRun  func()
+	beforeGet func()
+}
+
+func (r raceInspector) GetTaskInfo(queue, id string) (*asynq.TaskInfo, error) {
+	if r.beforeGet != nil {
+		r.beforeGet()
+	}
+	return r.TaskInspector.GetTaskInfo(queue, id)
 }
 
 func (r raceInspector) RunTask(queue, id string) error {
@@ -110,13 +122,13 @@ func TestCancelRaces(t *testing.T) {
 		t.Fatalf("active cancel want conflict, got %v", err)
 	}
 
-	// 检查后被取走（DeleteTask 报 active state）→ 409
+	// 取消提交后才被 Redis 取走，仍按已持久化的取消返回。
 	ins2 := &fakeInspector{exists: true, state: asynq.TaskStatePending,
 		delErr: errors.New("asynq: INTERNAL_ERROR: cannot delete task in active state. use CancelProcessing instead.")}
 	s2 := newSvc(t, ins2)
 	row(t, s2, "rb", repository.StatusPending)
-	if err := s2.CancelTask(ctx, "rb"); !isConflict(err) {
-		t.Fatalf("delete-active want conflict, got %v", err)
+	if err := s2.CancelTask(ctx, "rb"); err != nil {
+		t.Fatalf("committed cancellation should survive active Redis cleanup: %v", err)
 	}
 
 	// running（DB 视角）→ 409
@@ -154,6 +166,42 @@ func TestCancelTerminalStateFingerprints409(t *testing.T) {
 		if r, _ := s.repo.GetByTaskID(ctx, "f35"); r.Status != repository.StatusPending {
 			t.Fatalf("%v: row must stay pending (fingerprint preserved), got %s", st, r.Status)
 		}
+	}
+}
+
+func TestCancelCASLossLeavesNewDeliveryAlone(t *testing.T) {
+	ctx := context.Background()
+	ins := &fakeInspector{exists: true, state: asynq.TaskStatePending}
+	svc := newSvc(t, ins)
+	row(t, svc, "worker-wins", repository.StatusPending)
+	svc.inspector = raceInspector{TaskInspector: ins, beforeGet: func() {
+		markFixtureDeliveryFailed(t, ctx, svc.repo, "worker-wins")
+	}}
+	wantConflict(t, svc.CancelTask(ctx, "worker-wins"))
+	if len(ins.deleted) != 0 {
+		t.Fatal("a lost cancel CAS must preserve the newer delivery")
+	}
+}
+
+func TestCancelCommitsAndRecordsCleanupBeforeQueueDelete(t *testing.T) {
+	ctx := context.Background()
+	ins := &fakeInspector{exists: true, state: asynq.TaskStatePending, delErr: errors.New("transient cleanup error")}
+	svc := newSvc(t, ins)
+	row(t, svc, "cleanup-retry", repository.StatusPending)
+	if n, err := svc.repo.MarkQueued(ctx, "cleanup-retry"); err != nil || n != 1 {
+		t.Fatalf("mark queued: n=%d err=%v", n, err)
+	}
+	ins.onDelete = func() {
+		run, err := svc.repo.GetByTaskID(ctx, "cleanup-retry")
+		if err != nil || run.Status != repository.StatusCanceled || run.Queued {
+			t.Fatalf("database must confirm cancellation and pending cleanup first: %v %v", run, err)
+		}
+	}
+	if err := svc.CancelTask(ctx, "cleanup-retry"); err != nil {
+		t.Fatalf("cleanup failure must not revoke persisted cancellation: %v", err)
+	}
+	if len(ins.deleted) != 1 {
+		t.Fatal("cancellation should attempt queue cleanup")
 	}
 }
 
@@ -202,6 +250,46 @@ func TestCancelQueueNotFoundIsKeyGone(t *testing.T) {
 	}
 	if r, _ := s.repo.GetByTaskID(ctx, "qnf"); r.Status != repository.StatusCanceled {
 		t.Fatalf("status: %s", r.Status)
+	}
+}
+
+func TestDegradedCancelDoesNotUseOldQueueSnapshot(t *testing.T) {
+	ctx := context.Background()
+	ins := &fakeInspector{getErr: errors.New("synthetic Redis outage")}
+	s := newSvc(t, ins)
+	row(t, s, "queued-before-cancel", repository.StatusPending)
+	s.inspector = raceInspector{TaskInspector: ins, beforeGet: func() {
+		if n, err := s.repo.MarkQueued(ctx, "queued-before-cancel"); err != nil || n != 1 {
+			t.Fatalf("mark queued: n=%d err=%v", n, err)
+		}
+	}}
+	if err := s.CancelTask(ctx, "queued-before-cancel"); err == nil {
+		t.Fatal("degraded cancellation must not succeed on a now-queued task")
+	}
+	got, err := s.repo.GetByTaskID(ctx, "queued-before-cancel")
+	if err != nil || got.Status != repository.StatusPending {
+		t.Fatalf("delivery must stay pending: %v %v", got, err)
+	}
+}
+
+func TestRetryPreservesNewTerminalDelivery(t *testing.T) {
+	ctx := context.Background()
+	ins := &fakeInspector{}
+	s := newSvc(t, ins)
+	row(t, s, "retry-dead", repository.StatusDead)
+	s.inspector = raceInspector{TaskInspector: ins, afterRun: func() {
+		now := time.Now()
+		if err := s.repo.MarkRunning(ctx, "retry-dead", 2, now, "new-delivery"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.repo.Finish(ctx, "retry-dead", repository.StatusDead, "new outcome", 2, now, now, "new-delivery"); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	wantConflict(t, s.RetryTask(ctx, "retry-dead"))
+	got, err := s.repo.GetByTaskID(ctx, "retry-dead")
+	if err != nil || got.Status != repository.StatusDead || got.Error != "new outcome" {
+		t.Fatalf("new terminal outcome must remain intact: %v %v", got, err)
 	}
 }
 

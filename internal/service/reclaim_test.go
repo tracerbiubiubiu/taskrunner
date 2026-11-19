@@ -182,7 +182,7 @@ func TestReclaimUnmarkedMemberZeroRowsCompensates(t *testing.T) {
 	l.defaults()
 	l.unmarked["m2"] = time.Now()
 	fake.hook = func(task.Payload) { // a1 入队时取消 m2（此刻 m2 尚未被本轮标记）
-		_, _ = st.MarkCanceledIfPending(ctx, "m2", "canceled via API", time.Now())
+		_, _ = st.MarkCanceledIfPending(ctx, &repository.Run{TaskID: "m2"}, "canceled via API", time.Now(), false)
 	}
 
 	l.ReclaimStalePending(ctx)
@@ -196,6 +196,35 @@ func TestReclaimUnmarkedMemberZeroRowsCompensates(t *testing.T) {
 	// 消亡确认出域（MarkCleanupDone）——非第一轮标记，属合法路径
 	if r, _ := st.GetByTaskID(ctx, "m2"); r.Status != repository.StatusCanceled {
 		t.Fatalf("canceled row must stay canceled, got %s", r.Status)
+	}
+}
+
+func TestReclaimKeepsRetryableDelivery(t *testing.T) {
+	for _, unmarked := range []bool{false, true} {
+		name := "first projection"
+		if unmarked {
+			name = "mark-only retry"
+		}
+		t.Run(name, func(t *testing.T) {
+			l, st, fake, inspector, _ := newReclaim(t)
+			ctx := context.Background()
+			if unmarked {
+				seedOld(t, st, "before", `{"task_id":"before"}`, 0)
+				l.defaults()
+				l.unmarked["retryable"] = time.Now()
+			}
+			seedOld(t, st, "retryable", `{"task_id":"retryable"}`, 0)
+			fake.hook = func(task.Payload) {
+				markFixtureDeliveryFailed(t, ctx, st, "retryable")
+			}
+			l.ReclaimStalePending(ctx)
+			if len(inspector.deleted) != 0 {
+				t.Fatal("reclaim must preserve a worker's retryable delivery")
+			}
+			if _, exists := l.unmarked["retryable"]; exists {
+				t.Fatal("a delivery that left pending must leave the mark-only set")
+			}
+		})
 	}
 }
 
@@ -223,6 +252,42 @@ func TestReclaimFailureCountingAggregated(t *testing.T) {
 
 // 判空/反序列化失败防御（F7/F66）：跳过按 tick 聚合 Warn；连续 ≥3 升级聚合 Error
 // （评审六·3：防永久逐行刷屏，给出人工修复信号）。
+func TestReclaimPersistentBadSnapshotDoesNotStarveLaterRows(t *testing.T) {
+	l, st, fake, _, _ := newReclaim(t)
+	l.BatchSize = 1
+	seedOld(t, st, "bad", "{not-json", 0)
+	seedOld(t, st, "good", `{"task_id":"good"}`, 0)
+	ctx := context.Background()
+	l.ReclaimStalePending(ctx)
+	if fake.count() != 0 {
+		t.Fatal("invalid snapshot must not be enqueued")
+	}
+	l.ReclaimStalePending(ctx)
+	queued, err := st.GetQueued(ctx, "good")
+	if err != nil || !queued || fake.count() != 1 {
+		t.Fatalf("later valid row must be projected, queued=%v enqueues=%d err=%v", queued, fake.count(), err)
+	}
+}
+
+func TestReclaimNewArrivalsDoNotPreventRevisitingAnOldRow(t *testing.T) {
+	loop, store, enqueue, _, _ := newReclaim(t)
+	loop.BatchSize = 1
+	seedOld(t, store, "first", `{"task_id":"first"}`, 0)
+	ctx := context.Background()
+	enqueue.err = errors.New("temporary projection failure")
+	loop.ReclaimStalePending(ctx)
+	enqueue.err = nil
+
+	for _, id := range []string{"later-1", "later-2", "later-3", "later-4"} {
+		seedOld(t, store, id, `{"task_id":"`+id+`"}`, 0)
+		loop.ReclaimStalePending(ctx)
+	}
+	queued, err := store.GetQueued(ctx, "first")
+	if err != nil || !queued {
+		t.Fatalf("ongoing arrivals must not starve the failed row: queued=%v err=%v", queued, err)
+	}
+}
+
 func TestReclaimEmptyOrCorruptPayloadSkipped(t *testing.T) {
 	l, st, fake, _, cap := newReclaim(t)
 	seedOld(t, st, "empty", "", 0)
@@ -359,7 +424,7 @@ func TestReclaimStuckCursorRotation(t *testing.T) {
 func seedCanceled(t *testing.T, s *repository.Store, id string, offset time.Duration) {
 	t.Helper()
 	seedOld(t, s, id, "", offset)
-	ok, err := s.MarkCanceledIfPending(context.Background(), id, "canceled via API", time.Now())
+	ok, err := s.MarkCanceledIfPending(context.Background(), &repository.Run{TaskID: id}, "canceled via API", time.Now(), false)
 	if !ok || err != nil {
 		t.Fatalf("cancel %s: %v %v", id, ok, err)
 	}
@@ -377,7 +442,7 @@ func TestReclaimCancelCleanupProbes(t *testing.T) {
 
 	// 宽限内的取消行不探（F45 判据）
 	seedOld(t, st, "c-fresh", "", 2*time.Hour)
-	if ok, _ := st.MarkCanceledIfPending(context.Background(), "c-fresh", "x", time.Now()); !ok {
+	if ok, _ := st.MarkCanceledIfPending(context.Background(), &repository.Run{TaskID: "c-fresh"}, "x", time.Now(), false); !ok {
 		t.Fatal("cancel c-fresh")
 	}
 

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"github.com/tracerbiubiubiu/taskrunner/internal/repository"
 	"github.com/tracerbiubiubiu/taskrunner/internal/task"
@@ -55,6 +56,36 @@ func TestCronAdvanceFailureRollsBackOccurrence(t *testing.T) {
 		t.Fatalf("recovered same due must enqueue once: %d", enq.count())
 	}
 }
+func TestCronAlreadyRecordedOccurrenceAdvancesWithoutAnotherDelivery(t *testing.T) {
+	svc, st, enq, _, now := cronFixture(t)
+	ctx := context.Background()
+	job, err := st.GetJob(ctx, "atomic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := task.Payload{TaskID: CronTaskID(job.JobID, job.NextRun.Time), JobID: job.JobID, Action: job.ActionID, Params: []byte(job.Params)}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.InsertPending(ctx, repository.Run{
+		TaskID: p.TaskID, JobID: p.JobID, Action: p.Action, Params: job.Params, EnqueuePayload: string(raw), EnqueuedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loop := &Loop{Store: st, Submit: svc, Logger: slog.Default(), Now: func() time.Time { return now }}
+	loop.FireDue(ctx)
+	current, err := st.GetJob(ctx, job.JobID)
+	if err != nil || !current.NextRun.Time.After(now) {
+		t.Fatalf("known occurrence should advance its schedule: %v %v", current, err)
+	}
+	loop.FireDue(ctx)
+	_, total, err := st.ListRuns(ctx, repository.RunFilter{})
+	if err != nil || total != 1 || enq.count() != 0 {
+		t.Fatalf("keep original occurrence without another delivery: rows=%d deliveries=%d err=%v", total, enq.count(), err)
+	}
+}
+
 func TestCronTwoLoopsClaimBeforeEnqueue(t *testing.T) {
 	svc, st, enq, _, now := cronFixture(t)
 	entered := make(chan struct{})

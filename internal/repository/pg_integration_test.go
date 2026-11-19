@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"os"
 	"sync"
 	"testing"
@@ -78,7 +79,7 @@ func TestPGFullLifecycle(t *testing.T) {
 	}
 
 	// 条件更新：非 pending 不可取消
-	ok, err := s.MarkCanceledIfPending(ctx, "pg-1", "x", now)
+	ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: "pg-1"}, "x", now, false)
 	if err != nil || ok {
 		t.Fatalf("cancel on succeeded should be no-op (ok=%v err=%v)", ok, err)
 	}
@@ -214,7 +215,7 @@ func TestPGReclaimColumnsAndQueries(t *testing.T) {
 		EnqueuePayload: `{"task_id":"pg-rq1"}`}); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	rows, err := s.ListUnqueued(ctx, now, 10)
+	rows, err := s.ListUnqueued(ctx, now, 0, math.MaxInt64, 10)
 	if err != nil || len(rows) != 1 || rows[0].TaskID != "pg-rq1" || rows[0].EnqueuePayload != `{"task_id":"pg-rq1"}` {
 		t.Fatalf("list unqueued: %+v err=%v", rows, err)
 	}
@@ -238,7 +239,7 @@ func TestPGReclaimColumnsAndQueries(t *testing.T) {
 	if err := s.InsertPending(ctx, Run{TaskID: "pg-rq2", Action: "a", EnqueuedAt: base}); err != nil {
 		t.Fatalf("insert rq2: %v", err)
 	}
-	if ok, err := s.MarkCanceledIfPending(ctx, "pg-rq2", "x", now); !ok || err != nil {
+	if ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: "pg-rq2"}, "x", now, false); !ok || err != nil {
 		t.Fatalf("cancel: %v %v", ok, err)
 	}
 	crows, err := s.ListCanceledUnqueued(ctx, now, 0, 10)

@@ -296,16 +296,32 @@ func (s *Store) ClaimCronOccurrence(ctx context.Context, j Job, next, now time.T
 	if n == 0 {
 		return false, nil
 	}
-	_, err = tx.ExecContext(ctx, s.pgq(`INSERT INTO job_runs
+	inserted, err := tx.ExecContext(ctx, s.pgq(`INSERT INTO job_runs
  (task_id,request_id,action,job_id,dept,params,callback_url,status,submitted_by,source_ip,enqueued_at,queued,enqueue_payload)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`), r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.Params, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt.Round(0), 0, r.EnqueuePayload)
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id) DO NOTHING`), r.TaskID, r.RequestID, r.Action, r.JobID, r.Dept, r.Params, r.CallbackURL, StatusPending, r.SubmittedBy, r.SourceIP, r.EnqueuedAt.Round(0), 0, r.EnqueuePayload)
 	if err != nil {
 		return false, fmt.Errorf("store: persist cron occurrence: %w", err)
+	}
+	n, err = inserted.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		var same bool
+		err := tx.QueryRowContext(ctx, s.pgq(`SELECT EXISTS (SELECT 1 FROM job_runs WHERE task_id=?
+AND job_id=? AND action=? AND dept=? AND params=? AND callback_url=? AND enqueue_payload=?)`),
+			r.TaskID, r.JobID, r.Action, r.Dept, r.Params, r.CallbackURL, r.EnqueuePayload).Scan(&same)
+		if err != nil {
+			return false, fmt.Errorf("store: read existing cron occurrence: %w", err)
+		}
+		if !same {
+			return false, fmt.Errorf("store: cron occurrence does not match the stored execution")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("store: commit cron occurrence: %w", err)
 	}
-	return true, nil
+	return n == 1, nil // Existing matching occurrences already own the outbox record.
 }
 
 func (s *Store) DisableCronSnapshot(ctx context.Context, j Job, now time.Time) error {

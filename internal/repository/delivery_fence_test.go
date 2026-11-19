@@ -45,13 +45,15 @@ func TestDeliveryFence_Storage(t *testing.T) {
 				t.Fatalf("old retry overwrote newer delivery claim: %v", err)
 			}
 			must(s.Finish(ctx, "fence", StatusDead, "current", 2, now, now.Add(3*time.Second), "retry2"))
-			reset, err := s.ResetPendingIfTerminal(ctx, "fence")
+			original, err := s.GetByTaskID(ctx, "fence")
+			must(err)
+			reset, err := s.ResetPendingIfTerminal(ctx, original)
 			must(err)
 			if !reset {
 				t.Fatal("manual retry not reset")
 			}
-			// Manual retry intentionally restarts asynq retry count, but never reuses the
-			// old execution identity even when count=1 recurs.
+			// Prove the fence when a pending execution receives a lower attempt counter.
+			// An ordinary Asynq RunTask still retains its queue retry count.
 			must(s.MarkRunning(ctx, "fence", 1, now.Add(4*time.Second), "manual-retry"))
 			if err := s.Finish(ctx, "fence", StatusFailed, "old", 1, now, now, "old"); !errors.Is(err, ErrDeliverySuperseded) {
 				t.Fatalf("manual retry old completion not fenced: %v", err)

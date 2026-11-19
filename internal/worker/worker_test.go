@@ -145,7 +145,7 @@ func TestTerminalGuardSkipsCallback(t *testing.T) {
 		finish func(d Deps, id string)
 	}{
 		{"canceled 行", func(d Deps, id string) {
-			d.Store.MarkCanceledIfPending(ctx, id, "canceled via API", time.Now())
+			d.Store.MarkCanceledIfPending(ctx, &repository.Run{TaskID: id}, "canceled via API", time.Now(), false)
 		}},
 		{"succeeded 行", func(d Deps, id string) {
 			d.Store.MarkRunning(ctx, id, 1, time.Now(), "fixture-delivery")

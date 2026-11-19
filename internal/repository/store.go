@@ -69,7 +69,8 @@ type Run struct {
 	EnqueuedAt  time.Time
 	StartedAt   sql.NullTime
 	FinishedAt  sql.NullTime
-	Queued      bool // 投递状态标志（ADR-004，两义：已交付 Redis / 已了结）——仅由新方法填充，既有查询下恒为零值、不可作判据（F29）
+	Queued      bool   // 单任务查询读取的投递状态标志（ADR-004）。
+	ExecutionID string // 单任务查询读取的执行代次，仅用于状态条件写。
 	// EnqueuePayload 提交载荷快照（task.Payload JSON，ADR-004 决策 2）——reclaim 重投唯一来源，
 	// 自带 timeout_secs 规避「job_runs 无超时覆盖」的重建缺口；与 asynq 载荷同源（F9）。
 	EnqueuePayload string
@@ -308,28 +309,29 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 func (s *Store) GetByTaskID(ctx context.Context, taskID string) (*Run, error) {
 	row := s.queryRow(ctx, `
 SELECT task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
-       submitted_by, source_ip, enqueued_at, started_at, finished_at
+       submitted_by, source_ip, enqueued_at, started_at, finished_at, queued, execution_id
 FROM job_runs WHERE task_id = ?`, taskID)
 	var r Run
+	var queued int
 	err := row.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.Params, &r.CallbackURL, &r.Status, &r.Attempts,
-		&r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP, &r.EnqueuedAt, &r.StartedAt, &r.FinishedAt)
+		&r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP, &r.EnqueuedAt, &r.StartedAt, &r.FinishedAt, &queued, &r.ExecutionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store: get job_run: %w", err)
 	}
+	r.Queued = queued != 0
 	return &r, nil
 }
 
-// ResetPending 死信/终败任务经 API 重试时，回到 pending（Asynq RunTask 同步重置其重试计数）。
-// 条件更新（WHERE status IN failed/dead）：RunTask 之后 worker 可能已完成并写入终态，
-// 0 行 = 状态已被并发改变 → 返回 false，调用方按冲突处理（防止把 succeeded 覆盖回 pending）。
-func (s *Store) ResetPendingIfTerminal(ctx context.Context, taskID string) (bool, error) {
+// ResetPendingIfTerminal projects a manual retry only for the terminal
+// execution the caller observed. Asynq RunTask keeps its original retry count.
+func (s *Store) ResetPendingIfTerminal(ctx context.Context, run *Run) (bool, error) {
 	res, err := s.exec(ctx, `
 UPDATE job_runs SET status = ?, error = '', started_at = NULL, finished_at = NULL
-WHERE task_id = ? AND status IN (?, ?)`,
-		StatusPending, taskID, StatusFailed, StatusDead)
+WHERE task_id = ? AND status = ? AND status IN (?, ?) AND execution_id = ?`,
+		StatusPending, run.TaskID, run.Status, StatusFailed, StatusDead, run.ExecutionID)
 	if err != nil {
 		return false, fmt.Errorf("store: reset pending: %w", err)
 	}
@@ -340,12 +342,13 @@ WHERE task_id = ? AND status IN (?, ?)`,
 	return n > 0, nil
 }
 
-// MarkCanceledIfPending 取消未开始的任务。条件更新（WHERE status=pending）：
-// 影响行数为 0 说明检查后状态已被并发改变（如 worker 刚取走），返回 false 由调用方按冲突处理。
-func (s *Store) MarkCanceledIfPending(ctx context.Context, taskID, errMsg string, finishedAt time.Time) (bool, error) {
+// MarkCanceledIfPending atomically records cancellation and admits its Redis
+// cleanup work. When Redis is unavailable, only a still-unqueued run qualifies.
+func (s *Store) MarkCanceledIfPending(ctx context.Context, run *Run, errMsg string, finishedAt time.Time, requireUnqueued bool) (bool, error) {
 	res, err := s.exec(ctx, `
-UPDATE job_runs SET status = ?, error = ?, finished_at = ? WHERE task_id = ? AND status = ?`,
-		StatusCanceled, errMsg, finishedAt, taskID, StatusPending)
+UPDATE job_runs SET status = ?, error = ?, finished_at = ?, queued = 0
+WHERE task_id = ? AND status = ? AND execution_id = ? AND (NOT ? OR queued = 0)`,
+		StatusCanceled, errMsg, finishedAt, run.TaskID, StatusPending, run.ExecutionID, requireUnqueued)
 	if err != nil {
 		return false, fmt.Errorf("store: mark canceled: %w", err)
 	}
@@ -522,9 +525,8 @@ WHERE task_id = ? AND status = ? AND attempts = ? AND execution_id = ?`,
 
 // ---- ADR-004：outbox 补偿（queued 标志 + 三域扫描器）----
 
-// MarkQueued 入队成功后按状态条件置位（决策 3/理由）：`status='pending'` 条件是
-// 取消检测器（F19）——0 行 = 行已离开 pending（并发取消/已被取走/已达终态，F39 三义），
-// 调用方据此走 DeleteTask 补偿撤销；返回影响行数供调用方判定。
+// MarkQueued 入队成功后仅为 pending 行置位。返回 0 行时，调用方须确认当前状态为
+// canceled 才能撤销投递；提前开始或完成的 worker 可以已有合法重试或留观记录。
 func (s *Store) MarkQueued(ctx context.Context, taskID string) (int64, error) {
 	res, err := s.exec(ctx, `UPDATE job_runs SET queued = 1 WHERE task_id = ? AND status = ?`, taskID, StatusPending)
 	if err != nil {
@@ -581,12 +583,18 @@ func scanReclaimRuns(rows *sql.Rows) ([]*Run, error) {
 	return out, rows.Err()
 }
 
-// ListUnqueued 第一轮扫描域（F1/F14：queued=0 AND status='pending' 才是安全域），
-// 显式批位上界（F66）。无需游标——论证见 ADR-004 决策 4 第一轮。
-func (s *Store) ListUnqueued(ctx context.Context, before time.Time, limit int) ([]*Run, error) {
+// LatestRunID fixes the finite upper bound for a reclaim sweep.
+func (s *Store) LatestRunID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.queryRow(ctx, `SELECT COALESCE(MAX(id),0) FROM job_runs`).Scan(&id)
+	return id, err
+}
+
+// ListUnqueued 第一轮扫描域；每轮沿有限主键区间推进，使持续的新行不会延后回卷。
+func (s *Store) ListUnqueued(ctx context.Context, before time.Time, cursorID, lastID int64, limit int) ([]*Run, error) {
 	rows, err := s.query(ctx, reclaimListCols+`
-WHERE queued = 0 AND status = ? AND enqueued_at <= ?
-ORDER BY id LIMIT ?`, StatusPending, before, limit)
+WHERE queued = 0 AND status = ? AND enqueued_at <= ? AND id > ? AND id <= ?
+ORDER BY id LIMIT ?`, StatusPending, before, cursorID, lastID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: list unqueued: %w", err)
 	}

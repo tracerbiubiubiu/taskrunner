@@ -148,7 +148,7 @@ func TestSubmitA3ZeroRowsCompensates(t *testing.T) {
 	ctx := context.Background()
 	// hook 在 Enqueue 内把行翻成 canceled（模拟「刚入队即被取消」的并发窗口）
 	fake.hook = func(p task.Payload) {
-		ok, err := st.MarkCanceledIfPending(ctx, p.TaskID, "canceled via API", time.Now())
+		ok, err := st.MarkCanceledIfPending(ctx, &repository.Run{TaskID: p.TaskID}, "canceled via API", time.Now(), false)
 		if !ok || err != nil {
 			t.Errorf("hook cancel: %v %v", ok, err)
 		}
@@ -162,6 +162,32 @@ func TestSubmitA3ZeroRowsCompensates(t *testing.T) {
 	}
 	if r, _ := st.GetByTaskID(ctx, "f19"); r.Status != repository.StatusCanceled {
 		t.Fatalf("row must stay canceled: %s", r.Status)
+	}
+}
+
+func TestSubmitA3KeepsRetryableDelivery(t *testing.T) {
+	svc, st, fake, inspector := newSubmitSvc(t)
+	ctx := context.Background()
+	fake.hook = func(p task.Payload) {
+		markFixtureDeliveryFailed(t, ctx, st, p.TaskID)
+	}
+	accepted, warning, err := svc.Submit(ctx, submitPayload("retryable"))
+	if !accepted || warning != nil || err != nil {
+		t.Fatalf("submit: got (%v, %v, %v)", accepted, warning, err)
+	}
+	if inspector.count() != 0 {
+		t.Fatal("a worker's retryable delivery must stay in the queue")
+	}
+}
+
+func markFixtureDeliveryFailed(t *testing.T, ctx context.Context, st *repository.Store, taskID string) {
+	t.Helper()
+	now := time.Now()
+	if err := st.MarkRunning(ctx, taskID, 1, now, "fixture-delivery"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Finish(ctx, taskID, repository.StatusFailed, "transient error", 1, now, now, "fixture-delivery"); err != nil {
+		t.Fatal(err)
 	}
 }
 

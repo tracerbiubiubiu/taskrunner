@@ -24,6 +24,27 @@ func payload(url string) task.Payload {
 	}
 }
 
+func TestRedirectDoesNotSatisfyCallback(t *testing.T) {
+	for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Error("callback must stay at the configured endpoint")
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer target.Close()
+			configured := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL, status)
+			}))
+			defer configured.Close()
+
+			err := New(Config{}).Do(context.Background(), payload(configured.URL))
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", status)) {
+				t.Fatalf("configured endpoint did not complete the callback: %v", err)
+			}
+		})
+	}
+}
+
 func TestSuccess(t *testing.T) {
 	var gotBody, gotCT string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

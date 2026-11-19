@@ -87,6 +87,8 @@ docker compose up -d --build
 
 `security.trusted_operator_callers`默认`[zhuzhao]`，可用`TASKRUNNER_TRUSTED_OPERATOR_CALLERS`覆盖；每个受信caller须已有验签key。显式空列表关闭真人声明，只记录服务主体。首次升级核对主仓签名operator；旧body.created_by/owner_service/submitted_by/actor不再覆盖可信归因。历史归因不批量改写，不能拿历史可疑created_by作为执行授权。
 
+恢复时如原时隙已有完全相符的执行记录和入队快照，只推进时间游标并保留原投递。原记录与候选快照不同则保留原时隙和记录并告警，由维护者按原记录核对。旧随机标识的时隙在交接时人工对账。
+
 本候选`App.Run`在HTTP/ready、worker和cron/reclaim前取得事实库单例：PG持专用session advisory锁，SQLite对规范化同文件旁的`.instance.lock`取本机flock（symlink同源也互斥）；失败直接退出，不切换DB或新建备用SQLite。运行期每500ms核对session仍持锁/文件inode，单次核验上限2s；丢失或不可证明时取消后台，并先停止worker拉取新任务，再排空HTTP和既有任务，不能让在途HTTP阻塞期间继续拉新。锁文件不作为可删除临时文件，进程退出由内核释放flock；升级/备份按固定DB来源，不能运行中删除或替换锁文件。
 
 生命周期取消后，新HTTP请求（包括`/readyz`）在进入业务路由前返回503及错误码10008，并携带`Retry-After: 1`；已经进入的请求及任务按上述排空处理。停止worker拉取本身等待时，这道受理闸也保持关闭，不以监听端口尚可连接表示实例仍可接业务。

@@ -6,7 +6,7 @@
 //	第二轮  仅告警    status='pending' AND queued=1 宽限外 → Inspector 查证按 State 分流，绝不重投
 //	第三域  仅清理    status='canceled' AND queued=0 宽限外 → DeleteTask 探针，确认消亡才出域
 //
-// 进程内状态（重启清零/回卷——F30/F46）：「已投未标记」集合、两级失败计数、两把游标。
+// 进程内状态（重启清零/回卷——F30/F46）：「已投未标记」集合、两级失败计数、三个游标。
 package service
 
 import (
@@ -42,6 +42,8 @@ type ReclaimLoop struct {
 	enqueueFailCnt map[string]*failStat // 第一轮逐行非冲突失败计数（≥3 → Error，TTL 回收）
 	probeFailCnt   map[string]*failStat // 第三域探针失败计数（F65，TTL 回收）
 	payloadSkipCnt map[string]*failStat // 空/损坏快照跳过计数（≥3 → Error 升级，TTL 回收）
+	unqueuedCursor int64                // 第一轮游标，坏行和持久故障行不占死批位
+	unqueuedLastID int64                // 本轮覆盖的最大 ID，开始新一轮时刷新
 	stuckCursor    int64                // 第二轮游标（行主键 id），0 = 从头扫（F36/F46/F56——时间列绑定格式不可作游标，见实现记录）
 	cancelCursor   int64                // 第三域游标，同款
 }
@@ -166,14 +168,22 @@ const reclaimThreshold = 3 // 连续失败升级阈值（一轮/二轮告警与�
 
 // ---- 第一轮：自动修复（仅 queued=0 AND status='pending' 安全域）----
 
-// requeueUnqueued 快照同参重投 + 条件标记。无需游标——Redis 全断时全批失败、恢复即逐批
-// 自愈；DB 写故障期批位被集合成员占据（仅重试标记），两种占位都无正确性损失（F66）。
+// requeueUnqueued 快照同参重投及条件标记。每轮最多消费一批，到末尾后回卷。
 func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
-	rows, err := l.Store.ListUnqueued(ctx, before, l.BatchSize)
+	if l.unqueuedCursor == 0 {
+		lastID, err := l.Store.LatestRunID(ctx)
+		if err != nil {
+			l.Logger.Error("reclaim: bound unqueued sweep failed", slog.Any("err", err))
+			return
+		}
+		l.unqueuedLastID = lastID
+	}
+	rows, err := l.Store.ListUnqueued(ctx, before, l.unqueuedCursor, l.unqueuedLastID, l.BatchSize)
 	if err != nil {
 		l.Logger.Error("reclaim: list unqueued failed", slog.Any("err", err))
 		return
 	}
+	l.advanceCursor(rows, l.BatchSize, &l.unqueuedCursor)
 	now := l.now()
 	var (
 		warned        []string // 本 tick 内 1–2 次失败的行（聚合 Warn，F62）
@@ -193,9 +203,7 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 				continue
 			}
 			if n == 0 {
-				// 成员行已离开 pending（F39 三义，最典型并发取消）→ 补偿 + 出集
-				//（F34：否则成员永久驻留、集合无界增长）
-				l.compensateDelete(ctx, r.TaskID, "unmarked member left pending")
+				compensateCanceledDelivery(ctx, l.Store, l.Inspector, l.Logger, l.Queue, r.TaskID)
 				delete(l.unmarked, r.TaskID)
 				continue
 			}
@@ -228,8 +236,7 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 				continue
 			}
 			if n == 0 {
-				// 行在标记前离开 pending（F39/F43 三义）→ DeleteTask 补偿撤销
-				l.compensateDelete(ctx, r.TaskID, "left pending before mark")
+				compensateCanceledDelivery(ctx, l.Store, l.Inspector, l.Logger, l.Queue, r.TaskID)
 				continue
 			}
 			l.Logger.Info("reclaim: re-enqueued", slog.String("task_id", r.TaskID))
@@ -261,27 +268,6 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 	if len(markFailed) > 0 {
 		l.Logger.Warn("reclaim: mark queued failed (rows held in unmarked set, mark-only retry next tick)",
 			slog.Int("rows", len(markFailed)), slog.String("sample_task_ids", sampleIDs(markFailed)))
-	}
-}
-
-// compensateDelete 补偿撤销（F19/F44/F64）：行已离开 pending 时的在途投递回收。
-// 容忍键消亡；active = worker 已取走（不可再缩残余——MarkRunning 复活拒绝 +
-// 决策 7 终态守卫兜底）；其余瞬时错误由第三域探针（canceled 行）或正常执行覆盖。
-func (l *ReclaimLoop) compensateDelete(ctx context.Context, taskID, why string) {
-	if l.Inspector == nil {
-		return
-	}
-	err := l.Inspector.DeleteTask(l.Queue, taskID)
-	switch {
-	case err == nil || isKeyGoneErr(err):
-		l.Logger.Info("reclaim: compensated in-flight enqueue (redis task deleted)",
-			slog.String("task_id", taskID), slog.String("why", why))
-	case isDeleteActiveErr(err):
-		l.Logger.Warn("reclaim: compensation delete hit active task, give up (at-least-once residual)",
-			slog.String("task_id", taskID))
-	default:
-		l.Logger.Warn("reclaim: compensation delete failed (canceled rows covered by domain-3 probe)",
-			slog.String("task_id", taskID), slog.Any("err", err))
 	}
 }
 

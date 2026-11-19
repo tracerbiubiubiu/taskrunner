@@ -16,8 +16,8 @@
 | `POST /v1/jobs` | `action_id`、`trigger_type` 必填；可选 cron_spec/params/dept/enabled/timeout_secs/description/created_by/owner_service。 |
 | `POST /v1/jobs/update` | body `job_id` 定位；可更新定义字段，省略表示保留。 |
 | `POST /v1/jobs/trigger` | body `job_id`，按任务定义立即提交；停用定义409。可选预分配`task_id`和成对`expected_action/expected_params`，实际定义与期望精确不符409/code10005且零新run；未成对400。旧无新字段调用保持默认生成UUID。 |
-| `POST /v1/tasks/cancel` | body `task_id`；仅未开始任务，已执行/不允许状态409。 |
-| `POST /v1/tasks/retry` | body `task_id`；仅 failed/dead，其他状态409；干预时队列已推进到pending/active也返回409，保留执行记录，真实Redis/未知错误仍500。 |
+| `POST /v1/tasks/cancel` | body `task_id`；仅当前未开始的执行，已执行或条件更新冲突返回409。队列前置查证不可用时，仅对仍未确认投递的 DB 行降级。DB 确认取消后返回成功，Redis 残留继续清理。 |
+| `POST /v1/tasks/retry` | body `task_id`；仅 failed/dead，其他状态409；干预时队列已推进到pending/active也返回409，保留执行记录，新执行结果先落库时返回409。人工重试沿用队列已有重试计数和预算。真实Redis/未知错误仍500。 |
 | `GET /v1/dead-letters` | page/page_size；返回 list/page/page_size，无total。队列未创建或空队列返回200空列表；其他队列故障仍报错。 |
 
 `params` 必须合法 JSON、不得显式 null或包含重复对象键，最大64KiB，容器嵌套最多256层；省略沿原空对象缺省。action/params比对保留任意精度十进制数值，不经float64；键序、空白和1/1.0等数值等价不构成冲突。新提交的task_id最多64个Unicode字符，与核心VARCHAR(64)对齐，不按UTF-8字节截断；省略仍生成UUID，旧查询/重试标识不批量改写。timeout_secs 为0或1–86400，0采用服务默认。一次性提交/新建定义的 callback_url 非空400；更新定义只要传该字段即拒绝（包括空值）。地址由 `Config.CallbackTargetURL` 确定。旧 POST/PATCH 带业务ID路径不属于本表现行路由；没有 jobs DELETE。
@@ -34,7 +34,7 @@
 {"task_id":"任务ID","job_id":"来源任务定义ID（有定义时）","request_id":"req-…","action":"audit_archive","params":{},"actor":"操作者","source_ip":"来源IP"}
 ```
 
-actor/source_ip 为可选归因字段；可选job_id保留运行来源关联，一次性提交省略。所有字段均在签名body内；job_id本身不授业务权，核心固定job授权仍须受签查询真实task/job快照。action 是运行时标识，job 定义字段仍叫 action_id。body 为唯一业务负载通道，不将业务参数散到URL。回调带服务自身AK/SK签名；有request_id则头与body贯通。对端以task_id实现幂等，并在动作完全成功后返回2xx；408/429及5xx/超时可重试，其余4xx不可重试；409仍表示快照冲突等终败，不用它承载在途状态。主仓在途/终态记账未确认的联合候选用503和Retry-After，只有动作已完成并确认终态才回2xx。任务级结果由查询API获取；可选终败通知是告警，不是第二套执行或结果复制通道。
+actor/source_ip 为可选归因字段；可选job_id保留运行来源关联，一次性提交省略。所有字段均在签名body内；job_id本身不授业务权，核心固定job授权仍须受签查询真实task/job快照。action 是运行时标识，job 定义字段仍叫 action_id。body 为唯一业务负载通道，不将业务参数散到URL。回调带服务自身AK/SK签名；有request_id则头与body贯通。对端以task_id实现幂等，并在动作完全成功后返回2xx；408/429及5xx/超时可重试，其余4xx不可重试。只接受配置端点直接返回的完成信号，3xx保留为可重试的未确认结果且不跟随跳转；409仍表示快照冲突等终败，不用它承载在途状态。主仓在途/终态记账未确认的联合候选用503和Retry-After，只有动作已完成并确认终态才回2xx。任务级结果由查询API获取；可选终败通知是告警，不是第二套执行或结果复制通道。
 
 这里的callback是**请求能力属主执行**，不是异步结果回贴入口；当前查询提供执行记录和状态，不代表已经包含业务结构化结果、工件授权或工单/AL字段回写。后续C03/D12将执行观察、属主效果receipt、结果投递和消费回贴分别核验，见[平台集成合同](../design/platform-integration.md#统一能力通道中的tr边界)。本表现有字段和线协议保持，不以新设计文字宣称新增结果API。
 

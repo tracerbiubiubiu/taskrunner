@@ -1,12 +1,14 @@
 // reclaim 扫描器（ADR-004 决策 4）：job_runs 兼任 outbox 的补偿回路。
-// 三域职责（仿 cron.go 范式：Run 薄壳 + 同步单轮方法；单 goroutine 串行，停机 = ctx 取消；
+// 域职责（仿 cron.go 范式：Run 薄壳 + 同步单轮方法；单 goroutine 串行，停机 = ctx 取消；
 // 多副本安全——同 task_id 竞投被 asynq TaskID 冲突挡住，无需分布式锁，F30）：
 //
-//	第一轮  自动修复  queued=0 AND status='pending' 宽限外 → 快照同参重投 + 条件标记（F32 三分）
-//	第二轮  仅告警    status='pending' AND queued=1 宽限外 → Inspector 查证按 State 分流，绝不重投
-//	第三域  仅清理    status='canceled' AND queued=0 宽限外 → DeleteTask 探针，确认消亡才出域
+//	第一轮  自动修复    queued=0 AND status='pending' 宽限外 → 快照同参重投 + 条件标记（F32 三分）
+//	第二轮  仅告警      status='pending' AND queued=1 宽限外 → Inspector 查证按 State 分流，绝不重投
+//	第三域  仅清理      status='canceled' AND queued=0 宽限外 → DeleteTask 探针，确认消亡才出域
+//	第四域  仅告警发现  status='running' 宽限外 → Inspector 查证 archived/absent 指纹（F40 后果⑥
+//	                    跟进，2026-11-20）——终态持续不可写的对账出口，仅告警，绝不重投、不改写
 //
-// 进程内状态（重启清零/回卷——F30/F46）：「已投未标记」集合、两级失败计数、三个游标。
+// 进程内状态（重启清零/回卷——F30/F46）：「已投未标记」集合、两级失败计数、四个游标。
 package service
 
 import (
@@ -46,6 +48,10 @@ type ReclaimLoop struct {
 	unqueuedLastID int64                // 本轮覆盖的最大 ID，开始新一轮时刷新
 	stuckCursor    int64                // 第二轮游标（行主键 id），0 = 从头扫（F36/F46/F56——时间列绑定格式不可作游标，见实现记录）
 	cancelCursor   int64                // 第三域游标，同款
+	cancelLastID   int64
+	runningAlerts  map[string]runningObservation
+	runningCursor  int64 // 第四域游标，同款
+	runningLastID  int64
 }
 
 // Run ticker 薄壳（cron.go 同款生命周期与零值防御）。
@@ -75,15 +81,24 @@ func (l *ReclaimLoop) ReclaimStalePending(ctx context.Context) {
 	prune(l.probeFailCnt, now)
 	prune(l.payloadSkipCnt, now)
 	pruneSeen(l.unmarked, now)
+	for id, observation := range l.runningAlerts {
+		if now.Sub(observation.reportedAt) >= failStatTTL {
+			delete(l.runningAlerts, id)
+		}
+	}
 	before := now.Add(-l.StaleAfter)
 	l.requeueUnqueued(ctx, before)
 	l.alertStuckPending(ctx, before)
 	l.probeCanceled(ctx, before)
+	l.alertStuckRunning(ctx, before)
 }
 
 // defaults 零值防御（F10：配置层已回退默认，此处兜底直构实例的测试/误用场景）
 // 并惰性初始化进程内状态。
 func (l *ReclaimLoop) defaults() {
+	if l.runningAlerts == nil {
+		l.runningAlerts = map[string]runningObservation{}
+	}
 	if l.BatchSize <= 0 {
 		l.BatchSize = 100
 	}
@@ -170,13 +185,8 @@ const reclaimThreshold = 3 // 连续失败升级阈值（一轮/二轮告警与�
 
 // requeueUnqueued 快照同参重投及条件标记。每轮最多消费一批，到末尾后回卷。
 func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
-	if l.unqueuedCursor == 0 {
-		lastID, err := l.Store.LatestRunID(ctx)
-		if err != nil {
-			l.Logger.Error("reclaim: bound unqueued sweep failed", slog.Any("err", err))
-			return
-		}
-		l.unqueuedLastID = lastID
+	if !l.boundSweep(ctx, l.unqueuedCursor, &l.unqueuedLastID, "unqueued") {
+		return
 	}
 	rows, err := l.Store.ListUnqueued(ctx, before, l.unqueuedCursor, l.unqueuedLastID, l.BatchSize)
 	if err != nil {
@@ -193,21 +203,22 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 		payloadBusted []string // 空/损坏快照连续 ≥3 次（聚合 Error 升级，评审五·3）
 	)
 	for _, r := range rows {
+		if ctx.Err() != nil {
+			return
+		}
 		if _, isMember := l.unmarked[r.TaskID]; isMember {
 			// 集合成员：只重试标记、跳过重投（F3——任务已在 Redis，重投纯属制造重复）；
 			// 检视即重盖时间戳（TTL 回收只针对行已离开域的孤儿条目，实现记录 §8）
 			l.unmarked[r.TaskID] = now
 			n, err := l.Store.MarkQueued(ctx, r.TaskID)
+			if err != nil || n == 0 {
+				compensateCanceledDelivery(ctx, l.Store, l.Inspector, l.Logger, l.Queue, r.TaskID)
+			}
 			if err != nil {
 				markFailed = append(markFailed, r.TaskID)
 				continue
 			}
-			if n == 0 {
-				compensateCanceledDelivery(ctx, l.Store, l.Inspector, l.Logger, l.Queue, r.TaskID)
-				delete(l.unmarked, r.TaskID)
-				continue
-			}
-			delete(l.unmarked, r.TaskID) // 标记成功出集
+			delete(l.unmarked, r.TaskID)
 			continue
 		}
 		// 判空/反序列化失败防御（F7/F66）：空/损坏快照跳过——按 tick 聚合 Warn，
@@ -229,6 +240,9 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 			// 冲突不是异常，而是「入队成功、标记前崩溃」的主恢复信号（F32）——不计失败计数
 			delete(l.enqueueFailCnt, r.TaskID)
 			n, merr := l.Store.MarkQueued(ctx, r.TaskID)
+			if merr != nil || n == 0 {
+				compensateCanceledDelivery(ctx, l.Store, l.Inspector, l.Logger, l.Queue, r.TaskID)
+			}
 			if merr != nil {
 				// 标记执行失败（DB 写故障）→ 入「已投未标记」集合（F3），下轮只重试标记
 				l.unmarked[r.TaskID] = now
@@ -236,11 +250,11 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 				continue
 			}
 			if n == 0 {
-				compensateCanceledDelivery(ctx, l.Store, l.Inspector, l.Logger, l.Queue, r.TaskID)
 				continue
 			}
 			l.Logger.Info("reclaim: re-enqueued", slog.String("task_id", r.TaskID))
 		default:
+			compensateCanceledDelivery(ctx, l.Store, l.Inspector, l.Logger, l.Queue, r.TaskID)
 			// 非冲突失败（Redis 不可用等）：计数，同一行 ≥3 → Error（F62 聚合打点）
 			if bump(l.enqueueFailCnt, r.TaskID, now, reclaimThreshold) {
 				errored = append(errored, r.TaskID)
@@ -282,6 +296,9 @@ func (l *ReclaimLoop) alertStuckPending(ctx context.Context, before time.Time) {
 		return
 	}
 	for _, r := range rows {
+		if ctx.Err() != nil {
+			return
+		}
 		l.inspectStuck(r)
 	}
 	// F36/F46：游标按批推进（在途行也推进——否则每轮占批位）；不足一批 = 耗尽回卷
@@ -324,20 +341,26 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 	if l.Inspector == nil {
 		return
 	}
-	rows, err := l.Store.ListCanceledUnqueued(ctx, before, l.cancelCursor, l.BatchSize)
+	if !l.boundSweep(ctx, l.cancelCursor, &l.cancelLastID, "cancel") {
+		return
+	}
+	rows, err := l.Store.ListCanceledUnqueued(ctx, before, l.cancelCursor, l.cancelLastID, l.BatchSize)
 	if err != nil {
 		l.Logger.Error("reclaim: list canceled unqueued failed", slog.Any("err", err))
 		return
 	}
 	now := l.now()
-	var errored []string
+	var errored, unregistered []string
 	var dirty []string // 脏态行（数据不一致指纹，F65 分类面）——按 tick 聚合 Warn（F62 精神，评审七·补）
 	for _, r := range rows {
+		if ctx.Err() != nil {
+			return
+		}
 		err := l.Inspector.DeleteTask(l.Queue, r.TaskID)
 		switch {
-		case err == nil || isKeyGoneErr(err):
+		case err == nil || errors.Is(err, asynq.ErrTaskNotFound):
 			// 键消亡确认 → 出域（MarkCleanupDone 不可复用 MarkQueued，F48）
-			if _, uerr := l.Store.MarkCleanupDone(ctx, r.TaskID); uerr != nil {
+			if _, uerr := l.Store.MarkCleanupDone(ctx, r.TaskID, r.CancelCleanupGeneration); uerr != nil {
 				// 置位失败：留域下轮重探（键已删，下轮探消亡快速出域）
 				l.Logger.Warn("reclaim: mark cleanup done failed, will re-probe",
 					slog.String("task_id", r.TaskID), slog.Any("err", uerr))
@@ -350,6 +373,9 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 			if isRedisDirtyStateErr(err) {
 				dirty = append(dirty, r.TaskID)
 			}
+			if errors.Is(err, asynq.ErrQueueNotFound) {
+				unregistered = append(unregistered, r.TaskID)
+			}
 			if bump(l.probeFailCnt, r.TaskID, now, reclaimThreshold) {
 				errored = append(errored, r.TaskID)
 			}
@@ -359,11 +385,96 @@ func (l *ReclaimLoop) probeCanceled(ctx context.Context, before time.Time) {
 		l.Logger.Warn("reclaim: cancel-cleanup probe hit dirty task state (redis data inconsistent), will re-probe",
 			slog.Int("rows", len(dirty)), slog.String("sample_task_ids", sampleIDs(dirty)))
 	}
+	if len(unregistered) > 0 {
+		l.Logger.Warn("reclaim: queue registration absent; cancel cleanup still pending",
+			slog.Int("rows", len(unregistered)), slog.String("sample_task_ids", sampleIDs(unregistered)))
+	}
 	if len(errored) > 0 {
 		l.Logger.Error("reclaim: cancel-cleanup probe persistently failing (>=3 consecutive)",
 			slog.Int("rows", len(errored)), slog.String("sample_task_ids", sampleIDs(errored)))
 	}
 	l.advanceCursor(rows, l.BatchSize, &l.cancelCursor)
+}
+
+type runningObservation struct {
+	executionID string
+	queueState  string
+	reportedAt  time.Time
+}
+
+// alertStuckRunning compares ledger and queue observations. It checks the
+// same execution again after the queue call before reporting the discrepancy.
+func (l *ReclaimLoop) alertStuckRunning(ctx context.Context, before time.Time) {
+	if l.Inspector == nil {
+		return
+	}
+	if !l.boundSweep(ctx, l.runningCursor, &l.runningLastID, "running") {
+		return
+	}
+	rows, err := l.Store.ListStuckRunning(ctx, before, l.runningCursor, l.runningLastID, l.BatchSize)
+	if err != nil {
+		l.Logger.Error("reclaim: list stuck running failed", slog.Any("err", err))
+		return
+	}
+	var queueErrors, ledgerErrors int
+	var queueErr, ledgerErr error
+	for _, row := range rows {
+		if ctx.Err() != nil {
+			return
+		}
+		info, err := l.Inspector.GetTaskInfo(l.Queue, row.TaskID)
+		var state string
+		switch {
+		case errors.Is(err, asynq.ErrTaskNotFound):
+			state = "absent"
+		case err != nil:
+			queueErrors++
+			queueErr = err
+			continue
+		case info.State == asynq.TaskStateArchived:
+			state = "archived"
+		default:
+			delete(l.runningAlerts, row.TaskID)
+			continue
+		}
+		matches, err := l.Store.RunningExecutionMatches(ctx, row.ID, row.ExecutionID)
+		if err != nil {
+			ledgerErrors++
+			ledgerErr = err
+			continue
+		}
+		if !matches {
+			delete(l.runningAlerts, row.TaskID)
+			continue
+		}
+		last := l.runningAlerts[row.TaskID]
+		if last.executionID == row.ExecutionID && last.queueState == state {
+			continue
+		}
+		l.runningAlerts[row.TaskID] = runningObservation{row.ExecutionID, state, l.now()}
+		l.Logger.Error("reclaim: stuck running with terminal or absent queue evidence; verify outcome manually, no auto replay",
+			slog.String("task_id", row.TaskID), slog.String("queue_state", state))
+	}
+	if queueErrors > 0 {
+		l.Logger.Warn("reclaim: running queue probes failed", slog.Int("rows", queueErrors), slog.Any("err", queueErr))
+	}
+	if ledgerErrors > 0 {
+		l.Logger.Warn("reclaim: running ledger rechecks failed", slog.Int("rows", ledgerErrors), slog.Any("err", ledgerErr))
+	}
+	l.advanceCursor(rows, l.BatchSize, &l.runningCursor)
+}
+
+func (l *ReclaimLoop) boundSweep(ctx context.Context, cursor int64, lastID *int64, domain string) bool {
+	if cursor != 0 {
+		return true
+	}
+	bound, err := l.Store.LatestRunID(ctx)
+	if err != nil {
+		l.Logger.Error("reclaim: bound sweep failed", slog.String("domain", domain), slog.Any("err", err))
+		return false
+	}
+	*lastID = bound
+	return true
 }
 
 // advanceCursor 游标按批推进；不足一批 = 耗尽回卷（F36/F46：重启回卷已点明）。

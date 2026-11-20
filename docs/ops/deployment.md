@@ -16,6 +16,10 @@
 
 > 本文命令从仓库根目录进入 `deploy/` 后运行；compose文件仍在 `deploy/compose.yaml`，不是docs目录。
 
+## 取消清理代次升级（2026-11-20）
+
+使用既有单实例停写升级流程。启动时给 SQLite 和 PG 的 `job_runs` 补 `cancel_cleanup_generation BIGINT NOT NULL DEFAULT 0`；存量取消行保留当前清理域和 queued 值。迟到投递为同一任务登记更新的清理代次，探针只确认采样时的代次。旧版忽略代次，混跑无法提供这一保证。回退前停止新写者，新增列可留给后继升级，仍按人工对账口径处理遗留队列。
+
 ## 运行基线升级（2026-11-12 候选）
 
 应用构建使用 Go 1.27.4 / Alpine 3.24，运行镜像 Alpine 3.24.4；PostgreSQL 18.6 使用 Debian trixie 官方镜像，备份工具与服务端同版本。镜像均钉完整版本和多架构摘要；本候选不自动修改已有实例。版本选择、依赖变化和验证边界见 [升级记录](version-upgrade.md)。
@@ -67,9 +71,23 @@ docker compose up -d --build
 - job_runs / jobs 落本栈专用 PG（C7 拍板：联调只用 PG；表结构应用启动自建）
 - asynq 队列落本栈 Redis（DB 0，独立实例不与 zhuzhao 共享；队列不备份——载荷快照在 job_runs
   `enqueue_payload` 兜底。Redis 丢失仅 queued=0+pending 可自动补投；queued=1+pending/running 须按日志人工对账，不能承诺全自动恢复）
+- **人工对账口径（2026-11-20）**：`queued=1+pending` 沿现有待投账本差异告警。
+  对宽限外的 `running`，看见队列归档或具体任务不存在后才复核账本仍为同一执行，再记录任务及队列状态。
+  运行对账重复快照按时窗抑制，探针故障按批记录。队列注册缺失可能遮住任务本体，此时保留取消清理等待，
+  运行对账记录探针故障。恢复队列观测后重新查证。
+  人工处理先向能力属主核对业务回执和实际效果，再决定补录或以新 task_id 重新提交。对账只读。
+  取消侧登记每次迟到投递的清理代次，入队响应不明确时也登记已取消的任务。
+  成功撤销残留或确认具体任务不存在后，探针才关闭自己观察到的这一轮。
 - **备份已就位（2026-10-01）**：pgbackup 侧车每日 02:00 `pg_dump -Fc`、保留 14 份
   （恢复步骤见 [备份与恢复](backup.md)；job_runs 保留期口径 M4 一并拍，
   调整=改 pgbackup 的 `RETAIN_COUNT`）
+
+## 停止预算（F0，2026-11-20）
+
+`deploy/compose.yaml` 的 taskrunner 服务配 `stop_grace_period: 90s`：`App.Run` 顺序收尾
+HTTP 排空（`TASKRUNNER_SHUTDOWN_TIMEOUT` 默认 30s）与 asynq worker 排空（同配置上限），
+Compose 默认 10s 宽限会把慢请求和未完成收尾提前 SIGKILL。上调排空配置时须同步上调该值
+（≥ 2×排空上限 + 余量）。补偿扫描收到停止信号后停止处理新的扫描行；已返回的投递可登记当前清理责任后退出。
 
 ## 非 root 与可写目录（R5）
 

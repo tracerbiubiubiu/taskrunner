@@ -211,16 +211,16 @@ func TestQueuedFlagLifecycle(t *testing.T) {
 
 	// MarkCleanupDone（F48 条件回归）：pending 行 → 0 行；canceled+queued=0 → 1 行；重复 → 0 行
 	seedRun(t, s, "q3", time.Now(), "")
-	if n, err := s.MarkCleanupDone(ctx, "q3"); err != nil || n != 0 {
+	if n, err := s.MarkCleanupDone(ctx, "q3", 0); err != nil || n != 0 {
 		t.Fatalf("cleanup on pending must be 0 rows: n=%d err=%v", n, err)
 	}
 	if ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: "q3"}, "x", time.Now(), false); !ok {
 		t.Fatalf("cancel q3: %v %v", ok, err)
 	}
-	if n, err := s.MarkCleanupDone(ctx, "q3"); err != nil || n != 1 {
+	if n, err := s.MarkCleanupDone(ctx, "q3", 0); err != nil || n != 1 {
 		t.Fatalf("cleanup on canceled+queued=0: n=%d err=%v", n, err)
 	}
-	if n, _ := s.MarkCleanupDone(ctx, "q3"); n != 0 {
+	if n, _ := s.MarkCleanupDone(ctx, "q3", 0); n != 0 {
 		t.Fatalf("second cleanup must be 0 rows, got %d", n)
 	}
 }
@@ -305,14 +305,14 @@ func TestListCursorRotation(t *testing.T) {
 			t.Fatalf("cancel %s: %v %v", id, ok, err)
 		}
 	}
-	rows, err = s.ListCanceledUnqueued(ctx, before, 0, 1)
+	rows, err = s.ListCanceledUnqueued(ctx, before, 0, math.MaxInt64, 1)
 	if err != nil || len(rows) != 1 || rows[0].TaskID != "x1" {
 		t.Fatalf("cancel batch1: %+v err=%v", rows, err)
 	}
-	if _, err := s.MarkCleanupDone(ctx, "x1"); err != nil {
+	if _, err := s.MarkCleanupDone(ctx, "x1", 0); err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
-	rows, _ = s.ListCanceledUnqueued(ctx, before, 0, 1)
+	rows, _ = s.ListCanceledUnqueued(ctx, before, 0, math.MaxInt64, 1)
 	if len(rows) != 1 || rows[0].TaskID != "x2" {
 		t.Fatalf("cleanup 出域后应离开扫描域: %+v", rows)
 	}
@@ -438,10 +438,18 @@ CREATE TABLE job_runs (
 	source_ip    TEXT NOT NULL DEFAULT '',
 	started_at   TIMESTAMP,
 	finished_at  TIMESTAMP,
-	enqueued_at  TIMESTAMP NOT NULL
+	enqueued_at  TIMESTAMP NOT NULL,
+	queued INTEGER NOT NULL DEFAULT 1
 );`
 	if _, err := raw.Exec(legacy); err != nil {
 		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO job_runs (task_id, action, status, attempts, enqueued_at, queued) VALUES
+		('legacy-cancel', 'a', 'canceled', 0, '2026-11-19 12:00:00', 0),
+		('legacy-pending', 'a', 'pending', 0, '2026-11-19 12:00:00', 0),
+		('legacy-running', 'a', 'running', 2, '2026-11-19 12:00:00', 1)`); err != nil {
+		raw.Close()
+		t.Fatalf("seed legacy rows: %v", err)
 	}
 	raw.Close()
 
@@ -450,6 +458,14 @@ CREATE TABLE job_runs (
 		t.Fatalf("open legacy db: %v", err)
 	}
 	defer s.Close()
+
+	checkUpgradedRuns(t, s)
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen upgraded store: %v", err)
+	}
+	defer reopened.Close()
+	checkUpgradedRuns(t, reopened)
 
 	ctx := context.Background()
 	if err := s.InsertPending(ctx, Run{
@@ -464,5 +480,134 @@ CREATE TABLE job_runs (
 	}
 	if r.JobID != "j1" || r.Dept != "audit" || r.Params != `{"k":1}` {
 		t.Fatalf("migrated columns round-trip: %+v", r)
+	}
+}
+
+func checkUpgradedRuns(t *testing.T, store *Store) {
+	t.Helper()
+	ctx := context.Background()
+	before := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	legacy := []struct {
+		id       string
+		status   string
+		attempts int
+		queued   bool
+	}{
+		{"legacy-cancel", StatusCanceled, 0, false},
+		{"legacy-pending", StatusPending, 0, false},
+		{"legacy-running", StatusRunning, 2, true},
+	}
+	for _, expected := range legacy {
+		row, err := store.GetByTaskID(ctx, expected.id)
+		if err != nil || row.Status != expected.status || row.Attempts != expected.attempts || row.Queued != expected.queued {
+			t.Fatalf("legacy row changed on upgrade: %+v %v", row, err)
+		}
+	}
+	rows, err := store.ListCanceledUnqueued(ctx, before, 0, math.MaxInt64, 10)
+	if err != nil || len(rows) != 1 || rows[0].TaskID != "legacy-cancel" || rows[0].CancelCleanupGeneration != 0 {
+		t.Fatalf("legacy cleanup obligation changed: %+v %v", rows, err)
+	}
+}
+
+// 清理重入（F2a 迟到取消投递，2026-11-20 复核）：已出域取消行（queued=1）被迟到投递取走时，
+// worker 终态守卫将其放回第三域（queued=0）重探；仅 canceled 行可重入——succeeded/running
+// 等其它状态不受影响。域内的新投递也更新代次，使旧探针结论失效。
+func TestMarkCleanupPendingConditions(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// canceled+queued=1（先前确认无键出域）→ 重入 1 行
+	seedRun(t, s, "rp1", time.Now(), "")
+	if ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: "rp1"}, "x", time.Now(), false); !ok || err != nil {
+		t.Fatalf("cancel rp1: %v %v", ok, err)
+	}
+	if n, err := s.MarkCleanupDone(ctx, "rp1", 0); err != nil || n != 1 {
+		t.Fatalf("cleanup done rp1: n=%d err=%v", n, err)
+	}
+	if n, err := s.MarkCleanupPending(ctx, "rp1"); err != nil || n != 1 {
+		t.Fatalf("reopen canceled: n=%d err=%v", n, err)
+	}
+	if q, _ := s.GetQueued(ctx, "rp1"); q {
+		t.Fatal("reopened canceled row must be back in the cleanup scope (queued=0)")
+	}
+	if n, err := s.MarkCleanupPending(ctx, "rp1"); n != 1 || err != nil {
+		t.Fatalf("new obligation while queued=0: n=%d err=%v", n, err)
+	}
+
+	// 其它状态一律 0 行，queued 置位不被翻动（合法任务的队列副本不被误撤）
+	for _, tc := range []struct {
+		id     string
+		evolve func(id string)
+	}{
+		{"rp-pending", func(string) {}},
+		{"rp-running", func(id string) {
+			s.MarkRunning(ctx, id, 1, time.Now(), "fx")
+		}},
+		{"rp-succeeded", func(id string) {
+			s.MarkRunning(ctx, id, 1, time.Now(), "fx")
+			s.Finish(ctx, id, StatusSucceeded, "", 1, time.Now(), time.Now(), "fx")
+		}},
+	} {
+		seedRun(t, s, tc.id, time.Now(), "")
+		s.MarkQueued(ctx, tc.id) // 模拟已投递
+		tc.evolve(tc.id)
+		if n, err := s.MarkCleanupPending(ctx, tc.id); err != nil || n != 0 {
+			t.Fatalf("%s must not re-enter cleanup scope: n=%d err=%v", tc.id, n, err)
+		}
+		if q, _ := s.GetQueued(ctx, tc.id); !q {
+			t.Fatalf("%s queue copy must stay untouched (queued stays 1)", tc.id)
+		}
+	}
+}
+
+// 第四域扫描判据（F40 后果⑥跟进，2026-11-20）：仅「宽限外 running」入选；宽限内合法长任务、
+// pending/canceled/终态行不入选；LIMIT + id 游标同款。before 用相对 base 的合成边界——
+// time.Now() 的单调时钟后缀绑定不可作比较边界（ADR-004 实现记录 §1）。
+func TestListStuckRunning(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	base := time.Now().Add(-time.Hour)
+	before := base.Add(30 * time.Minute)
+
+	seedRun(t, s, "sr1", base, "")
+	seedRun(t, s, "sr2", base.Add(time.Minute), "")
+	if err := s.MarkRunning(ctx, "sr1", 1, base, "fx1"); err != nil {
+		t.Fatalf("mark running sr1: %v", err)
+	}
+	if err := s.MarkRunning(ctx, "sr2", 1, base, "fx2"); err != nil {
+		t.Fatalf("mark running sr2: %v", err)
+	}
+	// 宽限内 running（合法长任务）→ 排除
+	seedRun(t, s, "sr-fresh", base.Add(59*time.Minute), "")
+	if err := s.MarkRunning(ctx, "sr-fresh", 1, base, "fx3"); err != nil {
+		t.Fatalf("mark running fresh: %v", err)
+	}
+	// 其它状态 → 排除（分属第一/三轮与终态）
+	seedRun(t, s, "sr-pending", base, "")
+	seedRun(t, s, "sr-canceled", base, "")
+	if ok, _ := s.MarkCanceledIfPending(ctx, &Run{TaskID: "sr-canceled"}, "x", time.Now(), false); !ok {
+		t.Fatal("cancel sr-canceled")
+	}
+	seedRun(t, s, "sr-done", base, "")
+	if err := s.MarkRunning(ctx, "sr-done", 1, base, "fx4"); err != nil {
+		t.Fatalf("mark running done: %v", err)
+	}
+	if err := s.Finish(ctx, "sr-done", StatusSucceeded, "", 1, base, base, "fx4"); err != nil {
+		t.Fatalf("finish done: %v", err)
+	}
+
+	rows, err := s.ListStuckRunning(ctx, before, 0, math.MaxInt64, 100)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 2 || rows[0].TaskID != "sr1" || rows[1].TaskID != "sr2" {
+		t.Fatalf("stuck-running domain broken: %+v", rows)
+	}
+	rows, err = s.ListStuckRunning(ctx, before, rows[0].ID, math.MaxInt64, 1)
+	if err != nil {
+		t.Fatalf("list cursor: %v", err)
+	}
+	if len(rows) != 1 || rows[0].TaskID != "sr2" {
+		t.Fatalf("cursor page: %+v", rows)
 	}
 }

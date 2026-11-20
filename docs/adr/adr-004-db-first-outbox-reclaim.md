@@ -51,7 +51,7 @@
 5. **Retention 入队选项**（默认 1h）：完成任务在 Redis 留观占住 TaskID，挡扫描器迟到重投与任务完成释放的竞态。配置名 `reclaim.retention`：虽作用于 Submit 入队 opts，因扫描器依赖其判断 TaskID 是否释放而归入 reclaim 组（评审 F11/F17②）。**asynq 以整秒承载 Retention**（评审 F67：client 入参 `int64(d.Seconds())` 截断、processor 以 `Retention > 0` 二分——亚秒值截断为 0 时任务完成即删键释放 TaskID，留观防线静默失效），故本配置生效粒度为整秒，校验按整秒化后判定（实施计划 4）。
 6. **取消按账本提交，队列清理可恢复**。先查询当前运行与队列。已经开始、已完成或归档记录拒绝取消。Redis 前置查证不可用时，只有条件提交时仍未确认投递的行可降级，已确认投递的行保持原错误。按原执行代次和 pending 状态提交 canceled，同时把 queued 置 0 入第三域。提交前没有 Redis 删除。提交后的即时清理失败时，取消成功且由第三域继续探测，worker 看到 canceled 时终止执行。
 
-7. **worker 终态守卫（评审 F59；副作用执行前重验行状态，业界 consumer-side guard）**：现状 `MarkRunning` 0 行失败以一条字符串错误混淆「行缺失」与「succeeded/canceled 复活拒绝」，worker 一律 Warn 后照常执行回调（`worker.go:85` 旧世界「入队成功落库失败」的容忍口径）——DB-first 下行先于任务存在，行缺失只剩历史/手动残留，而「行已 canceled/succeeded 仍照常回调」是取消失效残余（F45：取消补偿间隙被取走执行）与降级取消窗口（F58）产生错误回调副作用的直接通道。改为：`MarkRunning` 0 行时补一次 `GetByTaskID` 分类（UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按未知包装、worker 维持继续执行）——行缺失 → `ErrRunNotFound`，worker 维持现口径（Warn + 继续回调，历史残留容忍不变）；行已 succeeded/canceled → `ErrTerminalRejected`，worker 记 Error + **不执行回调** + `asynq.SkipRetry` 丢弃任务（行已是终态，无需 Finish）；DB 错误 → 包装错误，worker 维持现口径继续（不能因记账故障中断执行）。取消语义经「探针挡取走（第三域）+ 守卫挡回调（本决策）」双层闭合，「已取消任务产生回调」在 at-least-once 投递下收敛到结构闭点。
+7. **worker 终态守卫（评审 F59；副作用执行前重验行状态，业界 consumer-side guard）**：现状 `MarkRunning` 0 行失败以一条字符串错误混淆「行缺失」与「succeeded/canceled 复活拒绝」，worker 一律 Warn 后照常执行回调（`worker.go:85` 旧世界「入队成功落库失败」的容忍口径）——DB-first 下行先于任务存在，行缺失只剩历史/手动残留，而「行已 canceled/succeeded 仍照常回调」是取消失效残余（F45：取消补偿间隙被取走执行）与降级取消窗口（F58）产生错误回调副作用的直接通道。改为：`MarkRunning` 0 行时补一次 `GetByTaskID` 分类（UPDATE 仍是唯一权威，补查仅作错误分类；补查失败按未知包装、worker 维持继续执行）——行缺失 → `ErrRunNotFound`，worker 维持现口径（Warn + 继续回调，历史残留容忍不变）；行已 succeeded/canceled → `ErrTerminalRejected`，worker 记 Error + **不执行回调** + `asynq.SkipRetry` 丢弃任务（行已是终态，无需 Finish）；DB 错误 → 包装错误，worker 维持现口径继续（不能因记账故障中断执行）。取消语义经「探针挡取走（第三域）+ 守卫挡回调（本决策）」双层闭合，「已取消任务产生回调」在 at-least-once 投递下收敛到结构闭点。（2026-11-20 跟进：迟到投递侧和守卫均通过 `MarkCleanupPending` 为 canceled 行登记新清理代次。探针完成时按同一代次条件出域，较新的义务仍留域。入队响应不明确时同样登记当前已取消行。投递侧即时删除失败留待扫描器恢复；队列注册缺失保留清理义务，等待确认具体任务。）
 
 ## 理由
 - 结构性消除「执行但无记录」：插行失败 = 500（Redis 无任务、DB 无行，干净）；入队失败 = 行在（可见、可修、可查）。原隐性权衡（执行优先 vs 记录优先）不再需要二选一。
@@ -71,7 +71,7 @@
   ③ 新增常驻组件（扫描器）与配置面，需关注积压告警；连续失败计数与「已投未标记」集合均为**进程态**——重启清零、多副本各自计数（多副本本身安全：同 task_id 竞投被 Redis TaskID 冲突挡住，无需 cronloop 式分布式锁，评审 F30）。
   ④ completed 态指纹在 Retention 留观期内即可被第二轮识别（F20 分流后不再有 1h 延迟）；留观过期后 completed 退化为 absent，告警文案不同、时效相同。
   ⑤ **登记不变式（评审 F38）**：「`ErrTaskIDConflict` = 已投递」的判定隐含 **job_runs 行生命周期 ≥ 同 task_id 的 Redis 键生命周期（含 Retention 留观）**——当前行终身保留成立；M4 保留期清理落地时必须重估（清理不得早于 Redis 键消亡 + Retention）。另注（评审 F63）：completed 留观副本的过期清理由 asynq Server 内置 janitor 协程执行（随 worker 进程运行，非 Redis TTL）——全停或纯 CLI 场景键滞留超过 retention、TaskID 释放晚于配置值；对不变式是安全方向（键活得更久），运维知悉即可。
-  ⑥ **既存空洞登记（三审残余项）**：`running + queued=0`（MarkRunning 成功但 Finish 长期失败）不落在任何扫描域——原稿即有的边界；依赖 Finish 失败自身 Error 日志与 M4 对账覆盖，本设计不为此扩域。（七审注：将来如需，可在第二轮加 `running` 超时的 alert-only 分支——一条判据 + 文案，仍不自动重投，成本低。）
+  ⑥ **既存空洞登记（三审残余项）**：`running + queued=0`（MarkRunning 成功但 Finish 长期失败）不落在任何扫描域——原稿即有的边界；依赖 Finish 失败自身 Error 日志与 M4 对账覆盖，本设计不为此扩域。（七审注：将来如需，可在第二轮加 `running` 超时的 alert-only 分支——一条判据 + 文案，仍不自动重投，成本低。）（2026-11-20 跟进：按七审注独立成第四域——`status='running'` 宽限外的 alert-only 对账发现，Inspector 观察 archived/absent 后复核同一执行仍为 running，记录实际队列状态；Redis 探针失败单独聚合，扫描保持只读；实现 `ListStuckRunning` + `idx_job_runs_running_stuck`，人工口径见部署指南，运行边界见运行设计「DB-first 受理与恢复」。）
 - 后续跟进：M4 对账任务（终兜底）+ 手动 reclaim 端点备选（F21）；接入方上量/多接入方/审计要求「记录与队列强一致」时再评估完整 Outbox（独立 relay；Debezium/CDC 对当前规模过重）。
 
 ## 评审修正记录（67 项，全部合入）

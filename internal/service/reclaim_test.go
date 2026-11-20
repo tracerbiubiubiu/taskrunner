@@ -434,7 +434,8 @@ func TestReclaimCancelCleanupProbes(t *testing.T) {
 	l, st, fake, ins, cap := newReclaim(t)
 	seedCanceled(t, st, "c-ok", 0)    // DeleteTask 成功 → 出域
 	seedCanceled(t, st, "c-gone", 0)  // ErrTaskNotFound → 出域
-	seedCanceled(t, st, "c-qgone", 0) // F64：ErrQueueNotFound（队列注册集被清）→ 出域
+	seedCanceled(t, st, "c-qgone", 0) // 注册缺失，保留清理责任
+	ins.delErr["c-qgone"] = asynq.ErrQueueNotFound
 	seedCanceled(t, st, "c-act", 0)   // active → 不出域
 	seedCanceled(t, st, "c-dirty", 0) // Lua 脏态 → 不出域 + 聚合 Warn（F65 分类面）
 	ins.delErr["c-act"] = errors.New("asynq: INTERNAL_ERROR: cannot delete task in active state. use CancelProcessing instead.")
@@ -448,7 +449,7 @@ func TestReclaimCancelCleanupProbes(t *testing.T) {
 
 	l.ReclaimStalePending(context.Background())
 
-	for _, id := range []string{"c-ok", "c-gone", "c-qgone"} {
+	for _, id := range []string{"c-ok", "c-gone"} {
 		if q, err := st.GetQueued(context.Background(), id); err != nil || !q {
 			t.Fatalf("%s must leave domain (queued=1): %v %v", id, q, err)
 		}
@@ -501,16 +502,178 @@ func TestReclaimCancelProbeFailureVisibilityAndRotation(t *testing.T) {
 	}
 }
 
-// F64：消亡容忍集不分 sentinel 类型——TaskNotFound 与 QueueNotFound 等价出域。
+// 队列注册缺失不能证明具体任务键消失。
 func TestReclaimKeyGoneTolerance(t *testing.T) {
 	l, st, _, ins, _ := newReclaim(t)
 	seedCanceled(t, st, "k1", 0)
 	ins.delErr["k1"] = asynq.ErrQueueNotFound
 	l.ReclaimStalePending(context.Background())
-	if q, err := st.GetQueued(context.Background(), "k1"); err != nil || !q {
-		t.Fatalf("ErrQueueNotFound must be treated as key-gone: %v %v", q, err)
+	if q, err := st.GetQueued(context.Background(), "k1"); err != nil || q {
+		t.Fatalf("missing queue registry must keep cleanup pending: %v %v", q, err)
 	}
 }
 
 // 编译期守住 task 包引用（payload 反序列化路径）。
 var _ = task.Payload{}
+
+// 迟到已取消投递 → 清理重入收敛（F2a，2026-11-20 复核）：重入行走既有第三域——
+// ① 探针失败不出域下轮重试；② 正常撤销残留副本出域；③ 再迟到的投递被再次重入后
+// 按「先前确认无键」快速出域。清理重入绝不重投。守卫侧重入行为见 worker 包
+// TestLateCanceledDeliveryReentersCleanupScope，此处以同款写位（MarkCleanupPending）模拟。
+func TestReopenedCanceledDeliveryCleanupConverges(t *testing.T) {
+	l, st, fake, ins, _ := newReclaim(t)
+	ctx := context.Background()
+	seedCanceled(t, st, "rp-x", 0)
+	if _, err := st.MarkCleanupDone(ctx, "rp-x", 0); err != nil { // 先前已确认消亡出域
+		t.Fatalf("cleanup done: %v", err)
+	}
+	if q, _ := st.GetQueued(ctx, "rp-x"); !q {
+		t.Fatal("fixture: row should be out of the sweep")
+	}
+
+	if _, err := st.MarkCleanupPending(ctx, "rp-x"); err != nil { // 守卫重入
+		t.Fatalf("reopen: %v", err)
+	}
+
+	// ① 失败：探针瞬时错误 → 留域，下轮重试
+	ins.delErr["rp-x"] = errors.New("redis timeout")
+	l.ReclaimStalePending(ctx)
+	if q, _ := st.GetQueued(ctx, "rp-x"); q {
+		t.Fatal("probe failure must keep reopened row in scope")
+	}
+
+	// ② 正常重试：撤销残留副本后出域
+	delete(ins.delErr, "rp-x")
+	l.ReclaimStalePending(ctx)
+	if q, err := st.GetQueued(ctx, "rp-x"); err != nil || !q {
+		t.Fatalf("surviving copy must be withdrawn and row leave the sweep: %v %v", q, err)
+	}
+	deleted := false
+	for _, id := range ins.deleted {
+		if id == "rp-x" {
+			deleted = true
+		}
+	}
+	if !deleted {
+		t.Fatal("reopened row must be re-probed by the existing cleanup sweep")
+	}
+	if fake.count() != 0 {
+		t.Fatal("cleanup reentry must never re-enqueue")
+	}
+
+	// ③ 再迟到 + 先前确认无键：重入后探 NotFound → 快速出域，不驻留
+	if _, err := st.MarkCleanupPending(ctx, "rp-x"); err != nil {
+		t.Fatalf("reopen again: %v", err)
+	}
+	ins.delErr["rp-x"] = asynq.ErrTaskNotFound
+	l.ReclaimStalePending(ctx)
+	if q, err := st.GetQueued(ctx, "rp-x"); err != nil || !q {
+		t.Fatalf("key-gone confirmation must close the reopened row: %v %v", q, err)
+	}
+}
+
+// 第四域（F40 后果⑥跟进，2026-11-20）：宽限外 running 行的对账发现——仅告警、绝不重投、
+// 不改写。archived 指纹 = 最终终态落库失败；absent= 队列证据
+// 丢失；探针失败另外聚合告警。
+func TestReclaimStuckRunningDispatch(t *testing.T) {
+	l, st, fake, ins, cap := newReclaim(t)
+	ctx := context.Background()
+	seedRunning := func(id string, state asynq.TaskState, hasState bool, getErr error) {
+		t.Helper()
+		seedOld(t, st, id, "", 0)
+		if err := st.MarkRunning(ctx, id, 1, reclaimBase, "fx-"+id); err != nil {
+			t.Fatalf("mark running %s: %v", id, err)
+		}
+		if hasState {
+			ins.states[id] = state
+		}
+		if getErr != nil {
+			ins.getErrs[id] = getErr
+		}
+	}
+	seedRunning("r-arch", asynq.TaskStateArchived, true, nil)                                   // 指纹：终态落库失败
+	seedRunning("r-absent", 0, false, asynq.ErrTaskNotFound)                                    // 指纹：队列证据丢失
+	seedRunning("r-qgone", 0, false, asynq.ErrQueueNotFound)                                    // 缺失注册，另记探针故障
+	seedRunning("r-active", asynq.TaskStateActive, true, nil)                                   // 在途，静默
+	seedRunning("r-retry", asynq.TaskStateRetry, true, nil)                                     // 在途，静默
+	seedRunning("r-probefail", asynq.TaskStateArchived, true, errors.New("redis dial timeout")) // 探针失败 ≠ 证据
+
+	l.ReclaimStalePending(ctx)
+
+	if got := cap.count(slog.LevelError, "stuck running"); got != 2 {
+		t.Fatalf("want 2 stuck-running Error alerts (archived/absent), got %d", got)
+	}
+	if got := cap.count(slog.LevelError, "no auto replay"); got != 2 {
+		t.Fatalf("alerts must carry the no-auto-replay manual boundary, got %d", got)
+	}
+	if got := cap.count(slog.LevelWarn, "running queue probes failed"); got != 1 {
+		t.Fatalf("queue probe failures must be visible separately: %d", got)
+	}
+	observed := make(map[string]string)
+	for _, record := range cap.records {
+		if record.Level != slog.LevelError || !strings.Contains(record.Message, "stuck running") {
+			continue
+		}
+		var taskID, queueState string
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "task_id" {
+				taskID = attr.Value.String()
+			}
+			if attr.Key == "queue_state" {
+				queueState = attr.Value.String()
+			}
+			return true
+		})
+		observed[taskID] = queueState
+	}
+	if observed["r-arch"] != "archived" || observed["r-absent"] != "absent" || observed["r-qgone"] != "" {
+		t.Fatalf("wrong ledger and queue discrepancies: %v", observed)
+	}
+	l.ReclaimStalePending(ctx)
+	if got := cap.count(slog.LevelError, "stuck running"); got != 2 {
+		t.Fatalf("same execution and queue state flooded the log: %d", got)
+	}
+	if fake.count() != 0 || len(ins.deleted) != 0 {
+		t.Fatal("running domain must leave the queue unchanged")
+	}
+	for _, id := range []string{"r-arch", "r-absent", "r-active"} {
+		r, err := st.GetByTaskID(ctx, id)
+		if err != nil || r.Status != repository.StatusRunning {
+			t.Fatalf("%s must stay running untouched: %+v %v", id, r, err)
+		}
+	}
+}
+
+// 第四域有界性（F36 同款）：批次 + 游标轮转保证 eventual 全覆盖；宽限内 running 行不探。
+func TestReclaimStuckRunningBoundedSweep(t *testing.T) {
+	l, st, _, ins, _ := newReclaim(t)
+	l.BatchSize = 2
+	ctx := context.Background()
+	for _, id := range []string{"b1", "b2", "b3"} {
+		seedOld(t, st, id, "", 0)
+		if err := st.MarkRunning(ctx, id, 1, reclaimBase, "fx"); err != nil {
+			t.Fatalf("mark running %s: %v", id, err)
+		}
+		ins.states[id] = asynq.TaskStateActive // 在途
+	}
+	seedOld(t, st, "b-fresh", "", 2*time.Hour) // 宽限内（enqueued_at 超前，同 TestReclaimCancelCleanupProbes 手法）
+	if err := st.MarkRunning(ctx, "b-fresh", 1, time.Now(), "fx"); err != nil {
+		t.Fatalf("mark running fresh: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		l.ReclaimStalePending(ctx)
+	}
+	seen := map[string]bool{}
+	for _, id := range ins.gotInfo {
+		seen[id] = true
+	}
+	for _, id := range []string{"b1", "b2", "b3"} {
+		if !seen[id] {
+			t.Fatalf("%s must be inspected within rotation", id)
+		}
+	}
+	if seen["b-fresh"] {
+		t.Fatal("grace-period running row must not be probed")
+	}
+}

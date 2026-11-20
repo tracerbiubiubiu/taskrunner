@@ -5,9 +5,14 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"time"
+
+	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
 // 触发方式。
@@ -307,14 +312,19 @@ func (s *Store) ClaimCronOccurrence(ctx context.Context, j Job, next, now time.T
 		return false, err
 	}
 	if n == 0 {
-		var same bool
-		err := tx.QueryRowContext(ctx, s.pgq(`SELECT EXISTS (SELECT 1 FROM job_runs WHERE task_id=?
-AND job_id=? AND action=? AND dept=? AND params=? AND callback_url=? AND enqueue_payload=?)`),
-			r.TaskID, r.JobID, r.Action, r.Dept, r.Params, r.CallbackURL, r.EnqueuePayload).Scan(&same)
+		var stored Run
+		query := `SELECT task_id,request_id,action,job_id,dept,params,callback_url,submitted_by,source_ip,enqueue_payload
+ FROM job_runs WHERE task_id=?`
+		if s.pg {
+			query += ` FOR UPDATE`
+		}
+		err := tx.QueryRowContext(ctx, s.pgq(query), r.TaskID).Scan(&stored.TaskID, &stored.RequestID,
+			&stored.Action, &stored.JobID, &stored.Dept, &stored.Params, &stored.CallbackURL,
+			&stored.SubmittedBy, &stored.SourceIP, &stored.EnqueuePayload)
 		if err != nil {
 			return false, fmt.Errorf("store: read existing cron occurrence: %w", err)
 		}
-		if !same {
+		if !sameCronOccurrence(stored, r) {
 			return false, fmt.Errorf("store: cron occurrence does not match the stored execution")
 		}
 	}
@@ -322,6 +332,74 @@ AND job_id=? AND action=? AND dept=? AND params=? AND callback_url=? AND enqueue
 		return false, fmt.Errorf("store: commit cron occurrence: %w", err)
 	}
 	return n == 1, nil // Existing matching occurrences already own the outbox record.
+}
+
+// Only an equivalent, self-consistent occurrence may recover the schedule.
+// This compares the frozen execution, not later job edits or delivery status;
+// the existing outbox is never rewritten or delivered again by the claimant.
+func sameCronOccurrence(stored, requested Run) bool {
+	old, ok := cronOccurrencePayload(stored)
+	if !ok {
+		return false
+	}
+	current, ok := cronOccurrencePayload(requested)
+	if !ok {
+		return false
+	}
+	equal, err := task.EqualJSON([]byte(stored.Params), []byte(requested.Params))
+	return err == nil && equal && stored.TaskID == requested.TaskID && stored.RequestID == requested.RequestID &&
+		stored.Action == requested.Action && stored.JobID == requested.JobID && stored.Dept == requested.Dept &&
+		stored.CallbackURL == requested.CallbackURL && stored.SubmittedBy == requested.SubmittedBy &&
+		stored.SourceIP == requested.SourceIP && old.TimeoutSecs == current.TimeoutSecs
+}
+
+func cronOccurrencePayload(r Run) (task.Payload, bool) {
+	var p task.Payload
+	if strings.TrimSpace(r.EnqueuePayload) == "" {
+		return p, false
+	}
+	// Validate envelope keys separately so the outer object does not consume
+	// params' EqualJSON depth budget. Unmarshal alone accepts duplicate keys
+	// and case-insensitive aliases; neither may authorize schedule recovery.
+	decoder := json.NewDecoder(strings.NewReader(r.EnqueuePayload))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return p, false
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return p, false
+		}
+		field, ok := key.(string)
+		if !ok || seen[field] {
+			return p, false
+		}
+		seen[field] = true
+		switch field {
+		case "task_id", "request_id", "action", "job_id", "dept", "callback_url", "params", "submitted_by", "source_ip", "timeout_secs":
+		default:
+			return p, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return p, false
+		}
+	}
+	if end, err := decoder.Token(); err != nil || end != json.Delim('}') {
+		return p, false
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return p, false
+	}
+	if err := json.Unmarshal([]byte(r.EnqueuePayload), &p); err != nil {
+		return p, false
+	}
+	equal, err := task.EqualJSON([]byte(r.Params), p.Params)
+	return p, err == nil && equal && p.TaskID != "" && p.Action != "" && p.JobID != "" &&
+		p.TaskID == r.TaskID && p.RequestID == r.RequestID && p.Action == r.Action && p.JobID == r.JobID &&
+		p.Dept == r.Dept && p.CallbackURL == r.CallbackURL && p.SubmittedBy == r.SubmittedBy && p.SourceIP == r.SourceIP
 }
 
 func (s *Store) DisableCronSnapshot(ctx context.Context, j Job, now time.Time) error {

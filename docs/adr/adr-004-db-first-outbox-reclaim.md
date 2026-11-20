@@ -37,7 +37,7 @@
    - **warning 明确不回传响应体**（评审 F8）：`SubmitOutput` 保持 `TaskID/Accepted` 不变，warning 仅进日志；调用方需要知道是否真的入队时查 `GET /v1/tasks/{id}` 的 live_state——避免改响应契约。
 
 4. **ReclaimLoop 扫描器**（仿 cron.go 范式：Run 薄壳 + 同步单轮方法；经 `cronRunner` 接口接线）：
-   - **第一轮（自动修复，仅安全域）**：判据 `queued=0 AND status='pending' AND enqueued_at<=now-stale_after`。每轮按整数主键游标取最多 `reclaim.batch` 行。每轮首次读取已提交最大 run ID，扫到该边界后回卷。坏快照和持续失败的行仍会复查及告警，后面的正常行能继续投递。以行内入队快照构造同参投递。
+	- **第一轮（自动修复，仅安全域）**：判据 `queued=0 AND status='pending' AND enqueued_at<=now-stale_after`。每轮按整数主键游标取最多 `reclaim.batch` 行。每轮首次读取已提交最大 run ID，扫到该边界后回卷。坏快照和持续失败的行仍会复查及告警，后面的正常行能继续投递。以行内入队快照构造同参投递。**（P2-9 跟进，2026-11-20：投递前快照须与 job_runs 权威列语义比对（task_id/request_id/action/job_id/dept/params/callback_url/submitted_by/source_ip；params 走 EqualJSON，空值归一 {}）；可解析但与账本不符的存量快照隔离留行、聚合 Warn→Error 报错并点名字段，绝不重投、不置位、不自动改写任一侧——各代 writer 单源同写两侧，分歧即落库后篡改/恢复/迁移损伤的不明历史，处置人工；快照缺键为零值与空列相等，旧形态不误隔离；集合成员行同样受检，不信任的快照不得经「只补标记」收敛。）**
      - **成功 / `ErrTaskIDConflict`** → 与 A3 共用条件标记及取消补偿口径。1 行完成；0 行补读状态，仅撤销已取消任务。标记执行失败进入唯一扫描器维护的**已投未标记集合**；集合成员下一轮仅重试标记，成功或 0 行均出集。冲突是收敛信号，不计入连续失败。
      - 非冲突失败（Redis 不可用等）→ Warn + 连续失败计数，同一行 ≥3 次 → Error（接入「Error 即告警」约定，出处 taskrunner.md §6:229）。
    - **第二轮（仅告警，绝不自动重投；按 State 分流，评审 F20）**：判据 `status='pending' AND queued=1 AND enqueued_at<=now-stale_after`（阈值复用 stale_after，评审 F17①），**复用 reclaim.batch + 游标轮转推进**（评审 F36：否则在途积压行每轮按 enqueued_at 升序占满批位，排在其后的 completed/absent/archived 异常行永不入选——告警饥饿；游标 `(enqueued_at, task_id)` 每轮推进、耗尽回卷，保证 eventual 全覆盖，每轮 GetTaskInfo 调用上界 = batch；**实施修订：游标改行主键 id，见实现记录 §1**）。查证分流：

@@ -591,16 +591,21 @@ func (s *Store) GetQueued(ctx context.Context, taskID string) (bool, error) {
 	return queued == 1, nil
 }
 
-// reclaimListCols 扫描器三域共用的最小列集（行主键 + 任务 ID + 快照 + 入队时间；
-// F29：新列只被新方法读取，既有查询零触碰）。
-const reclaimListCols = `SELECT id, task_id, enqueue_payload, enqueued_at, execution_id, cancel_cleanup_generation FROM job_runs`
+// reclaimListCols 扫描器四域共用的列集（行主键 + 任务 ID + 快照 + 入队时间 +
+// 执行代次/清理代次 + 重投比对面权威列；F29：新列只被扫描器方法读取，既有查询零触碰）。
+// request_id/action/job_id/dept/params/callback_url/submitted_by/source_ip 是
+// InsertPending 从同一 payload 单源写定的权威列——reclaim 第一轮重投前按 P2-9
+// 与快照语义比对，不符即隔离（service 层判定，本层只负责读全）。
+const reclaimListCols = `SELECT id, task_id, enqueue_payload, enqueued_at, execution_id, cancel_cleanup_generation,
+       request_id, action, job_id, dept, params, callback_url, submitted_by, source_ip FROM job_runs`
 
 func scanReclaimRuns(rows *sql.Rows) ([]*Run, error) {
 	defer rows.Close()
 	var out []*Run
 	for rows.Next() {
 		var r Run
-		if err := rows.Scan(&r.ID, &r.TaskID, &r.EnqueuePayload, &r.EnqueuedAt, &r.ExecutionID, &r.CancelCleanupGeneration); err != nil {
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.EnqueuePayload, &r.EnqueuedAt, &r.ExecutionID, &r.CancelCleanupGeneration,
+			&r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.Params, &r.CallbackURL, &r.SubmittedBy, &r.SourceIP); err != nil {
 			return nil, fmt.Errorf("store: scan reclaim run: %w", err)
 		}
 		out = append(out, &r)

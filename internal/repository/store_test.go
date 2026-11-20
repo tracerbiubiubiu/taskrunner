@@ -225,6 +225,33 @@ func TestQueuedFlagLifecycle(t *testing.T) {
 	}
 }
 
+// P2-9（2026-11-20 续批）：扫描器列集回读权威列——reclaim 重投比对的数据面。
+// InsertPending 单源同写 payload 与列；本用例钉住列集经 ListUnqueued 完整往返，
+// 防 scanReclaimRuns 列序漂移静默错位。
+func TestListUnqueuedReturnsLedgerColumns(t *testing.T) {
+	s := openTestStore(t)
+	ctx := t.Context()
+	base := time.Now().Add(-time.Hour)
+	if err := s.InsertPending(ctx, Run{
+		TaskID: "cols-1", RequestID: "req-1", Action: "audit_archive", JobID: "j-1", Dept: "audit",
+		Params: `{"retain_days":90}`, CallbackURL: "http://zhu.internal/cb",
+		SubmittedBy: "10086", SourceIP: "10.9.9.9", EnqueuedAt: base,
+		EnqueuePayload: `{"task_id":"cols-1","action":"audit_archive"}`,
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	rows, err := s.ListUnqueued(ctx, time.Now(), 0, math.MaxInt64, 10)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("list: %+v err=%v", rows, err)
+	}
+	r := rows[0]
+	if r.TaskID != "cols-1" || r.RequestID != "req-1" || r.Action != "audit_archive" ||
+		r.JobID != "j-1" || r.Dept != "audit" || r.Params != `{"retain_days":90}` ||
+		r.CallbackURL != "http://zhu.internal/cb" || r.SubmittedBy != "10086" || r.SourceIP != "10.9.9.9" {
+		t.Fatalf("ledger columns round-trip broken: %+v", r)
+	}
+}
+
 // 第一轮扫描域安全性（F1/F14）：canceled 行与 succeeded+queued=0 残留都不得入选。
 func TestListUnqueuedSafetyDomain(t *testing.T) {
 	s := openTestStore(t)

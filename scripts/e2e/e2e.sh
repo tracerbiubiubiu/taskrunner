@@ -37,6 +37,7 @@ db() { python3 -c "
 import sqlite3
 c = sqlite3.connect('$WORK/e2e.db')
 r = c.execute(\"$1\").fetchone()
+c.commit()  # 隐式事务不提交即回滚——手术写（⑦重置/⑦b快照改写）必须显式落盘
 print(r[0] if r else '<none>')
 "; }
 redis_up()   { docker start "$RNAME" >/dev/null; sleep 1; }
@@ -125,20 +126,29 @@ assert_eq "⑥已取消任务零回调" "$cb" "0"
 echo "—— ⑦ F32 崩溃恢复冲突收敛"
 $C submit e2e-6 /cb >/dev/null
 wait_status e2e-6 succeeded 15
-before=$(grep -c e2e-crash "$WORK/callbacks.log" 2>/dev/null || true)
-python3 -c "
-import sqlite3
-c = sqlite3.connect('$WORK/e2e.db')
-c.execute(\"UPDATE job_runs SET task_id='e2e-crash' WHERE task_id='e2e-6'\")
-c.execute(\"UPDATE job_runs SET status='pending', queued=0, attempts=0, started_at=NULL, finished_at=NULL, error='' WHERE task_id='e2e-crash'\")
-c.commit()
-"
+before=$(grep -c e2e-6 "$WORK/callbacks.log" 2>/dev/null || true)
+# Reproduce a pending ledger while the original delivery still owns the same
+# queue ID. Preserve the accepted payload and its row identity.
+db "UPDATE job_runs SET status='pending', queued=0, attempts=0, started_at=NULL, finished_at=NULL, error='' WHERE task_id='e2e-6'" >/dev/null
 sleep 5 # > stale_after+tick：第一轮重投撞冲突（留观键占住 TaskID）→ 条件标记收敛
-assert_eq "⑦冲突分支收敛 status=pending" "$(db "SELECT status FROM job_runs WHERE task_id='e2e-crash'")" "pending"
-assert_eq "⑦冲突分支收敛 queued=1" "$(db "SELECT queued FROM job_runs WHERE task_id='e2e-crash'")" "1"
-after=$(grep -c e2e-crash "$WORK/callbacks.log" 2>/dev/null || true)
+assert_eq "⑦冲突分支收敛 status=pending" "$(db "SELECT status FROM job_runs WHERE task_id='e2e-6'")" "pending"
+assert_eq "⑦冲突分支收敛 queued=1" "$(db "SELECT queued FROM job_runs WHERE task_id='e2e-6'")" "1"
+after=$(grep -c e2e-6 "$WORK/callbacks.log" 2>/dev/null || true)
 assert_eq "⑦零重执行" "$after" "$before"
-db "DELETE FROM job_runs WHERE task_id='e2e-crash'" >/dev/null # 清理手术行，免第二轮告警
+db "DELETE FROM job_runs WHERE task_id='e2e-6'" >/dev/null
+
+echo "—— ⑦b 语法有效但错目标的存量快照"
+redis_down
+$C submit e2e-mismatch /cb >/dev/null
+db "UPDATE job_runs SET enqueue_payload=json_set(enqueue_payload, '$.task_id', 'e2e-wrong-target') WHERE task_id='e2e-mismatch'" >/dev/null
+redis_up
+sleep 5
+assert_eq "⑦b 异常行保持 pending 未标入队" "$(db "SELECT status || ':' || queued FROM job_runs WHERE task_id='e2e-mismatch'")" "pending:0"
+cb=$(grep -Ec 'e2e-mismatch|e2e-wrong-target' "$WORK/callbacks.log" 2>/dev/null || true)
+assert_eq "⑦b 错快照零回调" "$cb" "0"
+grep -q 'snapshot/ledger mismatch persistently.*e2e-mismatch' "$WORK"/logs/*.log &&
+  ok "⑦b 快照不符告警升级" || fail "⑦b 缺快照不符升级告警"
+db "DELETE FROM job_runs WHERE task_id='e2e-mismatch'" >/dev/null
 
 if [ "${E2E_INCLUDE_CRON:-0}" = "1" ]; then
   echo "—— ⑧ cron 到点自动触发（可选，≤70s）"

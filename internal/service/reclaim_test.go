@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"path/filepath"
@@ -110,10 +111,16 @@ var reclaimBase = time.Now().Add(-time.Hour) // 宽限外
 
 func seedOld(t *testing.T, s *repository.Store, id, payload string, offset time.Duration) {
 	t.Helper()
-	if err := s.InsertPending(context.Background(), repository.Run{
-		TaskID: id, Action: "a", CallbackURL: "http://x",
-		EnqueuedAt: reclaimBase.Add(offset), EnqueuePayload: payload,
-	}); err != nil {
+	// P2-9 后快照与权威列必须同源一致（真实 writer 单源同写）；可解析的 payload
+	// 反推权威列，损坏快照不进比对面，列值无关紧要。
+	r := repository.Run{TaskID: id, EnqueuedAt: reclaimBase.Add(offset), EnqueuePayload: payload}
+	var p task.Payload
+	if payload != "" && json.Unmarshal([]byte(payload), &p) == nil {
+		r.RequestID, r.Action, r.JobID, r.Dept = p.RequestID, p.Action, p.JobID, p.Dept
+		r.Params, r.CallbackURL = string(p.Params), p.CallbackURL
+		r.SubmittedBy, r.SourceIP = p.SubmittedBy, p.SourceIP
+	}
+	if err := s.InsertPending(context.Background(), r); err != nil {
 		t.Fatalf("seed %s: %v", id, err)
 	}
 }

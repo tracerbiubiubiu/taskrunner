@@ -2,7 +2,9 @@
 // 域职责（仿 cron.go 范式：Run 薄壳 + 同步单轮方法；单 goroutine 串行，停机 = ctx 取消；
 // 多副本安全——同 task_id 竞投被 asynq TaskID 冲突挡住，无需分布式锁，F30）：
 //
-//	第一轮  自动修复    queued=0 AND status='pending' 宽限外 → 快照同参重投 + 条件标记（F32 三分）
+//	第一轮  自动修复    queued=0 AND status='pending' 宽限外 → 快照同参重投 + 条件标记（F32 三分）；
+//	                    快照须先通过判空/反序列化与账本语义比对（P2-9，2026-11-20）：
+//	                    与权威列不符的存量快照隔离留行、聚合报错、绝不重投
 //	第二轮  仅告警      status='pending' AND queued=1 宽限外 → Inspector 查证按 State 分流，绝不重投
 //	第三域  仅清理      status='canceled' AND queued=0 宽限外 → DeleteTask 探针，确认消亡才出域
 //	第四域  仅告警发现  status='running' 宽限外 → Inspector 查证 archived/absent 指纹（F40 后果⑥
@@ -16,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,19 +43,20 @@ type ReclaimLoop struct {
 	Now        func() time.Time
 
 	// ---- 进程内状态（非持久化；游标重启回卷 F46，计数器/集合重启清零 F30）----
-	unmarked       map[string]time.Time // 「已投未标记」集合（F3）：写者唯一为本扫描器（F33）；值 = 最近检视时间——成员行经其它路径离开 pending（worker 取走/取消）后条目由 TTL 回收（实现记录 §8，评审七·1）
-	enqueueFailCnt map[string]*failStat // 第一轮逐行非冲突失败计数（≥3 → Error，TTL 回收）
-	probeFailCnt   map[string]*failStat // 第三域探针失败计数（F65，TTL 回收）
-	payloadSkipCnt map[string]*failStat // 空/损坏快照跳过计数（≥3 → Error 升级，TTL 回收）
-	unqueuedCursor int64                // 第一轮游标，坏行和持久故障行不占死批位
-	unqueuedLastID int64                // 本轮覆盖的最大 ID，开始新一轮时刷新
-	stuckCursor    int64                // 第二轮游标（行主键 id），0 = 从头扫（F36/F46/F56——时间列绑定格式不可作游标，见实现记录）
-	stuckLastID    int64
-	cancelCursor   int64 // 第三域游标，同款
-	cancelLastID   int64
-	runningAlerts  map[string]runningObservation
-	runningCursor  int64 // 第四域游标，同款
-	runningLastID  int64
+	unmarked            map[string]time.Time // 「已投未标记」集合（F3）：写者唯一为本扫描器（F33）；值 = 最近检视时间——成员行经其它路径离开 pending（worker 取走/取消）后条目由 TTL 回收（实现记录 §8，评审七·1）
+	enqueueFailCnt      map[string]*failStat // 第一轮逐行非冲突失败计数（≥3 → Error，TTL 回收）
+	probeFailCnt        map[string]*failStat // 第三域探针失败计数（F65，TTL 回收）
+	payloadSkipCnt      map[string]*failStat // 空/损坏快照跳过计数（≥3 → Error 升级，TTL 回收）
+	snapshotMismatchCnt map[string]*failStat // 快照-账本语义不符隔离计数（P2-9，≥3 → Error 升级，TTL 回收）
+	unqueuedCursor      int64                // 第一轮游标，坏行和持久故障行不占死批位
+	unqueuedLastID      int64                // 本轮覆盖的最大 ID，开始新一轮时刷新
+	stuckCursor         int64                // 第二轮游标（行主键 id），0 = 从头扫（F36/F46/F56——时间列绑定格式不可作游标，见实现记录）
+	stuckLastID         int64
+	cancelCursor        int64 // 第三域游标，同款
+	cancelLastID        int64
+	runningAlerts       map[string]runningObservation
+	runningCursor       int64 // 第四域游标，同款
+	runningLastID       int64
 }
 
 // Run ticker 薄壳（cron.go 同款生命周期与零值防御）。
@@ -81,6 +85,7 @@ func (l *ReclaimLoop) ReclaimStalePending(ctx context.Context) {
 	prune(l.enqueueFailCnt, now)
 	prune(l.probeFailCnt, now)
 	prune(l.payloadSkipCnt, now)
+	prune(l.snapshotMismatchCnt, now)
 	pruneSeen(l.unmarked, now)
 	for id, observation := range l.runningAlerts {
 		if now.Sub(observation.reportedAt) >= failStatTTL {
@@ -117,6 +122,9 @@ func (l *ReclaimLoop) defaults() {
 	}
 	if l.payloadSkipCnt == nil {
 		l.payloadSkipCnt = map[string]*failStat{}
+	}
+	if l.snapshotMismatchCnt == nil {
+		l.snapshotMismatchCnt = map[string]*failStat{}
 	}
 	if l.unmarked == nil {
 		l.unmarked = map[string]time.Time{}
@@ -197,15 +205,48 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 	l.advanceCursor(rows, l.BatchSize, &l.unqueuedCursor)
 	now := l.now()
 	var (
-		warned        []string // 本 tick 内 1–2 次失败的行（聚合 Warn，F62）
-		errored       []string // 连续 ≥3 次失败的行（聚合 Error）
-		markFailed    []string // 条件标记执行失败（DB 写故障，F3/F33）
-		payloadSkip   []string // 空/损坏快照跳过（1–2 次，聚合 Warn）
-		payloadBusted []string // 空/损坏快照连续 ≥3 次（聚合 Error 升级，评审五·3）
+		warned           []string // 本 tick 内 1–2 次失败的行（聚合 Warn，F62）
+		errored          []string // 连续 ≥3 次失败的行（聚合 Error）
+		markFailed       []string // 条件标记执行失败（DB 写故障，F3/F33）
+		payloadSkip      []string // 空/损坏快照跳过（1–2 次，聚合 Warn）
+		payloadBusted    []string // 空/损坏快照连续 ≥3 次（聚合 Error 升级，评审五·3）
+		mismatchSkipped  []string // 快照-账本语义不符隔离（P2-9，1–2 次，聚合 Warn）
+		mismatchBusted   []string // 快照-账本语义不符连续 ≥3 次（聚合 Error 升级）
+		mismatchFieldSet = map[string]bool{}
 	)
 	for _, r := range rows {
 		if ctx.Err() != nil {
 			return
+		}
+		// 判空/反序列化失败防御（F7/F66）：空/损坏快照跳过——按 tick 聚合 Warn，
+		// 连续 ≥3 次升级聚合 Error（正常不可达；真出现 = 手工改库/迁移问题，需人工）。
+		// 先于集合成员分支：投递源字节都不可解析的行，其队列副本必被 worker 丢弃，
+		// 「只补标记」收敛只会把损坏移出可见域。
+		var p task.Payload
+		perr := json.Unmarshal([]byte(r.EnqueuePayload), &p)
+		if r.EnqueuePayload == "" || perr != nil {
+			if bump(l.payloadSkipCnt, r.TaskID, now, reclaimThreshold) {
+				payloadBusted = append(payloadBusted, r.TaskID)
+			} else {
+				payloadSkip = append(payloadSkip, r.TaskID)
+			}
+			continue
+		}
+		// P2-9 快照-账本语义比对（2026-11-20 续批）：可解析但与权威列不符的存量快照
+		// 属「不明历史」（落库后篡改/备份恢复/迁移损伤）——隔离留行：不重投、不置位、
+		// 零写；成员态一并出集（不信任的快照不得经「只补标记」宣告已投递）。
+		// 人工修复两侧任一后按域轮转自然恢复，绝不自动改写。
+		if fields := snapshotLedgerMismatch(&p, r); len(fields) > 0 {
+			delete(l.unmarked, r.TaskID)
+			for _, f := range fields {
+				mismatchFieldSet[f] = true
+			}
+			if bump(l.snapshotMismatchCnt, r.TaskID, now, reclaimThreshold) {
+				mismatchBusted = append(mismatchBusted, r.TaskID)
+			} else {
+				mismatchSkipped = append(mismatchSkipped, r.TaskID)
+			}
+			continue
 		}
 		if _, isMember := l.unmarked[r.TaskID]; isMember {
 			// 集合成员：只重试标记、跳过重投（F3——任务已在 Redis，重投纯属制造重复）；
@@ -220,18 +261,6 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 				continue
 			}
 			delete(l.unmarked, r.TaskID)
-			continue
-		}
-		// 判空/反序列化失败防御（F7/F66）：空/损坏快照跳过——按 tick 聚合 Warn，
-		// 连续 ≥3 次升级聚合 Error（正常不可达；真出现 = 手工改库/迁移问题，需人工）
-		var p task.Payload
-		perr := json.Unmarshal([]byte(r.EnqueuePayload), &p)
-		if r.EnqueuePayload == "" || perr != nil {
-			if bump(l.payloadSkipCnt, r.TaskID, now, reclaimThreshold) {
-				payloadBusted = append(payloadBusted, r.TaskID)
-			} else {
-				payloadSkip = append(payloadSkip, r.TaskID)
-			}
 			continue
 		}
 		_, err := l.Client.Enqueue(asynq.NewTask(task.TypeCallback, []byte(r.EnqueuePayload)),
@@ -272,6 +301,16 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 		l.Logger.Error("reclaim: enqueue payload empty/corrupt persistently (>=3) — manual data repair needed",
 			slog.Int("rows", len(payloadBusted)), slog.String("sample_task_ids", sampleIDs(payloadBusted)))
 	}
+	if len(mismatchSkipped) > 0 {
+		l.Logger.Warn("reclaim: snapshot/ledger mismatch, isolated (escalates after 3 consecutive)",
+			slog.Int("rows", len(mismatchSkipped)), slog.String("sample_task_ids", sampleIDs(mismatchSkipped)),
+			slog.String("mismatched_fields", joinFieldSet(mismatchFieldSet)))
+	}
+	if len(mismatchBusted) > 0 {
+		l.Logger.Error("reclaim: snapshot/ledger mismatch persistently (>=3) — manual data repair needed, no auto rewrite",
+			slog.Int("rows", len(mismatchBusted)), slog.String("sample_task_ids", sampleIDs(mismatchBusted)),
+			slog.String("mismatched_fields", joinFieldSet(mismatchFieldSet)))
+	}
 	if len(warned) > 0 {
 		l.Logger.Warn("reclaim: enqueue failed (will retry next tick)",
 			slog.Int("rows", len(warned)), slog.String("sample_task_ids", sampleIDs(warned)))
@@ -284,6 +323,44 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 		l.Logger.Warn("reclaim: mark queued failed (rows held in unmarked set, mark-only retry next tick)",
 			slog.Int("rows", len(markFailed)), slog.String("sample_task_ids", sampleIDs(markFailed)))
 	}
+}
+
+// snapshotLedgerMismatch 比对可解析快照与 job_runs 权威列（P2-9，2026-11-20 续批）。
+// 各代 writer 均在同一 INSERT 内由同一 payload 单源写定两侧（task_id/request_id/
+// action/job_id/dept/params/callback_url/submitted_by/source_ip），一致快照必然相等；
+// 分歧只能来自落库后篡改、备份恢复或迁移损伤——属「不明历史」，返回不符字段名，
+// 调用方隔离留行、聚合报错并等待人工处置，绝不自动改写任一侧。
+// 兼容旧快照：缺键反序列化为零值，与空权威列相等；params 复用 task.EqualJSON
+// （任意精度数值、键序/空白不敏感，空值归一 {}）；权威列不可安全解析（重复键等）
+// 视为不符，不得猜语义。timeout_secs 无权威列，不入比较面。
+func snapshotLedgerMismatch(p *task.Payload, r *repository.Run) []string {
+	var mismatched []string
+	add := func(field string, bad bool) {
+		if bad {
+			mismatched = append(mismatched, field)
+		}
+	}
+	add("task_id", p.TaskID != r.TaskID)
+	add("request_id", p.RequestID != r.RequestID)
+	add("action", p.Action != r.Action)
+	add("job_id", p.JobID != r.JobID)
+	add("dept", p.Dept != r.Dept)
+	add("callback_url", p.CallbackURL != r.CallbackURL)
+	add("submitted_by", p.SubmittedBy != r.SubmittedBy)
+	add("source_ip", p.SourceIP != r.SourceIP)
+	equal, err := task.EqualJSON([]byte(r.Params), p.Params)
+	add("params", err != nil || !equal)
+	return mismatched
+}
+
+// joinFieldSet 聚合日志的不符字段清单（排序保证确定性，防逐 tick 抖动）。
+func joinFieldSet(set map[string]bool) string {
+	fields := make([]string, 0, len(set))
+	for f := range set {
+		fields = append(fields, f)
+	}
+	sort.Strings(fields)
+	return strings.Join(fields, ",")
 }
 
 // ---- 第二轮：仅告警，绝不重投 ----

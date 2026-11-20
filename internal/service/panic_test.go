@@ -96,7 +96,7 @@ func TestBackgroundPanicChild(t *testing.T) {
 		run = l.Run
 	case "reclaim":
 		p, _ := json.Marshal(task.Payload{TaskID: "panic", Action: "audit", CallbackURL: "http://callback.invalid"})
-		err = st.InsertPending(ctx, repository.Run{TaskID: "panic", Action: "audit", EnqueuedAt: past, EnqueuePayload: string(p)})
+		err = st.InsertPending(ctx, repository.Run{TaskID: "panic", Action: "audit", CallbackURL: "http://callback.invalid", EnqueuedAt: past, EnqueuePayload: string(p)})
 		if err != nil {
 			t.Fatal(err)
 		}

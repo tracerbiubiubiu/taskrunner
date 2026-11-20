@@ -210,14 +210,19 @@ func TestPGReclaimColumnsAndQueries(t *testing.T) {
 	base := time.Now().Add(-time.Hour)
 	now := time.Now()
 
-	// 新列写入 + 第一轮扫描域 + payload 往返
-	if err := s.InsertPending(ctx, Run{TaskID: "pg-rq1", Action: "a", EnqueuedAt: base,
-		EnqueuePayload: `{"task_id":"pg-rq1"}`}); err != nil {
+	// 新列写入 + 第一轮扫描域 + payload/权威列往返（P2-9 比对数据面）
+	if err := s.InsertPending(ctx, Run{TaskID: "pg-rq1", RequestID: "req-rq1", Action: "a", JobID: "j-rq1",
+		Dept: "audit", Params: `{"k":1}`, CallbackURL: "http://cb.invalid", SubmittedBy: "10086", SourceIP: "10.9.9.9",
+		EnqueuedAt: base, EnqueuePayload: `{"task_id":"pg-rq1","action":"a"}`}); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	rows, err := s.ListUnqueued(ctx, now, 0, math.MaxInt64, 10)
-	if err != nil || len(rows) != 1 || rows[0].TaskID != "pg-rq1" || rows[0].EnqueuePayload != `{"task_id":"pg-rq1"}` {
+	if err != nil || len(rows) != 1 || rows[0].TaskID != "pg-rq1" || rows[0].EnqueuePayload != `{"task_id":"pg-rq1","action":"a"}` {
 		t.Fatalf("list unqueued: %+v err=%v", rows, err)
+	}
+	if r := rows[0]; r.RequestID != "req-rq1" || r.Action != "a" || r.JobID != "j-rq1" || r.Dept != "audit" ||
+		r.Params != `{"k":1}` || r.CallbackURL != "http://cb.invalid" || r.SubmittedBy != "10086" || r.SourceIP != "10.9.9.9" {
+		t.Fatalf("PG ledger columns round-trip broken: %+v", r)
 	}
 	if n, err := s.MarkQueued(ctx, "pg-rq1"); err != nil || n != 1 {
 		t.Fatalf("mark queued: %d %v", n, err)
@@ -395,6 +400,59 @@ func TestPGCronOccurrenceAtomicClaim(t *testing.T) {
 	_, total, err := st.ListRuns(ctx, RunFilter{})
 	if err != nil || total != 1 {
 		t.Fatalf("pending outbox count: %d %v", total, err)
+	}
+}
+
+// P2-9 独立调度面（PG 方言）：同一发生次身份被内容不符的存量占用 → 整笔回滚、
+// 原 due 保留、零新增；同内容重认领 → 匹配同一发生次才推进、零重复投递。
+func TestPGCronOccurrenceIdentityConflictRollsBack(t *testing.T) {
+	st := openTestStorePG(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	j := Job{JobID: "pg-conflict", ActionID: "a", TriggerType: TriggerCron, CronSpec: "* * * * *", Params: "{}", Enabled: true, NextRun: sql.NullTime{Valid: true, Time: now.Add(-time.Minute)}, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)}
+	if err := st.CreateJob(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	due := j.NextRun.Time
+	// 存量发生次：同身份、旧参数快照（人工回拨/备份恢复后的「不明历史」）
+	older := Run{TaskID: "cron:pg-identity", Action: "a", JobID: j.JobID, Params: `{"older":true}`,
+		EnqueuedAt: now.Add(-time.Minute), EnqueuePayload: `{"task_id":"cron:pg-identity","action":"a","job_id":"pg-conflict","params":{"older":true}}`}
+	if err := st.InsertPending(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+
+	current := Run{TaskID: "cron:pg-identity", Action: "a", JobID: j.JobID, Params: "{}", EnqueuedAt: now,
+		EnqueuePayload: `{"task_id":"cron:pg-identity","action":"a","job_id":"pg-conflict","params":{}}`}
+	if _, err := st.ClaimCronOccurrence(ctx, j, now.Add(time.Minute), now, current); err == nil {
+		t.Fatal("identity conflict must reject the claim")
+	}
+	after, err := st.GetJob(ctx, j.JobID)
+	if err != nil || !after.NextRun.Time.Equal(due) {
+		t.Fatalf("conflicted slot must keep the original due: %+v %v", after, err)
+	}
+	_, total, err := st.ListRuns(ctx, RunFilter{})
+	if err != nil || total != 1 {
+		t.Fatalf("rollback must leave exactly the stored occurrence: %d %v", total, err)
+	}
+	row, err := st.GetByTaskID(ctx, older.TaskID)
+	if err != nil || row.Params != `{"older":true}` || row.Status != StatusPending {
+		t.Fatalf("existing occurrence snapshot must not be auto-overwritten: %+v %v", row, err)
+	}
+
+	// 同内容重认领：匹配同一发生次 → 推进 next_run、零重复投递记录
+	same := Run{TaskID: "cron:pg-identity", Action: "a", JobID: j.JobID, Params: `{"older":true}`,
+		EnqueuedAt: now, EnqueuePayload: older.EnqueuePayload}
+	claimed, err := st.ClaimCronOccurrence(ctx, j, now.Add(time.Minute), now, same)
+	if err != nil || claimed {
+		t.Fatalf("already-owned occurrence must advance without a new delivery: %v %v", claimed, err)
+	}
+	advanced, err := st.GetJob(ctx, j.JobID)
+	if err != nil || !advanced.NextRun.Time.After(due) {
+		t.Fatalf("matching occurrence must advance the schedule: %+v %v", advanced, err)
+	}
+	_, total, err = st.ListRuns(ctx, RunFilter{})
+	if err != nil || total != 1 {
+		t.Fatalf("matching occurrence must not duplicate: %d %v", total, err)
 	}
 }
 

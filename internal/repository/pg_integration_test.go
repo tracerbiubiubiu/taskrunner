@@ -227,11 +227,11 @@ func TestPGReclaimColumnsAndQueries(t *testing.T) {
 	}
 
 	// 第二轮 id 游标：耗尽判定
-	stuck, err := s.ListStuckPending(ctx, now, 0, 10)
+	stuck, err := s.ListStuckPending(ctx, now, 0, math.MaxInt64, 10)
 	if err != nil || len(stuck) != 1 || stuck[0].TaskID != "pg-rq1" {
 		t.Fatalf("stuck: %+v err=%v", stuck, err)
 	}
-	if stuck2, err := s.ListStuckPending(ctx, now, stuck[0].ID, 10); err != nil || len(stuck2) != 0 {
+	if stuck2, err := s.ListStuckPending(ctx, now, stuck[0].ID, math.MaxInt64, 10); err != nil || len(stuck2) != 0 {
 		t.Fatalf("cursor exhausted: %+v err=%v", stuck2, err)
 	}
 
@@ -242,14 +242,25 @@ func TestPGReclaimColumnsAndQueries(t *testing.T) {
 	if ok, err := s.MarkCanceledIfPending(ctx, &Run{TaskID: "pg-rq2"}, "x", now, false); !ok || err != nil {
 		t.Fatalf("cancel: %v %v", ok, err)
 	}
-	crows, err := s.ListCanceledUnqueued(ctx, now, 0, 10)
+	crows, err := s.ListCanceledUnqueued(ctx, now, 0, math.MaxInt64, 10)
 	if err != nil || len(crows) != 1 || crows[0].TaskID != "pg-rq2" {
 		t.Fatalf("canceled domain: %+v err=%v", crows, err)
 	}
-	if n, err := s.MarkCleanupDone(ctx, "pg-rq2"); err != nil || n != 1 {
+	oldGeneration := crows[0].CancelCleanupGeneration
+	if n, err := s.MarkCleanupPending(ctx, "pg-rq2"); err != nil || n != 1 {
+		t.Fatalf("new cleanup obligation: %d %v", n, err)
+	}
+	if n, err := s.MarkCleanupDone(ctx, "pg-rq2", oldGeneration); err != nil || n != 0 {
+		t.Fatalf("old probe closed a more recent obligation: %d %v", n, err)
+	}
+	crows, err = s.ListCanceledUnqueued(ctx, now, 0, math.MaxInt64, 10)
+	if err != nil || len(crows) != 1 || crows[0].CancelCleanupGeneration <= oldGeneration {
+		t.Fatalf("new cleanup generation: %+v %v", crows, err)
+	}
+	if n, err := s.MarkCleanupDone(ctx, "pg-rq2", crows[0].CancelCleanupGeneration); err != nil || n != 1 {
 		t.Fatalf("cleanup done: %d %v", n, err)
 	}
-	if crows2, _ := s.ListCanceledUnqueued(ctx, now, 0, 10); len(crows2) != 0 {
+	if crows2, _ := s.ListCanceledUnqueued(ctx, now, 0, math.MaxInt64, 10); len(crows2) != 0 {
 		t.Fatalf("出域后应离开扫描域: %+v", crows2)
 	}
 
@@ -284,10 +295,18 @@ CREATE TABLE job_runs (
 	source_ip    TEXT NOT NULL DEFAULT '',
 	started_at   TIMESTAMPTZ,
 	finished_at  TIMESTAMPTZ,
-	enqueued_at  TIMESTAMPTZ NOT NULL
+	enqueued_at  TIMESTAMPTZ NOT NULL,
+	queued INTEGER NOT NULL DEFAULT 1
 );`); err != nil {
 		raw.Close()
 		t.Fatalf("create legacy pg table: %v", err)
+	}
+	if _, err := raw.Exec(`INSERT INTO job_runs (task_id, action, status, attempts, enqueued_at, queued) VALUES
+		('legacy-cancel', 'a', 'canceled', 0, '2026-11-19 12:00:00', 0),
+		('legacy-pending', 'a', 'pending', 0, '2026-11-19 12:00:00', 0),
+		('legacy-running', 'a', 'running', 2, '2026-11-19 12:00:00', 1)`); err != nil {
+		raw.Close()
+		t.Fatalf("seed legacy rows: %v", err)
 	}
 	raw.Close()
 
@@ -296,6 +315,14 @@ CREATE TABLE job_runs (
 		t.Fatalf("OpenPG on legacy db: %v", err)
 	}
 	defer s.Close()
+
+	checkUpgradedRuns(t, s)
+	reopened, err := OpenPG(dsn)
+	if err != nil {
+		t.Fatalf("reopen upgraded store: %v", err)
+	}
+	defer reopened.Close()
+	checkUpgradedRuns(t, reopened)
 
 	ctx := context.Background()
 	if err := s.InsertPending(ctx, Run{

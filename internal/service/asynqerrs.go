@@ -44,10 +44,9 @@ func isRedisDirtyStateErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), asynqDirtyStateErrText)
 }
 
-// isKeyGoneErr 键已消亡确认（F64）：任务不存在，或队列名已不在 asynq:queues 注册集
-// （asynq 自身 API 删队列要求空队或先删全部任务键，FLUSHDB 同清注册集——队列不在 ⇒ 任务必不在；
-// 唯一例外是运维手工 SREM 注册集，属口径外病态操作）。消亡确认用于：补偿撤销容忍、
-// 第三域出域、取消路径容忍。
+// isKeyGoneErr preserves the F64 behavior for the direct Cancel API.
+// Background cleanup and ledger observations require
+// ErrTaskNotFound: an absent queue registration may hide existing tasks.
 func isKeyGoneErr(err error) bool {
 	return errors.Is(err, asynq.ErrTaskNotFound) || errors.Is(err, asynq.ErrQueueNotFound)
 }

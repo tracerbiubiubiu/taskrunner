@@ -172,3 +172,52 @@ func TestTerminalGuardSkipsCallback(t *testing.T) {
 		})
 	}
 }
+
+// 迟到已取消投递的清理重入（F2a 取消对账，2026-11-20 复核）：清理确认出域（queued=1）的
+// 取消行被 at-least-once 迟到投递取走时，终态守卫在丢弃投递、不执行回调、保留取消终态的
+// 同时，把该行放回第三域（queued=0）由 reclaim 重探撤残留。succeeded 行（合法终态残留，
+// F42）不得重入——队列留观副本不受影响。
+func TestLateCanceledDeliveryReentersCleanupScope(t *testing.T) {
+	ctx := context.Background()
+	t.Run("canceled 行重入清理域", func(t *testing.T) {
+		var calls int32
+		d, mux := newDeps(t, fakeCB{calls: &calls})
+		d.Store.InsertPending(ctx, repository.Run{TaskID: "late1", Action: "a", EnqueuedAt: time.Now()})
+		if ok, err := d.Store.MarkCanceledIfPending(ctx, &repository.Run{TaskID: "late1"}, "canceled via API", time.Now(), false); !ok || err != nil {
+			t.Fatalf("cancel: %v %v", ok, err)
+		}
+		if _, err := d.Store.MarkCleanupDone(ctx, "late1", 0); err != nil { // 模拟先前键消亡确认——行已出域
+			t.Fatalf("cleanup done: %v", err)
+		}
+
+		if err := mux.ProcessTask(ctx, payload(t, "late1")); !errors.Is(err, asynq.SkipRetry) {
+			t.Fatalf("late canceled delivery want SkipRetry, got %v", err)
+		}
+		if calls != 0 {
+			t.Fatalf("callback must be intercepted, got %d calls", calls)
+		}
+		r, _ := d.Store.GetByTaskID(ctx, "late1")
+		if r.Status != repository.StatusCanceled {
+			t.Fatalf("cancel terminal state must be preserved, got %s", r.Status)
+		}
+		if q, _ := d.Store.GetQueued(ctx, "late1"); q {
+			t.Fatal("late delivery must re-admit the row to the cancel-cleanup sweep (queued=0)")
+		}
+	})
+	t.Run("succeeded 行不重入", func(t *testing.T) {
+		d, mux := newDeps(t, fakeCB{})
+		d.Store.InsertPending(ctx, repository.Run{TaskID: "late2", Action: "a", EnqueuedAt: time.Now()})
+		if _, err := d.Store.MarkQueued(ctx, "late2"); err != nil {
+			t.Fatalf("mark queued: %v", err)
+		}
+		d.Store.MarkRunning(ctx, "late2", 1, time.Now(), "fx")
+		d.Store.Finish(ctx, "late2", repository.StatusSucceeded, "", 1, time.Now(), time.Now(), "fx")
+
+		if err := mux.ProcessTask(ctx, payload(t, "late2")); !errors.Is(err, asynq.SkipRetry) {
+			t.Fatalf("late succeeded delivery want SkipRetry, got %v", err)
+		}
+		if q, _ := d.Store.GetQueued(ctx, "late2"); !q {
+			t.Fatal("succeeded row must stay out of the cleanup scope (queued=1 untouched)")
+		}
+	})
+}

@@ -95,6 +95,11 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    # F0 容器停止预算（2026-11-20 复核）：App.Run 顺序收尾 = HTTP 排空（TASKRUNNER_SHUTDOWN_TIMEOUT
+    # 默认 30s）→ asynq worker 排空（同配置上限，默认 30s）→ 后台 goroutine join。Compose 默认
+    # 停止宽限仅 10s，慢请求与未完成的收尾会被提前 SIGKILL。此处 90s = 2×默认排空 + 30s 余量；
+    # 上调 TASKRUNNER_SHUTDOWN_TIMEOUT 时须同步上调本值（≥ 2×排空上限 + 余量）。
+    stop_grace_period: 90s
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:18080/healthz || exit 1"]
       interval: 10s

@@ -149,8 +149,8 @@ func TestCallbackPanicAsynqLifecycle(t *testing.T) {
 							}
 							before := time.Now().Add(time.Hour)
 							a, _ := st.ListUnqueued(ctx, before, 0, math.MaxInt64, 100)
-							b, _ := st.ListStuckPending(ctx, before, 0, 100)
-							c, _ := st.ListCanceledUnqueued(ctx, before, 0, 100)
+							b, _ := st.ListStuckPending(ctx, before, 0, math.MaxInt64, 100)
+							c, _ := st.ListCanceledUnqueued(ctx, before, 0, math.MaxInt64, 100)
 							t.Fatalf("panic archived but DB still running; reclaim domains=%d/%d/%d attempts=%d", len(a), len(b), len(c), r.Attempts)
 						}
 						time.Sleep(5 * time.Millisecond)

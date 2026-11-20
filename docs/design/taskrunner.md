@@ -25,7 +25,7 @@ flowchart TD
 
 `internal/service/submit.go` 的 `Service.Submit` 先持久化载荷和 `queued=0`，再尝试入 Redis；入队失败仍是已受理，Reclaim 负责补投。`job_runs` 兼任本服务的 outbox，不是业务平台通用事件 Outbox。准确状态和指纹见 [ADR-004](../adr/adr-004-db-first-outbox-reclaim.md)。
 
-Redis 丢失后仅 `queued=0 + pending` 可自动重建；`queued=1 + pending` 告警待人工对账，`running` 等不会被任意自动重投。取消的 `queued=0` 行可在部分 Redis 故障下降级标记取消；`queued=1` 需要队列协作。清理数据前必须保证 DB 行生命周期覆盖对应 Redis TaskID 键与 retention 留观期，不能因为默认留存时间到了就删事实行。
+Redis 丢失后仅 `queued=0 + pending` 可自动重建；`queued=1 + pending` 告警待人工对账。超过宽限的 `running` 行按批核对队列，各域取每轮固定 ID 上界后回卷。观察到归档或无键时复核账本执行代次并告警，探针故障单独聚合。队列注册缺失保留取消责任，并进入两类账本对账的探针故障统计；运行扫描只读。初投或补投发现行已取消时，先登记新一轮清理责任，再尝试撤销残留投递。worker 拒绝迟到投递时也能登记。每轮探针只确认其观察到的清理代次，取消状态、合法任务和回调预算保持原语义。取消的 `queued=0` 行可在部分 Redis 故障下降级标记取消；`queued=1` 需要队列协作。清理数据前必须保证 DB 行生命周期覆盖对应 Redis TaskID 键与 retention 留观期，不能因为默认留存时间到了就删事实行。
 
 ## 执行、重试与并发
 

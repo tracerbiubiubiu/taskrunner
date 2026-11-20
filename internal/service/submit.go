@@ -114,13 +114,18 @@ func (s *Service) enqueuePersisted(ctx context.Context, p task.Payload, payload 
 	if _, err := s.Client.Enqueue(asynq.NewTask(task.TypeCallback, payload),
 		buildEnqueueOpts(p, s.Queue, s.MaxRetry, s.Retention)...); err != nil {
 		if !errors.Is(err, asynq.ErrTaskIDConflict) {
-			// Redis 抖动：行留 queued=0，reclaim 第一轮修复后执行
+			// An enqueue error can arrive after Redis accepted the task.
+			// Only a canceled row needs another cleanup obligation.
+			compensateCanceledDelivery(ctx, s.Store, s.Inspector, s.Logger, s.Queue, p.TaskID)
 			return true, err, nil
 		}
 		// 冲突 = 同 ID 任务已在 Redis（并发同提兜底）——本行照常条件置位
 	}
 	// 条件标记（F19）：按 status 条件是取消检测器——0 行 = 行在入队期间离开 pending
 	n, merr := s.Store.MarkQueued(ctx, p.TaskID)
+	if merr != nil || n == 0 {
+		compensateCanceledDelivery(ctx, s.Store, s.Inspector, s.Logger, s.Queue, p.TaskID)
+	}
 	if merr != nil {
 		// 标记执行失败（DB 写故障，F33）：行留 queued=0，任务已在 Redis，
 		// 由 reclaim 第一轮的冲突分支收敛补课（F32）。至少 Warn 留痕——
@@ -131,30 +136,28 @@ func (s *Service) enqueuePersisted(ctx context.Context, p task.Payload, payload 
 		}
 		return true, nil, nil
 	}
-	if n == 0 {
-		compensateCanceledDelivery(ctx, s.Store, s.Inspector, s.Logger, s.Queue, p.TaskID)
-	}
 	return true, nil, nil
 }
 
 // A worker may execute or schedule a retry before MarkQueued. Cancel is final,
 // so the Redis copy may be withdrawn only after the ledger confirms cancellation.
 func compensateCanceledDelivery(ctx context.Context, store *repository.Store, inspector TaskDelete, logger *slog.Logger, queue, taskID string) {
-	if inspector == nil {
-		return
-	}
-	run, err := store.GetByTaskID(ctx, taskID)
+	// The queue call has already happened. A disconnected submitter must not
+	// discard cleanup responsibility for a delivery that can still exist.
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	pending, err := store.MarkCleanupPending(cleanup, taskID)
 	if err != nil {
 		if logger != nil {
-			logger.Warn("outbox: cannot confirm cancellation; retained delivery",
+			logger.Error("outbox: cannot register canceled delivery cleanup",
 				slog.String("task_id", taskID), slog.Any("err", err))
 		}
 		return
 	}
-	if run.Status != repository.StatusCanceled {
+	if pending == 0 || inspector == nil {
 		return
 	}
-	if err := inspector.DeleteTask(queue, taskID); err != nil && !isKeyGoneErr(err) && logger != nil {
+	if err := inspector.DeleteTask(queue, taskID); err != nil && !errors.Is(err, asynq.ErrTaskNotFound) && logger != nil {
 		logger.Warn("outbox: could not withdraw canceled delivery",
 			slog.String("task_id", taskID), slog.Any("err", err))
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -162,6 +163,30 @@ func TestSubmitA3ZeroRowsCompensates(t *testing.T) {
 	}
 	if r, _ := st.GetByTaskID(ctx, "f19"); r.Status != repository.StatusCanceled {
 		t.Fatalf("row must stay canceled: %s", r.Status)
+	}
+}
+
+func TestSubmitReopensCancellationWhenLateDeliveryCannotBeWithdrawn(t *testing.T) {
+	svc, st, queue, inspector := newSubmitSvc(t)
+	ctx := context.Background()
+	inspector.err = errors.New("queue unavailable")
+	queue.hook = func(p task.Payload) {
+		canceled, err := st.MarkCanceledIfPending(ctx, &repository.Run{TaskID: p.TaskID}, "canceled", time.Now(), false)
+		if err != nil || !canceled {
+			t.Fatalf("cancel before late delivery: %v %v", canceled, err)
+		}
+		if n, err := st.MarkCleanupDone(ctx, p.TaskID, 0); n != 1 || err != nil {
+			t.Fatalf("confirm absent queue key before late delivery: %d %v", n, err)
+		}
+	}
+
+	accepted, _, err := svc.Submit(ctx, submitPayload("late-submit"))
+	if err != nil || !accepted || inspector.count() != 1 {
+		t.Fatalf("late submit and withdrawal: accepted=%v, err=%v, deletes=%d", accepted, err, inspector.count())
+	}
+	rows, err := st.ListCanceledUnqueued(ctx, time.Now().Add(time.Hour), 0, math.MaxInt64, 10)
+	if err != nil || len(rows) != 1 || rows[0].TaskID != "late-submit" {
+		t.Fatalf("unwithdrawn delivery must be visible to cleanup before any worker runs: %v %v", rows, err)
 	}
 }
 

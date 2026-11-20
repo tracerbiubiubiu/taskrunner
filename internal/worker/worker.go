@@ -100,6 +100,11 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 			// F45/F58 窗口的「已取消任务产生回调」由此结构性关闭。
 			logger.Error("terminal-state guard: job_runs row already terminal, dropping delivery",
 				slog.Any("err", err))
+			if errors.Is(err, repository.ErrTerminalRejected) {
+				// A late delivery may be observed here even if its producer
+				// could not register it with the cancellation sweep.
+				d.reopenCancelCleanup(ctx, logger, p.TaskID)
+			}
 			return fmt.Errorf("worker: terminal row rejects resurrection: %w: %w", err, asynq.SkipRetry)
 		}
 		if ctx.Err() != nil {
@@ -152,6 +157,26 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 			logger.Warn("task failed, will retry", slog.Int("attempt", attempt), slog.Any("err", err))
 		}
 		return err // 交还 Asynq 按退避策略重试
+	}
+}
+
+// reopenCancelCleanup 迟到已取消投递的清理重入（F2a 取消对账，2026-11-20 复核）：
+// 清理确认出域（queued=1）的取消行仍可能收到 at-least-once 迟到投递——该行已不在
+// reclaim 第三域扫描（ListCanceledUnqueued 不再选中），残留副本本无收敛出口。此处把
+// canceled 行放回清理域（queued=0），由 probeCanceled 下轮重探撤残留或确认消亡；
+// 取消终态不动，succeeded 行的条件写恒 0 行（合法留观副本不受影响）。写失败仅留痕：
+// 投递照常丢弃，行为退回重入前口径，后续迟到投递可再次重入。
+func (d Deps) reopenCancelCleanup(ctx context.Context, logger *slog.Logger, taskID string) {
+	fctx, cancel := finishCtx(ctx)
+	defer cancel()
+	n, err := d.Store.MarkCleanupPending(fctx, taskID)
+	switch {
+	case err != nil:
+		logger.Error("cancel-cleanup re-admission failed",
+			slog.String("task_id", taskID), slog.Any("err", err))
+	case n > 0:
+		logger.Debug("late canceled delivery re-admitted to cancel-cleanup sweep",
+			slog.String("task_id", taskID))
 	}
 }
 

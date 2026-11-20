@@ -248,12 +248,13 @@ func (s *Store) queryRow(ctx context.Context, q string, args ...any) *sql.Row {
 	return s.db.QueryRowContext(ctx, s.pgq(q), args...)
 }
 
-// migrateColumns 按列判存补齐旧库缺失列（幂等：新库全部命中跳过；双驱动——
-// SQLite 走 pragma_table_info，PG 走 information_schema；ALTER 语句两驱动通用）。
+// migrateColumns 幂等补齐旧库缺失列。PostgreSQL 按 ALTER TABLE 相同的
+// search_path 解析目标表，避免把另一 schema 的同名表当成目标。
 func migrateColumns(db *sql.DB, driver string) error {
 	existsQuery := map[string]string{
-		DriverSQLite: "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
-		DriverPG:     "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
+		DriverSQLite: "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)",
+		DriverPG: `SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+			WHERE attrelid = pg_catalog.to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped)`,
 	}
 	type colDef struct {
 		table string
@@ -273,12 +274,10 @@ func migrateColumns(db *sql.DB, driver string) error {
 		{"job_runs", "execution_id", "ALTER TABLE job_runs ADD COLUMN execution_id TEXT NOT NULL DEFAULT ''"},
 		{"job_runs", "cancel_cleanup_generation", "ALTER TABLE job_runs ADD COLUMN cancel_cleanup_generation BIGINT NOT NULL DEFAULT 0"},
 	} {
-		rows, err := db.Query(existsQuery[driver], c.table, c.col)
-		if err != nil {
-			return err
+		var has bool
+		if err := db.QueryRow(existsQuery[driver], c.table, c.col).Scan(&has); err != nil {
+			return fmt.Errorf("check column %s.%s: %w", c.table, c.col, err)
 		}
-		has := rows.Next()
-		rows.Close()
 		if has {
 			continue
 		}

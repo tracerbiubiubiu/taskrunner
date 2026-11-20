@@ -63,6 +63,40 @@ func TestCronExistingSnapshotSemantics(t *testing.T) {
 	}
 }
 
+func TestPGLegacyColumnMigrationWithSiblingSchema(t *testing.T) {
+	// Both schemas are visible to the database role. Only the target schema is on
+	// the store's search_path, so a matching column in its sibling cannot satisfy
+	// the target store's startup check.
+	sibling := cronSnapshotStorePG(t)
+	target := cronSnapshotStorePG(t)
+	ctx := context.Background()
+	if err := target.InsertPending(ctx, Run{TaskID: "legacy", Action: "synthetic", EnqueuedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.exec(ctx, `ALTER TABLE job_runs DROP COLUMN execution_id`); err != nil {
+		t.Fatal(err)
+	}
+	if err := sibling.InsertPending(ctx, Run{TaskID: "sibling", Action: "synthetic", EnqueuedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sibling.MarkRunning(ctx, "sibling", 1, time.Now(), "sibling-delivery"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := migrateColumns(target.db, DriverPG); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy, err := target.GetByTaskID(ctx, "legacy")
+	if err != nil || legacy.Status != StatusPending || legacy.ExecutionID != "" {
+		t.Fatalf("target legacy record not available after upgrade: %+v, %v", legacy, err)
+	}
+	other, err := sibling.GetByTaskID(ctx, "sibling")
+	if err != nil || other.ExecutionID != "sibling-delivery" {
+		t.Fatalf("sibling record changed: %+v, %v", other, err)
+	}
+}
+
 // A byte comparison must fail the positive cases. Removing the snapshot guard
 // must fail the negative cases, including byte-identical corrupt snapshots.
 func testCronExistingSnapshotSemantics(t *testing.T, open func(*testing.T) *Store) {

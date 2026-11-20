@@ -12,6 +12,8 @@
 
 先备份DB、排空或停止全部旧taskrunner写实例，再启动新版本。`repository.migrateColumns`按既有启动迁移惯例给PG/SQLite的`job_runs`添加`execution_id TEXT NOT NULL DEFAULT ''`；保留存量任务/状态/attempt，旧行首次被新worker取得时写新身份。该列仅为内部并发栅栏，不进入API或载荷。每次delivery重新生成身份，终态写入同时匹配status/attempt/identity；旧实例忽略新谓词，混跑不满足修复条件。
 
+同库有多个 PostgreSQL schema 时，启动按连接的 `search_path` 判定和补齐目标 `job_runs` 的列。同库其他 schema 的同名表不参与判断。升级验证须检查实际运行连接所用的表，并确认历史状态和投递标识未被重写。
+
 回滚须先停全部新writer再换回旧二进制。新增列可保留，旧代码忽略它；如确需删除列，须在停写和备份后按所用数据库能力单独回退，禁止运行期删列。回滚将恢复旧的同attempt竞态边界，不得把旧代码保留该列视为仍具防护。备份/恢复应包含列和数据，回调动作的业务幂等依旧由属主服务保证。
 
 > 本文命令从仓库根目录进入 `deploy/` 后运行；compose文件仍在 `deploy/compose.yaml`，不是docs目录。

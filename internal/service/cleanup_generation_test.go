@@ -153,20 +153,33 @@ func TestReclaimScansAgainUnderContinuousArrivals(t *testing.T) {
 		}
 		inspector.states[id] = asynq.TaskStateActive
 	}
+	seedPending := func(id string) {
+		seedOld(t, store, id, "", 0)
+		if n, err := store.MarkQueued(ctx, id); err != nil || n != 1 {
+			t.Fatalf("fixture pending delivery: %d %v", n, err)
+		}
+		inspector.states[id] = asynq.TaskStatePending
+	}
+	seedPending("first-pending")
 	seedRunning("first-running")
 	l.ReclaimStalePending(ctx)
 	delete(inspector.delErr, "first-cancel")
 	inspector.states["first-running"] = asynq.TaskStateArchived
+	inspector.states["first-pending"] = asynq.TaskStateArchived
 	for i := 0; i < 8; i++ {
 		seedCanceled(t, store, fmt.Sprintf("more-canceled-%d", i), 0)
 		seedRunning(fmt.Sprintf("more-running-%d", i))
+		seedPending(fmt.Sprintf("more-pending-%d", i))
 		l.ReclaimStalePending(ctx)
 	}
 	if closed, err := store.GetQueued(ctx, "first-cancel"); err != nil || !closed {
 		t.Fatalf("sustained arrivals starved an older cancellation: %v %v", closed, err)
 	}
 	if got := logs.count(slog.LevelError, "stuck running"); got != 1 {
-		t.Fatalf("sustained arrivals starved an older execution: %d", got)
+		t.Errorf("sustained arrivals starved an older execution: %d", got)
+	}
+	if got := logs.count(slog.LevelError, "row still pending"); got == 0 {
+		t.Errorf("sustained arrivals starved an older pending projection")
 	}
 }
 
@@ -180,11 +193,22 @@ func TestReclaimMissingQueueRegistrationIsInconclusive(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspector.getErrs["running-with-missing-queue"] = asynq.ErrQueueNotFound
+	seedOld(t, store, "pending-with-missing-queue", "", 0)
+	if n, err := store.MarkQueued(ctx, "pending-with-missing-queue"); err != nil || n != 1 {
+		t.Fatalf("fixture pending delivery: %d %v", n, err)
+	}
+	inspector.getErrs["pending-with-missing-queue"] = asynq.ErrQueueNotFound
 	l.ReclaimStalePending(ctx)
 	if closed, err := store.GetQueued(ctx, "cancel-with-missing-queue"); err != nil || closed {
 		t.Errorf("missing queue registry retired cleanup without checking the task: %v %v", closed, err)
 	}
 	if got := logs.count(slog.LevelError, "stuck running"); got != 0 {
 		t.Errorf("missing queue registry was treated as an absent task key: %d", got)
+	}
+	if got := logs.count(slog.LevelError, "stuck pending row, task absent"); got != 0 {
+		t.Errorf("missing queue registry was treated as an absent pending key: %d", got)
+	}
+	if got := logs.count(slog.LevelWarn, "pending queue probes failed"); got != 1 {
+		t.Errorf("pending queue probe failure was not aggregated: %d", got)
 	}
 }

@@ -629,10 +629,10 @@ ORDER BY id LIMIT ?`, StatusPending, before, cursorID, lastID, limit)
 // ListStuckPending 第二轮扫描域（pending AND queued=1），id 游标支持轮转
 // （F36/F46/F56；cursorID=0 = 从头扫；游标键必须走整数主键——时间列绑定格式
 // 含驱动内部后缀，等值/边界比较不可靠，见实现记录）。
-func (s *Store) ListStuckPending(ctx context.Context, before time.Time, cursorID int64, limit int) ([]*Run, error) {
+func (s *Store) ListStuckPending(ctx context.Context, before time.Time, cursorID, lastID int64, limit int) ([]*Run, error) {
 	rows, err := s.query(ctx, reclaimListCols+`
-WHERE status = ? AND queued = 1 AND enqueued_at <= ? AND id > ?
-ORDER BY id LIMIT ?`, StatusPending, before, cursorID, limit)
+WHERE status = ? AND queued = 1 AND enqueued_at <= ? AND id > ? AND id <= ?
+ORDER BY id LIMIT ?`, StatusPending, before, cursorID, lastID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: list stuck pending: %w", err)
 	}

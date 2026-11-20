@@ -47,7 +47,8 @@ type ReclaimLoop struct {
 	unqueuedCursor int64                // 第一轮游标，坏行和持久故障行不占死批位
 	unqueuedLastID int64                // 本轮覆盖的最大 ID，开始新一轮时刷新
 	stuckCursor    int64                // 第二轮游标（行主键 id），0 = 从头扫（F36/F46/F56——时间列绑定格式不可作游标，见实现记录）
-	cancelCursor   int64                // 第三域游标，同款
+	stuckLastID    int64
+	cancelCursor   int64 // 第三域游标，同款
 	cancelLastID   int64
 	runningAlerts  map[string]runningObservation
 	runningCursor  int64 // 第四域游标，同款
@@ -290,33 +291,42 @@ func (l *ReclaimLoop) requeueUnqueued(ctx context.Context, before time.Time) {
 // alertStuckPending pending AND queued=1 宽限外 → Inspector 查证按 State 分流（F20）。
 // 复用 batch + id 游标轮转（F36：在途行占批位时保证 eventual 全覆盖）。
 func (l *ReclaimLoop) alertStuckPending(ctx context.Context, before time.Time) {
-	rows, err := l.Store.ListStuckPending(ctx, before, l.stuckCursor, l.BatchSize)
+	if l.Inspector == nil || !l.boundSweep(ctx, l.stuckCursor, &l.stuckLastID, "pending") {
+		return
+	}
+	rows, err := l.Store.ListStuckPending(ctx, before, l.stuckCursor, l.stuckLastID, l.BatchSize)
 	if err != nil {
 		l.Logger.Error("reclaim: list stuck pending failed", slog.Any("err", err))
 		return
 	}
+	var probeErrors int
+	var probeErr error
 	for _, r := range rows {
 		if ctx.Err() != nil {
 			return
 		}
-		l.inspectStuck(r)
+		if err := l.inspectStuck(r); err != nil {
+			probeErrors++
+			probeErr = err
+		}
+	}
+	if probeErrors > 0 {
+		l.Logger.Warn("reclaim: pending queue probes failed", slog.Int("rows", probeErrors), slog.Any("err", probeErr))
 	}
 	// F36/F46：游标按批推进（在途行也推进——否则每轮占批位）；不足一批 = 耗尽回卷
 	l.advanceCursor(rows, l.BatchSize, &l.stuckCursor)
 }
 
-func (l *ReclaimLoop) inspectStuck(r *repository.Run) {
+func (l *ReclaimLoop) inspectStuck(r *repository.Run) error {
 	info, err := l.Inspector.GetTaskInfo(l.Queue, r.TaskID)
 	switch {
-	case err != nil && !isKeyGoneErr(err):
-		// 查证瞬时失败：静默跳过（Redis 全断时第一轮已在告警），游标照常推进
-		return
-	case isKeyGoneErr(err):
-		// F64：队列注册集被清（FLUSHDB/删队列）同归 absent——「任务不在」恰是事实
+	case errors.Is(err, asynq.ErrTaskNotFound):
 		l.Logger.Error("reclaim: stuck pending row, task absent from queue (redis loss/mark residual); "+
 			"manual action: resubmit with new task_id or wait for M4 reconciliation",
 			slog.String("task_id", r.TaskID))
-		return
+		return nil
+	case err != nil:
+		return err
 	}
 	switch info.State {
 	case asynq.TaskStateCompleted:
@@ -330,6 +340,7 @@ func (l *ReclaimLoop) inspectStuck(r *repository.Run) {
 	default:
 		// pending/scheduled/retry/active/aggregating：在途，静默跳过
 	}
+	return nil
 }
 
 // ---- 第三域：仅清理，绝不重投 ----

@@ -227,11 +227,11 @@ func TestPGReclaimColumnsAndQueries(t *testing.T) {
 	}
 
 	// 第二轮 id 游标：耗尽判定
-	stuck, err := s.ListStuckPending(ctx, now, 0, 10)
+	stuck, err := s.ListStuckPending(ctx, now, 0, math.MaxInt64, 10)
 	if err != nil || len(stuck) != 1 || stuck[0].TaskID != "pg-rq1" {
 		t.Fatalf("stuck: %+v err=%v", stuck, err)
 	}
-	if stuck2, err := s.ListStuckPending(ctx, now, stuck[0].ID, 10); err != nil || len(stuck2) != 0 {
+	if stuck2, err := s.ListStuckPending(ctx, now, stuck[0].ID, math.MaxInt64, 10); err != nil || len(stuck2) != 0 {
 		t.Fatalf("cursor exhausted: %+v err=%v", stuck2, err)
 	}
 

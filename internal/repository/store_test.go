@@ -281,19 +281,19 @@ func TestListCursorRotation(t *testing.T) {
 	}
 	before := time.Now()
 
-	rows, err := s.ListStuckPending(ctx, before, 0, 2)
+	rows, err := s.ListStuckPending(ctx, before, 0, math.MaxInt64, 2)
 	if err != nil || len(rows) != 2 || rows[0].TaskID != "c1" || rows[1].TaskID != "c2" {
 		t.Fatalf("batch1: %+v err=%v", rows, err)
 	}
-	rows2, err := s.ListStuckPending(ctx, before, rows[len(rows)-1].ID, 2)
+	rows2, err := s.ListStuckPending(ctx, before, rows[len(rows)-1].ID, math.MaxInt64, 2)
 	if err != nil || len(rows2) != 1 || rows2[0].TaskID != "c3" {
 		t.Fatalf("batch2: %+v err=%v", rows2, err)
 	}
-	rows3, _ := s.ListStuckPending(ctx, before, rows2[len(rows2)-1].ID, 2)
+	rows3, _ := s.ListStuckPending(ctx, before, rows2[len(rows2)-1].ID, math.MaxInt64, 2)
 	if len(rows3) != 0 {
 		t.Fatalf("exhausted: %+v", rows3)
 	}
-	rows4, _ := s.ListStuckPending(ctx, before, 0, 2)
+	rows4, _ := s.ListStuckPending(ctx, before, 0, math.MaxInt64, 2)
 	if len(rows4) != 2 || rows4[0].TaskID != "c1" {
 		t.Fatalf("wrap around: %+v", rows4)
 	}

@@ -44,8 +44,8 @@ func isRedisDirtyStateErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), asynqDirtyStateErrText)
 }
 
-// isKeyGoneErr preserves the F64 policy for preliminary cancellation and
-// pending checks. Generation cleanup and running observations require
+// isKeyGoneErr preserves the F64 behavior for the direct Cancel API.
+// Background cleanup and ledger observations require
 // ErrTaskNotFound: an absent queue registration may hide existing tasks.
 func isKeyGoneErr(err error) bool {
 	return errors.Is(err, asynq.ErrTaskNotFound) || errors.Is(err, asynq.ErrQueueNotFound)

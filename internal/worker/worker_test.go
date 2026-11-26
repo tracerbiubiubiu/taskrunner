@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -220,4 +223,67 @@ func TestLateCanceledDeliveryReentersCleanupScope(t *testing.T) {
 			t.Fatal("succeeded row must stay out of the cleanup scope (queued=1 untouched)")
 		}
 	})
+}
+
+func TestB3WorkerUsesClaimedDeliveryAndAwaitsReceipt(t *testing.T) {
+	ctx := context.Background()
+	d, _ := newDeps(t, fakeCB{})
+	const taskID = "task-original"
+	const operationID = "op-original"
+	if err := d.Store.InsertPending(ctx, repository.Run{
+		TaskID: taskID, Action: "activelist.document.get", EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var deliveries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var wire struct {
+			ProtocolVersion int    `json:"protocol_version"`
+			TaskID          string `json:"task_id"`
+			OperationID     string `json:"operation_id"`
+			ActionVersion   int    `json:"action_version"`
+			DeliveryID      string `json:"delivery_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&wire); err != nil {
+			t.Error(err)
+		}
+		row, err := d.Store.GetByTaskID(r.Context(), taskID)
+		if err != nil || row.ExecutionID == "" || row.ExecutionID != wire.DeliveryID || row.Status != repository.StatusRunning {
+			t.Errorf("wire delivery is not the active execution claim: wire=%+v row=%+v err=%v", wire, row, err)
+		}
+		if wire.ProtocolVersion != 2 || wire.TaskID != taskID || wire.OperationID != operationID || wire.ActionVersion != 1 {
+			t.Errorf("callback did not preserve the operation binding: %+v", wire)
+		}
+		deliveries = append(deliveries, wire.DeliveryID)
+		if len(deliveries) == 1 {
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = io.WriteString(w, `{"code":0,"data":{"task_id":"task-original","operation_id":"op-original","state":"in_progress"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":0,"data":{"task_id":"task-original","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}}`)
+	}))
+	defer srv.Close()
+	d.Callback = callback.New(callback.Config{})
+	mux := NewMux(d)
+	p := task.Payload{TaskID: taskID, Action: "activelist.document.get", CallbackURL: srv.URL, Params: []byte(`{"operation_id":"op-original"}`)}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := asynq.NewTask(task.TypeCallback, raw)
+	if err := mux.ProcessTask(ctx, delivery); err == nil || errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("first attempt must retain retry without a receipt: %v", err)
+	}
+	row, err := d.Store.GetByTaskID(ctx, taskID)
+	if err != nil || row.Status == repository.StatusSucceeded {
+		t.Fatalf("pending response falsely completed the task: row=%+v err=%v", row, err)
+	}
+	if err := mux.ProcessTask(ctx, delivery); err != nil {
+		t.Fatalf("same task can complete upon receipt: %v", err)
+	}
+	row, err = d.Store.GetByTaskID(ctx, taskID)
+	if err != nil || row.Status != repository.StatusSucceeded || len(deliveries) != 2 || deliveries[0] == deliveries[1] {
+		t.Fatalf("retry completion: row=%+v deliveries=%v err=%v", row, deliveries, err)
+	}
 }

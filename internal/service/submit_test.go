@@ -381,3 +381,68 @@ func TestNewTaskIDMatchesCoreCharacterWidth(t *testing.T) {
 		t.Fatalf("oversize ID reached queue: %d", enq.count())
 	}
 }
+
+func TestSubmitB3SameIdentityRequiresFrozenDeliveryInput(t *testing.T) {
+	svc, st, queue, _ := newSubmitSvc(t)
+	ctx := context.Background()
+	original := submitPayload("b3-task")
+	original.Action = "ticket.evidence.report.generate"
+	original.Params = []byte(`{"operation_id":"op-original","count":2}`)
+	original.TimeoutSecs = 18
+	original.SubmittedBy = "ticket-operator"
+	original.Dept = "sample-dept"
+	if accepted, warning, err := svc.Submit(ctx, original); !accepted || warning != nil || err != nil {
+		t.Fatalf("first submission: accepted=%v warning=%v err=%v", accepted, warning, err)
+	}
+
+	idempotent := original
+	idempotent.RequestID = "later-trace"
+	idempotent.SourceIP = "127.0.0.2"
+	idempotent.Params = []byte(`{"count":2.0,"operation_id":"op-original"}`)
+	if accepted, warning, err := svc.Submit(ctx, idempotent); accepted || warning != nil || err != nil {
+		t.Fatalf("equivalent retry: accepted=%v warning=%v err=%v", accepted, warning, err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*task.Payload)
+	}{
+		{"different timeout", func(p *task.Payload) { p.TimeoutSecs++ }},
+		{"different submitter", func(p *task.Payload) { p.SubmittedBy = "other-operator" }},
+		{"different department", func(p *task.Payload) { p.Dept = "other-dept" }},
+		{"different target", func(p *task.Payload) { p.CallbackURL += "-other" }},
+		{"different operation", func(p *task.Payload) { p.Params = []byte(`{"count":2,"operation_id":"op-other"}`) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conflicting := original
+			tc.mutate(&conflicting)
+			var conflictErr *ConflictError
+			if accepted, warning, err := svc.Submit(ctx, conflicting); accepted || warning != nil || !errors.As(err, &conflictErr) {
+				t.Fatalf("conflicting retry: accepted=%v warning=%v err=%v", accepted, warning, err)
+			}
+		})
+	}
+	row, err := st.GetByTaskID(ctx, original.TaskID)
+	if err != nil || row.Params != string(original.Params) || queue.count() != 1 {
+		t.Fatalf("only the original task may be stored and delivered: row=%#v enqueued=%d err=%v", row, queue.count(), err)
+	}
+}
+
+func TestSubmitB3RejectsMissingOperationID(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"operation_id":42}`, `{"Operation_ID":"other"}`, `{"operation_id":" "}`} {
+		t.Run(raw, func(t *testing.T) {
+			svc, st, queue, _ := newSubmitSvc(t)
+			p := submitPayload("b3-task")
+			p.Action = "activelist.document.update"
+			p.Params = []byte(raw)
+			ctx := context.Background()
+			var invalidErr *InvalidError
+			if accepted, warning, err := svc.Submit(ctx, p); accepted || warning != nil || !errors.As(err, &invalidErr) {
+				t.Errorf("malformed operation accepted=%v warning=%v err=%v", accepted, warning, err)
+			}
+			if _, err := st.GetByTaskID(ctx, p.TaskID); !errors.Is(err, repository.ErrNotFound) || queue.count() != 0 {
+				t.Fatalf("malformed operation reached storage or Redis: enqueues=%d err=%v", queue.count(), err)
+			}
+		})
+	}
+}

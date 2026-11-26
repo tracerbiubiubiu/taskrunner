@@ -16,6 +16,8 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx stdlib 驱动注册（C7）
 	_ "modernc.org/sqlite"
+
+	"github.com/tracerbiubiubiu/taskrunner/internal/task"
 )
 
 // 任务状态（设计文档 §6 最小 schema）。
@@ -314,12 +316,12 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 func (s *Store) GetByTaskID(ctx context.Context, taskID string) (*Run, error) {
 	row := s.queryRow(ctx, `
 SELECT task_id, request_id, action, job_id, dept, params, callback_url, status, attempts, error, duration_ms,
-       submitted_by, source_ip, enqueued_at, started_at, finished_at, queued, execution_id
+       submitted_by, source_ip, enqueued_at, started_at, finished_at, queued, execution_id, enqueue_payload
 FROM job_runs WHERE task_id = ?`, taskID)
 	var r Run
 	var queued int
 	err := row.Scan(&r.TaskID, &r.RequestID, &r.Action, &r.JobID, &r.Dept, &r.Params, &r.CallbackURL, &r.Status, &r.Attempts,
-		&r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP, &r.EnqueuedAt, &r.StartedAt, &r.FinishedAt, &queued, &r.ExecutionID)
+		&r.Error, &r.DurationMS, &r.SubmittedBy, &r.SourceIP, &r.EnqueuedAt, &r.StartedAt, &r.FinishedAt, &queued, &r.ExecutionID, &r.EnqueuePayload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -377,6 +379,7 @@ type RunFilter struct {
 	To          *time.Time
 	Page        int // 1 起
 	PageSize    int
+	LegacyOnly  bool
 }
 
 // toAny []string → []any（SQL 参数）。
@@ -421,6 +424,11 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 		where, args = where+" AND enqueued_at <= ?", append(args, *f.To)
 	}
 
+	if f.LegacyOnly {
+		where += " AND action NOT IN (?, ?, ?)"
+		args = append(args,
+			task.TicketEvidenceReportAction, task.ActiveListDocumentUpdateAction, task.ActiveListDocumentGetAction)
+	}
 	var total int64
 	if err := s.queryRow(ctx, `SELECT COUNT(*) FROM job_runs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("store: count runs: %w", err)

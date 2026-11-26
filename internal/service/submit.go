@@ -62,6 +62,18 @@ func buildEnqueueOpts(p task.Payload, queue string, maxRetry int, retention time
 	return opts
 }
 
+func validateSubmitParameters(p task.Payload) error {
+	if err := validateParameters(p.Params); err != nil {
+		return err
+	}
+	if task.UsesReceiptCallback(p.Action) {
+		if _, err := task.ReceiptOperationID(p.Params); err != nil {
+			return invalid("%v", err)
+		}
+	}
+	return nil
+}
+
 // Submit受理任务。accepted=false且无error仅表示同task_id/action/params幂等重提。
 // 同task_id异action/params返回ConflictError，保留原任务且零新增执行。
 // 入队失败（Redis 抖动）返回 warning：行已落库即 SSOT，reclaim 修复后执行——
@@ -70,7 +82,7 @@ func (s *Service) Submit(ctx context.Context, p task.Payload) (accepted bool, wa
 	if err := validateTaskID(p.TaskID); err != nil {
 		return false, nil, err
 	}
-	if err := validateParameters(p.Params); err != nil {
+	if err := validateSubmitParameters(p); err != nil {
 		return false, nil, err
 	}
 	// A1：先查 job_runs。Asynq 的 TaskID 冲突只在任务还留在 Redis 时成立（succeeded 后 ID 被释放），
@@ -171,13 +183,23 @@ func sameInput(existing *repository.Run, p task.Payload) error {
 	if existing.Action != p.Action || existing.JobID != p.JobID || !equal {
 		return conflict("task_id 已存在且 action/params 不一致")
 	}
+	if task.UsesReceiptCallback(p.Action) {
+		var snapshot task.Payload
+		if err := json.Unmarshal([]byte(existing.EnqueuePayload), &snapshot); err != nil || snapshot.TaskID != p.TaskID {
+			return conflict("task_id 已存在且原提交快照无法安全比对")
+		}
+		if existing.SubmittedBy != p.SubmittedBy || existing.Dept != p.Dept ||
+			existing.CallbackURL != p.CallbackURL || snapshot.TimeoutSecs != p.TimeoutSecs {
+			return conflict("task_id 已存在且原提交快照不一致")
+		}
+	}
 	return nil
 }
 
 // SubmitCron persists the original due slot and its next_run advance in one
 // local transaction before any queue call. Losing loop instances do no work.
 func (s *Service) SubmitCron(ctx context.Context, j repository.Job, p task.Payload, next, now time.Time) (bool, error, error) {
-	if err := validateParameters(p.Params); err != nil {
+	if err := validateSubmitParameters(p); err != nil {
 		return false, nil, err
 	}
 	payload, err := json.Marshal(p)
@@ -209,7 +231,7 @@ func (s *Service) SubmitJob(ctx context.Context, j repository.Job, p task.Payloa
 	if err := validateTaskID(p.TaskID); err != nil {
 		return false, nil, err
 	}
-	if err := validateParameters(p.Params); err != nil {
+	if err := validateSubmitParameters(p); err != nil {
 		return false, nil, err
 	}
 	raw, err := json.Marshal(p)

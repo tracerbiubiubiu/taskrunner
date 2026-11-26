@@ -209,3 +209,46 @@ func TestCallbackCarriesJobAssociation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestB3CallbackRequiresMatchingReceipt(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		status        int
+		reply         string
+		wantSuccess   bool
+		wantRejection bool
+	}{
+		{"valid", 200, `{"code":0,"data":{"task_id":"t1","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}}`, true, false},
+		{"202 is pending", 202, `{"code":0,"data":{"task_id":"t1","operation_id":"op-original","state":"in_progress"}}`, false, false},
+		{"503 is unresolved", 503, `{}`, false, false},
+		{"204 cannot succeed", 204, "", false, false},
+		{"unenveloped success", 200, `{"task_id":"t1","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}`, false, false},
+		{"legacy success has no receipt", 200, `{"code":0,"data":{"task_id":"t1","status":"succeeded"}}`, false, false},
+		{"code missing", 200, `{"data":{"task_id":"t1","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}}`, false, false},
+		{"code null", 200, `{"code":null,"data":{"task_id":"t1","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}}`, false, false},
+		{"code not zero", 200, `{"code":1,"data":{"task_id":"t1","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}}`, false, false},
+		{"duplicate code", 200, `{"code":1,"code":0,"data":{"task_id":"t1","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}}`, false, false},
+		{"wrong task", 200, `{"code":0,"data":{"task_id":"different","operation_id":"op-original","state":"succeeded","receipt_id":"receipt-original"}}`, false, false},
+		{"wrong operation", 200, `{"code":0,"data":{"task_id":"t1","operation_id":"different","state":"succeeded","receipt_id":"receipt-original"}}`, false, false},
+		{"unknown state", 200, `{"code":0,"data":{"task_id":"t1","operation_id":"op-original","state":"outcome_unknown","receipt_id":"receipt-original"}}`, false, false},
+		{"empty receipt", 200, `{"code":0,"data":{"task_id":"t1","operation_id":"op-original","state":"succeeded","receipt_id":" "}}`, false, false},
+		{"bad body", 200, `{"code":0`, false, false},
+		{"403 is definitive delivery rejection", 403, `{}`, false, true},
+		{"409 is definitive delivery rejection", 409, `{}`, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.reply)
+			}))
+			defer srv.Close()
+			p := payload(srv.URL)
+			p.Action = "ticket.evidence.report.generate"
+			p.Params = []byte(`{"operation_id":"op-original"}`)
+			err := New(Config{}).Do(context.Background(), p)
+			if (err == nil) != tc.wantSuccess || errors.Is(err, ErrNonRetryable) != tc.wantRejection {
+				t.Fatalf("success=%v rejection=%v, got %v", tc.wantSuccess, tc.wantRejection, err)
+			}
+		})
+	}
+}

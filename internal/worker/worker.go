@@ -116,7 +116,7 @@ func (d Deps) handleCallback(ctx context.Context, t *asynq.Task) error {
 		return fmt.Errorf("worker: claim required before callback: %w", err)
 	}
 
-	err := d.callCallback(ctx, p, logger)
+	err := d.callCallback(callback.WithDeliveryID(ctx, executionID), p, logger)
 	switch {
 	case err == nil:
 		if err := d.finish(ctx, logger, p.TaskID, repository.StatusSucceeded, "", attempt, now, executionID); err != nil {

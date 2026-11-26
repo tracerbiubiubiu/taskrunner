@@ -11,6 +11,7 @@
 | `POST /v1/tasks` | `action` 必填；可选 `task_id`、`request_id`、`dept`、`params`、`submitted_by`、`source_ip`、`timeout_secs`。持久化成功即受理，Redis 暂不可用仍200待补投；不代表执行成功。相同 task_id、action及精确JSON语义params终身去重；同号异action/params返回HTTP409/code10005，零新增执行。 |
 | `GET /v1/tasks/:id` | 按 task_id 查询现态，包含 dept 标签。 |
 | `GET /v1/runs` | `id/request_id/action/status/job_id/dept/submitted_by/from/to/page/page_size`；dept 可重复多值，按运行快照列筛选，不 JOIN 当前 jobs；from/to 为 RFC3339。返回 list/total/page/page_size。 |
+| `GET /v1/runs/legacy` | 签名服务间路径，查询和响应沿用 `/v1/runs`。按持久化的结构化回执动作排除对应运行，先过滤再计数和分页。 |
 | `GET /v1/jobs/:job_id` | 经同一AK/SK验签读取单一定义，返回现有JobView（含真实action_id/params/enabled/updated_at）；不存在404。核心仅在已有职责允许的内部用例消费，不对前端直接开放。读取不是授权凭证，也不锁住后续更新。 |
 | `GET /v1/jobs` | `dept/action_id/enabled/page/page_size`；返回分页任务定义。 |
 | `POST /v1/jobs` | `action_id`、`trigger_type` 必填；可选 cron_spec/params/dept/enabled/timeout_secs/description/created_by/owner_service。 |
@@ -19,8 +20,9 @@
 | `POST /v1/tasks/cancel` | body `task_id`；仅当前未开始的执行，已执行或条件更新冲突返回409。队列前置查证不可用时，仅对仍未确认投递的 DB 行降级。DB 确认取消后返回成功，Redis 残留继续清理。 |
 | `POST /v1/tasks/retry` | body `task_id`；仅 failed/dead，其他状态409；干预时队列已推进到pending/active也返回409，保留执行记录，新执行结果先落库时返回409。人工重试沿用队列已有重试计数和预算。真实Redis/未知错误仍500。 |
 | `GET /v1/dead-letters` | page/page_size；返回 list/page/page_size，无total。队列未创建或空队列返回200空列表；其他队列故障仍报错。 |
+| `GET /v1/dead-letters/legacy` | 签名服务间路径，以持久化动作排除结构化回执任务，无法找到持久记录的归档项不展示，然后分页。 |
 
-`params` 必须合法 JSON、不得显式 null或包含重复对象键，最大64KiB，容器嵌套最多256层；省略沿原空对象缺省。action/params比对保留任意精度十进制数值，不经float64；键序、空白和1/1.0等数值等价不构成冲突。新提交的task_id最多64个Unicode字符，与核心VARCHAR(64)对齐，不按UTF-8字节截断；省略仍生成UUID，旧查询/重试标识不批量改写。timeout_secs 为0或1–86400，0采用服务默认。一次性提交/新建定义的 callback_url 非空400；更新定义只要传该字段即拒绝（包括空值）。地址由 `Config.CallbackTargetURL` 确定。旧 POST/PATCH 带业务ID路径不属于本表现行路由；没有 jobs DELETE。
+`params` 必须合法 JSON、不得显式 null或包含重复对象键，最大64KiB，容器嵌套最多256层；省略沿原空对象缺省。action/params比对保留任意精度十进制数值，不经float64；键序、空白和1/1.0等数值等价不构成冲突。新提交的task_id最多64个Unicode字符，与核心VARCHAR(64)对齐，不按UTF-8字节截断；省略仍生成UUID，旧查询/重试标识不批量改写。timeout_secs 为0或1–86400，0采用服务默认。结构化回执动作的 `params.operation_id` 必填且为非空字符串。同号还需匹配首次持久保存的提交人、部门、配置回调地址和超时值，差异返回 409。一次性提交/新建定义的 callback_url 非空400；更新定义只要传该字段即拒绝（包括空值）。地址由 `Config.CallbackTargetURL` 确定。旧 POST/PATCH 带业务ID路径不属于本表现行路由；没有 jobs DELETE。
 
 `created_by/owner_service/submitted_by/actor`旧body字段兼容接收但不具有归因权威。经验签的caller与operator进入Service可信context；仅`security.trusted_operator_callers`列出的caller可声明非空真人operator（默认仅zhuzhao，必须有对应验签key，明确空列表表示不信任任何真人声明）。其它caller或无真人operator归因`service:<caller>`；无外部caller的内部调用归因`service:taskrunner`。owner_service取可信caller，更新保留原creator。该名单只影响归因，不能把任意签名operator当成核心授权。
 
@@ -34,7 +36,11 @@
 {"task_id":"任务ID","job_id":"来源任务定义ID（有定义时）","request_id":"req-…","action":"audit_archive","params":{},"actor":"操作者","source_ip":"来源IP"}
 ```
 
-actor/source_ip 为可选归因字段；可选job_id保留运行来源关联，一次性提交省略。所有字段均在签名body内；job_id本身不授业务权，核心固定job授权仍须受签查询真实task/job快照。action 是运行时标识，job 定义字段仍叫 action_id。body 为唯一业务负载通道，不将业务参数散到URL。回调带服务自身AK/SK签名；有request_id则头与body贯通。对端以task_id实现幂等，并在动作完全成功后返回2xx；408/429及5xx/超时可重试，其余4xx不可重试。只接受配置端点直接返回的完成信号，3xx保留为可重试的未确认结果且不跟随跳转；409仍表示快照冲突等终败，不用它承载在途状态。主仓在途/终态记账未确认的联合候选用503和Retry-After，只有动作已完成并确认终态才回2xx。任务级结果由查询API获取；可选终败通知是告警，不是第二套执行或结果复制通道。
+actor/source_ip 为可选归因字段；可选job_id保留运行来源关联，一次性提交省略。所有字段均在签名body内；job_id本身不授业务权，核心固定job授权仍须受签查询真实task/job快照。action 是运行时标识，job 定义字段仍叫 action_id。body 为唯一业务负载通道，不将业务参数散到URL。回调带服务自身AK/SK签名；有request_id则头与body贯通。旧动作的对端以task_id实现幂等，并在动作完全成功后返回2xx；408/429及5xx/超时可重试，其余4xx不可重试。只接受配置端点直接返回的完成信号，3xx保留为可重试的未确认结果且不跟随跳转；409仍表示快照冲突等终败，不用它承载在途状态。主仓在途/终态记账未确认的联合候选用503和Retry-After，只有动作已完成并确认终态才回2xx。任务级结果由查询API获取；可选终败通知是告警，不是第二套执行或结果复制通道。
+
+`ticket.evidence.report.generate`、`activelist.document.update`、`activelist.document.get` 使用结构化回执协议。原有请求字段保留，增加整数 `protocol_version=2` 和 `action_version=1`，以及 `operation_id` 和 `delivery_id`。操作号取冻结的 `params.operation_id`，每次投递的身份取 worker 持久认领时的执行编号。同一任务的重投保留原任务号和操作号。
+
+仅 HTTP 200 且 `code=0`、`data.task_id` 与 `data.operation_id` 匹配原任务、`data.state="succeeded"` 且 `data.receipt_id` 非空才确认成功。202、503、错误或不匹配的回执进入现有投递重试；对端凭原操作号查找持久结果。408/429 仍可重试，其余 4xx 终止这次投递。队列的失败、重试耗尽和死信描述投递事实，业务结果以能力属主的持久收据为准。
 
 这里的callback是**请求能力属主执行**，不是异步结果回贴入口；当前查询提供执行记录和状态，不代表已经包含业务结构化结果、工件授权或工单/AL字段回写。后续C03/D12将执行观察、属主效果receipt、结果投递和消费回贴分别核验，见[平台集成合同](../design/platform-integration.md#统一能力通道中的tr边界)。本表现有字段和线协议保持，不以新设计文字宣称新增结果API。
 
@@ -49,7 +55,7 @@ actor/source_ip 为可选归因字段；可选job_id保留运行来源关联，�
 - 执行身份栅栏：`internal/worker/worker.go` 的 `Deps.handleCallback` 与 repository `MarkRunning` / `Finish`。
 - notifier：`internal/notify/notifier.go`；部署值见 [部署](../ops/deployment.md)。
 
-执行库的execution_id不进入本API。准确字段类型以请求结构、repository响应tag为准，新增接口须同步本页和调用方，不能用历史设计的设想代替实现。
+执行库的 execution_id 以 delivery_id 进入结构化内部回调，运行查询不返回此字段。准确字段类型以请求结构、repository响应tag为准，新增接口须同步本页和调用方，不能用历史设计的设想代替实现。
 
 ## cron发生次与兼容
 

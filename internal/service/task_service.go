@@ -256,13 +256,14 @@ type RunQuery struct {
 	SubmittedBy                      string // 「只看我提交的」（zhuzhao 代理把 me 换 actor 后透传）
 	From, To                         *time.Time
 	Page, PageSize                   int
+	LegacyOnly                       bool
 }
 
 func (s *TaskService) ListRuns(ctx context.Context, q RunQuery) ([]RunView, int64, error) {
 	runs, total, err := s.repo.ListRuns(ctx, repository.RunFilter{
 		ID: q.ID, RequestID: q.RequestID, Action: q.Action, Status: q.Status, JobID: q.JobID, Depts: q.Depts,
 		SubmittedBy: q.SubmittedBy,
-		From:        q.From, To: q.To, Page: q.Page, PageSize: q.PageSize,
+		From:        q.From, To: q.To, Page: q.Page, PageSize: q.PageSize, LegacyOnly: q.LegacyOnly,
 	})
 	if err != nil {
 		return nil, 0, err
@@ -303,6 +304,59 @@ func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) (
 	if err != nil {
 		return nil, err
 	}
+	return deadLetterViews(tasks), nil
+}
+
+// ListLegacyDeadLetters paginates the visible subsequence of the shared archive.
+func (s *TaskService) ListLegacyDeadLetters(ctx context.Context, page, pageSize int) ([]DeadLetterView, error) {
+	const batchSize = 200
+	if pageSize <= 0 || pageSize > batchSize {
+		pageSize = 50
+	}
+	var visibleInPage int
+	selected := make([]*asynq.TaskInfo, 0, pageSize)
+	for archivePage := 1; ; archivePage++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		batch, err := s.inspector.ListArchivedTasks(s.queue, asynq.PageSize(batchSize), asynq.Page(archivePage))
+		if errors.Is(err, asynq.ErrQueueNotFound) {
+			return []DeadLetterView{}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, archived := range batch {
+			run, err := s.repo.GetByTaskID(ctx, archived.ID)
+			if errors.Is(err, repository.ErrNotFound) {
+				continue // Unknown archive entries cannot be safely classified.
+			}
+			if err != nil {
+				return nil, err
+			}
+			if task.UsesReceiptCallback(run.Action) {
+				continue
+			}
+			if page > 1 {
+				visibleInPage++
+				if visibleInPage == pageSize {
+					page--
+					visibleInPage = 0
+				}
+				continue
+			}
+			selected = append(selected, archived)
+			if len(selected) == pageSize {
+				return deadLetterViews(selected), nil
+			}
+		}
+		if len(batch) < batchSize {
+			return deadLetterViews(selected), nil
+		}
+	}
+}
+
+func deadLetterViews(tasks []*asynq.TaskInfo) []DeadLetterView {
 	out := make([]DeadLetterView, 0, len(tasks))
 	for _, t := range tasks {
 		out = append(out, DeadLetterView{
@@ -310,7 +364,7 @@ func (s *TaskService) ListDeadLetters(ctx context.Context, page, pageSize int) (
 			LastError: t.LastErr, Retried: t.Retried, MaxRetry: t.MaxRetry, LastFailedAt: t.LastFailedAt,
 		})
 	}
-	return out, nil
+	return out
 }
 
 // ---- 干预 ----

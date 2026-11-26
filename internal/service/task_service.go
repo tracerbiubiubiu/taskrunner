@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -328,7 +327,14 @@ func (s *TaskService) ListLegacyDeadLetters(ctx context.Context, page, pageSize 
 			return nil, err
 		}
 		for _, archived := range batch {
-			if belongsToReceiptCallback(archived) {
+			run, err := s.repo.GetByTaskID(ctx, archived.ID)
+			if errors.Is(err, repository.ErrNotFound) {
+				continue // Unknown archive entries cannot be safely classified.
+			}
+			if err != nil {
+				return nil, err
+			}
+			if task.UsesReceiptCallback(run.Action) {
 				continue
 			}
 			if page > 1 {
@@ -348,16 +354,6 @@ func (s *TaskService) ListLegacyDeadLetters(ctx context.Context, page, pageSize 
 			return deadLetterViews(selected), nil
 		}
 	}
-}
-
-func belongsToReceiptCallback(archived *asynq.TaskInfo) bool {
-	if strings.HasPrefix(archived.ID, task.ReceiptTaskIDPrefix) {
-		return true
-	}
-	var p struct {
-		Action string `json:"action"`
-	}
-	return json.Unmarshal(archived.Payload, &p) == nil && task.UsesReceiptCallback(p.Action)
 }
 
 func deadLetterViews(tasks []*asynq.TaskInfo) []DeadLetterView {

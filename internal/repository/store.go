@@ -425,8 +425,8 @@ func (s *Store) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int64, error
 	}
 
 	if f.LegacyOnly {
-		where += " AND substr(task_id, 1, ?) <> ? AND action NOT IN (?, ?, ?)"
-		args = append(args, len(task.ReceiptTaskIDPrefix), task.ReceiptTaskIDPrefix,
+		where += " AND action NOT IN (?, ?, ?)"
+		args = append(args,
 			task.TicketEvidenceReportAction, task.ActiveListDocumentUpdateAction, task.ActiveListDocumentGetAction)
 	}
 	var total int64

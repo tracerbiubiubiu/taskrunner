@@ -11,7 +11,7 @@
 | `POST /v1/tasks` | `action` 必填；可选 `task_id`、`request_id`、`dept`、`params`、`submitted_by`、`source_ip`、`timeout_secs`。持久化成功即受理，Redis 暂不可用仍200待补投；不代表执行成功。相同 task_id、action及精确JSON语义params终身去重；同号异action/params返回HTTP409/code10005，零新增执行。 |
 | `GET /v1/tasks/:id` | 按 task_id 查询现态，包含 dept 标签。 |
 | `GET /v1/runs` | `id/request_id/action/status/job_id/dept/submitted_by/from/to/page/page_size`；dept 可重复多值，按运行快照列筛选，不 JOIN 当前 jobs；from/to 为 RFC3339。返回 list/total/page/page_size。 |
-| `GET /v1/runs/legacy` | 签名服务间路径，查询和响应沿用 `/v1/runs`。按结构化回执动作及保留的 `b3_` ID 前缀排除对应运行，先过滤再计数和分页。 |
+| `GET /v1/runs/legacy` | 签名服务间路径，查询和响应沿用 `/v1/runs`。按持久化的结构化回执动作排除对应运行，先过滤再计数和分页。 |
 | `GET /v1/jobs/:job_id` | 经同一AK/SK验签读取单一定义，返回现有JobView（含真实action_id/params/enabled/updated_at）；不存在404。核心仅在已有职责允许的内部用例消费，不对前端直接开放。读取不是授权凭证，也不锁住后续更新。 |
 | `GET /v1/jobs` | `dept/action_id/enabled/page/page_size`；返回分页任务定义。 |
 | `POST /v1/jobs` | `action_id`、`trigger_type` 必填；可选 cron_spec/params/dept/enabled/timeout_secs/description/created_by/owner_service。 |
@@ -20,7 +20,7 @@
 | `POST /v1/tasks/cancel` | body `task_id`；仅当前未开始的执行，已执行或条件更新冲突返回409。队列前置查证不可用时，仅对仍未确认投递的 DB 行降级。DB 确认取消后返回成功，Redis 残留继续清理。 |
 | `POST /v1/tasks/retry` | body `task_id`；仅 failed/dead，其他状态409；干预时队列已推进到pending/active也返回409，保留执行记录，新执行结果先落库时返回409。人工重试沿用队列已有重试计数和预算。真实Redis/未知错误仍500。 |
 | `GET /v1/dead-letters` | page/page_size；返回 list/page/page_size，无total。队列未创建或空队列返回200空列表；其他队列故障仍报错。 |
-| `GET /v1/dead-letters/legacy` | 签名服务间路径，排除相同结构化回执动作或保留 ID 前缀后形成可见列表，再分页。 |
+| `GET /v1/dead-letters/legacy` | 签名服务间路径，以持久化动作排除结构化回执任务，无法找到持久记录的归档项不展示，然后分页。 |
 
 `params` 必须合法 JSON、不得显式 null或包含重复对象键，最大64KiB，容器嵌套最多256层；省略沿原空对象缺省。action/params比对保留任意精度十进制数值，不经float64；键序、空白和1/1.0等数值等价不构成冲突。新提交的task_id最多64个Unicode字符，与核心VARCHAR(64)对齐，不按UTF-8字节截断；省略仍生成UUID，旧查询/重试标识不批量改写。timeout_secs 为0或1–86400，0采用服务默认。结构化回执动作的 `params.operation_id` 必填且为非空字符串。同号还需匹配首次持久保存的提交人、部门、配置回调地址和超时值，差异返回 409。一次性提交/新建定义的 callback_url 非空400；更新定义只要传该字段即拒绝（包括空值）。地址由 `Config.CallbackTargetURL` 确定。旧 POST/PATCH 带业务ID路径不属于本表现行路由；没有 jobs DELETE。
 

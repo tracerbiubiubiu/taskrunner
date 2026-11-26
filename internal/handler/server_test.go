@@ -836,9 +836,9 @@ func TestLegacyRunsExcludeReceiptTasksBeforeCountingAndPaging(t *testing.T) {
 	for _, tc := range []struct {
 		page   int
 		taskID string
-	}{{1, "newer-legacy"}, {2, "older-legacy"}} {
+	}{{1, "b3_reserved_identity"}, {2, "newer-legacy"}, {3, "older-legacy"}} {
 		path := fmt.Sprintf("/v1/runs/legacy?page=%d&page_size=1&exclude_b3=false", tc.page)
-		assertTaskList(t, f.do(t, http.MethodGet, path, nil), tc.taskID, 2)
+		assertTaskList(t, f.do(t, http.MethodGet, path, nil), tc.taskID, 3)
 	}
 	assertTaskList(t, f.do(t, http.MethodGet, "/v1/runs?page_size=1", nil), "b3_reserved_identity", 5)
 
@@ -855,13 +855,25 @@ func TestLegacyRunsExcludeReceiptTasksBeforeCountingAndPaging(t *testing.T) {
 
 func TestLegacyDeadLettersPageAfterExcludingReceiptTasks(t *testing.T) {
 	f := newFixture(t)
+	for _, run := range []repository.Run{
+		{TaskID: "b3_legacy", Action: "audit_archive"},
+		{TaskID: "structured", Action: "activelist.document.get"},
+		{TaskID: "b3_structured", Action: "ticket.evidence.report.generate"},
+		{TaskID: "older-legacy", Action: "audit_archive"},
+	} {
+		run.EnqueuedAt = time.Now()
+		if err := f.st.InsertPending(context.Background(), run); err != nil {
+			t.Fatal(err)
+		}
+	}
 	f.insp.list = []*asynq.TaskInfo{
-		{ID: "b3_hidden", State: asynq.TaskStateArchived},
-		{ID: "newer-legacy", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
-		{ID: "no-prefix-structured", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"activelist.document.get"}`)},
+		{ID: "unknown", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
+		{ID: "b3_legacy", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
+		{ID: "structured", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
+		{ID: "b3_structured", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
 		{ID: "older-legacy", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
 	}
-	assertTaskList(t, f.do(t, http.MethodGet, "/v1/dead-letters/legacy?page=1&page_size=1", nil), "newer-legacy", -1)
+	assertTaskList(t, f.do(t, http.MethodGet, "/v1/dead-letters/legacy?page=1&page_size=1", nil), "b3_legacy", -1)
 	assertTaskList(t, f.do(t, http.MethodGet, "/v1/dead-letters/legacy?page=2&page_size=1", nil), "older-legacy", -1)
 }
 

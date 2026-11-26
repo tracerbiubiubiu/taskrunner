@@ -68,8 +68,10 @@ func New(d Deps) *gin.Engine {
 		v1.GET("/tasks/:id", d.getTask)
 		v1.POST("/tasks/cancel", d.cancelTask)
 		v1.POST("/tasks/retry", d.retryTask)
-		v1.GET("/runs", d.listRuns)
-		v1.GET("/dead-letters", d.listDeadLetters)
+		v1.GET("/runs", d.listRuns(false))
+		v1.GET("/runs/legacy", d.listRuns(true))
+		v1.GET("/dead-letters", d.listDeadLetters(false))
+		v1.GET("/dead-letters/legacy", d.listDeadLetters(true))
 		v1.GET("/jobs", d.listJobs)
 		v1.GET("/jobs/:job_id", d.getJob)
 		v1.POST("/jobs", d.createJob)
@@ -148,40 +150,49 @@ func (d *Deps) getTask(c *gin.Context) {
 	response.OK(c, v)
 }
 
-func (d *Deps) listRuns(c *gin.Context) {
-	q := service.RunQuery{
-		ID: int64(atoi(c.Query("id"), 0)), RequestID: c.Query("request_id"), Action: c.Query("action"),
-		Status: c.Query("status"), JobID: c.Query("job_id"), Depts: c.QueryArray("dept"),
-		SubmittedBy: c.Query("submitted_by"), // zhuzhao 代理已把 me 换成 actor（02 W5）
-		Page:        atoi(c.Query("page"), 1), PageSize: atoi(c.Query("page_size"), 20),
-	}
-	for k, dest := range map[string]**time.Time{"from": &q.From, "to": &q.To} {
-		if v := c.Query(k); v != "" {
-			t, err := time.Parse(time.RFC3339, v)
-			if err != nil {
-				response.BadRequest(c, "查询参数 "+k+" 需为 RFC3339 格式时间（例：2026-09-15T08:00:00Z）")
-				return
-			}
-			*dest = &t
+func (d *Deps) listRuns(legacyOnly bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		q := service.RunQuery{
+			ID: int64(atoi(c.Query("id"), 0)), RequestID: c.Query("request_id"), Action: c.Query("action"),
+			Status: c.Query("status"), JobID: c.Query("job_id"), Depts: c.QueryArray("dept"),
+			SubmittedBy: c.Query("submitted_by"), // zhuzhao 代理已把 me 换成 actor（02 W5）
+			Page:        atoi(c.Query("page"), 1), PageSize: atoi(c.Query("page_size"), 20),
+			LegacyOnly: legacyOnly,
 		}
+		for k, dest := range map[string]**time.Time{"from": &q.From, "to": &q.To} {
+			if v := c.Query(k); v != "" {
+				t, err := time.Parse(time.RFC3339, v)
+				if err != nil {
+					response.BadRequest(c, "查询参数 "+k+" 需为 RFC3339 格式时间（例：2026-09-15T08:00:00Z）")
+					return
+				}
+				*dest = &t
+			}
+		}
+		runs, total, err := d.Tasks.ListRuns(c.Request.Context(), q)
+		if err != nil {
+			d.fail(c, err, "查询失败")
+			return
+		}
+		response.OKPage(c, runs, total, clampPage(q.Page), clampSize(q.PageSize, 20))
 	}
-	runs, total, err := d.Tasks.ListRuns(c.Request.Context(), q)
-	if err != nil {
-		d.fail(c, err, "查询失败")
-		return
-	}
-	response.OKPage(c, runs, total, clampPage(q.Page), clampSize(q.PageSize, 20))
 }
 
-func (d *Deps) listDeadLetters(c *gin.Context) {
-	// 钳制后回显生效值（与 runs/jobs 端点同款——调用方无需猜测实际页大小）
-	page, pageSize := clampPage(atoi(c.Query("page"), 1)), clampSize(atoi(c.Query("page_size"), 50), 50)
-	list, err := d.Tasks.ListDeadLetters(c.Request.Context(), page, pageSize)
-	if err != nil {
-		d.fail(c, err, "查询失败")
-		return
+func (d *Deps) listDeadLetters(legacyOnly bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 钳制后回显生效值（与 runs/jobs 端点同款——调用方无需猜测实际页大小）
+		page, pageSize := clampPage(atoi(c.Query("page"), 1)), clampSize(atoi(c.Query("page_size"), 50), 50)
+		listForPage := d.Tasks.ListDeadLetters
+		if legacyOnly {
+			listForPage = d.Tasks.ListLegacyDeadLetters
+		}
+		list, err := listForPage(c.Request.Context(), page, pageSize)
+		if err != nil {
+			d.fail(c, err, "查询失败")
+			return
+		}
+		response.OK(c, gin.H{"list": list, "page": page, "page_size": pageSize})
 	}
-	response.OK(c, gin.H{"list": list, "page": page, "page_size": pageSize})
 }
 
 // ---- 干预 ----

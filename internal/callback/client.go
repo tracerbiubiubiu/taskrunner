@@ -1,5 +1,5 @@
 // Package callback 执行对 zhuzhao 内网端点的 HTTP 回调（设计文档 §4 契约）：
-// 2xx = 动作完成；408/429及5xx/超时/网络错误可重试，其余4xx不可重试。
+// 旧动作以2xx确认完成，结构化回执动作须收到对应操作的持久回执。
 package callback
 
 import (
@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/tracerbiubiubiu/zhuzhao-utils/aksk"
@@ -48,13 +49,17 @@ func New(cfg Config) *Client {
 
 // body 回调请求体（契约见 zhuzhao-integration.md §2.1）。
 type body struct {
-	TaskID    string    `json:"task_id"`
-	JobID     string    `json:"job_id,omitempty"`
-	RequestID string    `json:"request_id"`
-	Action    string    `json:"action"`
-	Params    paramJSON `json:"params,omitempty"`
-	Actor     string    `json:"actor,omitempty"` // 原始提交人工号，回传供 zhuzhao 审计串联
-	SourceIP  string    `json:"source_ip,omitempty"`
+	TaskID          string    `json:"task_id"`
+	JobID           string    `json:"job_id,omitempty"`
+	RequestID       string    `json:"request_id"`
+	Action          string    `json:"action"`
+	Params          paramJSON `json:"params,omitempty"`
+	Actor           string    `json:"actor,omitempty"` // 原始提交人工号，回传供 zhuzhao 审计串联
+	SourceIP        string    `json:"source_ip,omitempty"`
+	ProtocolVersion int       `json:"protocol_version,omitempty"`
+	OperationID     string    `json:"operation_id,omitempty"`
+	ActionVersion   int       `json:"action_version,omitempty"`
+	DeliveryID      string    `json:"delivery_id,omitempty"`
 }
 
 // paramJSON 保持 params 原样透传（不二次编码）。
@@ -68,6 +73,13 @@ func (p paramJSON) MarshalJSON() ([]byte, error) {
 	return p, nil
 }
 
+type deliveryIDKey struct{}
+
+// WithDeliveryID passes the worker's durable execution identity to the callback.
+func WithDeliveryID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, deliveryIDKey{}, id)
+}
+
 // Do 执行一次回调。nil = 成功；包装 ErrNonRetryable = 不可重试（4xx / 本地构造错误）；
 // 其他 error = 可重试（5xx / 网络错误 / 超时）。
 func (c *Client) Do(ctx context.Context, p task.Payload) error {
@@ -78,7 +90,7 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	b, err := json.Marshal(body{
+	wire := body{
 		TaskID:    p.TaskID,
 		JobID:     p.JobID,
 		RequestID: p.RequestID,
@@ -86,7 +98,19 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 		Params:    paramJSON(p.Params),
 		Actor:     p.SubmittedBy,
 		SourceIP:  p.SourceIP,
-	})
+	}
+	strict := task.UsesReceiptCallback(p.Action)
+	if strict {
+		operationID, err := task.ReceiptOperationID(p.Params)
+		if err != nil {
+			return fmt.Errorf("%w：%v", ErrNonRetryable, err)
+		}
+		wire.ProtocolVersion = 2
+		wire.ActionVersion = 1
+		wire.OperationID = operationID
+		wire.DeliveryID, _ = ctx.Value(deliveryIDKey{}).(string)
+	}
+	b, err := json.Marshal(wire)
 	if err != nil {
 		// 入参已在提交侧校验，正常不可达；一旦发生属载荷本身缺陷，重试无法恢复
 		return fmt.Errorf("%w：请求体序列化失败（请检查 params）: %v", ErrNonRetryable, err)
@@ -113,6 +137,23 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 	}
 	defer resp.Body.Close()
 
+	// Version 2 requires a matching durable receipt. Any other 2xx is only
+	// delivery evidence; the worker can retry the same task and operation.
+	if strict && resp.StatusCode == http.StatusOK {
+		if err := readReceipt(resp.Body, wire.TaskID, wire.OperationID); err != nil {
+			return fmt.Errorf("回调失败（可重试）：动作 %s，%w", p.Action, err)
+		}
+		return nil
+	}
+	if strict {
+		switch {
+		case resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+			resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests:
+			return fmt.Errorf("%w：对端返回 HTTP %d（客户端错误），动作 %s", ErrNonRetryable, resp.StatusCode, p.Action)
+		default:
+			return fmt.Errorf("回调结果尚未确认（可重试）：对端返回 HTTP %d，动作 %s", resp.StatusCode, p.Action)
+		}
+	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		// 2xx = 执行完全成功（拍板 2026-09-03：无响应体状态字段——zhuzhao handler 业务失败
@@ -130,6 +171,32 @@ func (c *Client) Do(ctx context.Context, p task.Payload) error {
 		return fmt.Errorf("回调失败（可重试）：对端返回 HTTP %d，动作 %s，响应片段: %q",
 			resp.StatusCode, p.Action, readSnippet(resp.Body))
 	}
+}
+
+// readReceipt only accepts a bounded, unambiguous Core success envelope.
+func readReceipt(r io.Reader, taskID, operationID string) error {
+	const maxReceiptBytes = 16 << 10
+	raw, err := io.ReadAll(io.LimitReader(r, maxReceiptBytes+1))
+	if err != nil || len(raw) > maxReceiptBytes {
+		return errors.New("无法读取回执")
+	}
+	if _, err := task.EqualJSON(raw, raw); err != nil {
+		return errors.New("回执 JSON 无效")
+	}
+
+	var envelope, data map[string]json.RawMessage
+	if json.Unmarshal(raw, &envelope) != nil || string(envelope["code"]) != "0" ||
+		json.Unmarshal(envelope["data"], &data) != nil {
+		return errors.New("缺少成功回执")
+	}
+	var receivedTask, receivedOperation, state, receiptID string
+	if json.Unmarshal(data["task_id"], &receivedTask) != nil || receivedTask != taskID ||
+		json.Unmarshal(data["operation_id"], &receivedOperation) != nil || receivedOperation != operationID ||
+		json.Unmarshal(data["state"], &state) != nil || state != "succeeded" ||
+		json.Unmarshal(data["receipt_id"], &receiptID) != nil || strings.TrimSpace(receiptID) == "" {
+		return errors.New("成功回执与原任务或操作不符")
+	}
+	return nil
 }
 
 // readSnippet 读取错误响应片段（截断），仅供日志定位。

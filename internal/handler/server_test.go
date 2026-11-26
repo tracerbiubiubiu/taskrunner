@@ -817,3 +817,66 @@ func TestSignedOperatorUsesCharacterLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyRunsExcludeReceiptTasksBeforeCountingAndPaging(t *testing.T) {
+	f := newFixture(t)
+	for i, run := range []repository.Run{
+		{TaskID: "older-legacy", Action: "audit_archive"},
+		{TaskID: "b3_new_report", Action: "ticket.evidence.report.generate"},
+		{TaskID: "newer-legacy", Action: "audit_archive"},
+		{TaskID: "another-receipt-task", Action: "activelist.document.update"},
+		{TaskID: "b3_reserved_identity", Action: "audit_archive"},
+	} {
+		run.EnqueuedAt = time.Date(2026, 11, 26, 12, i, 0, 0, time.UTC)
+		if err := f.st.InsertPending(context.Background(), run); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct {
+		page   int
+		taskID string
+	}{{1, "newer-legacy"}, {2, "older-legacy"}} {
+		path := fmt.Sprintf("/v1/runs/legacy?page=%d&page_size=1&exclude_b3=false", tc.page)
+		assertTaskList(t, f.do(t, http.MethodGet, path, nil), tc.taskID, 2)
+	}
+	assertTaskList(t, f.do(t, http.MethodGet, "/v1/runs?page_size=1", nil), "b3_reserved_identity", 5)
+
+	w := f.do(t, http.MethodGet, "/v1/runs/legacy?action=activelist.document.update", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("cannot read legacy route: status=%d body=%s", w.Code, w.Body)
+	}
+	_, envelope := decode(t, w)
+	data := envelope["data"].(map[string]any)
+	if data["total"] != float64(0) || len(data["list"].([]any)) != 0 {
+		t.Fatalf("action selection cannot bypass legacy route restriction: %v", data)
+	}
+}
+
+func TestLegacyDeadLettersPageAfterExcludingReceiptTasks(t *testing.T) {
+	f := newFixture(t)
+	f.insp.list = []*asynq.TaskInfo{
+		{ID: "b3_hidden", State: asynq.TaskStateArchived},
+		{ID: "newer-legacy", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
+		{ID: "no-prefix-structured", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"activelist.document.get"}`)},
+		{ID: "older-legacy", State: asynq.TaskStateArchived, Payload: []byte(`{"action":"audit_archive"}`)},
+	}
+	assertTaskList(t, f.do(t, http.MethodGet, "/v1/dead-letters/legacy?page=1&page_size=1", nil), "newer-legacy", -1)
+	assertTaskList(t, f.do(t, http.MethodGet, "/v1/dead-letters/legacy?page=2&page_size=1", nil), "older-legacy", -1)
+}
+
+func assertTaskList(t *testing.T, w *httptest.ResponseRecorder, taskID string, total int) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d: %s", w.Code, w.Body)
+	}
+	_, envelope := decode(t, w)
+	data := envelope["data"].(map[string]any)
+	list := data["list"].([]any)
+	if len(list) != 1 || list[0].(map[string]any)["task_id"] != taskID {
+		t.Fatalf("want task %s, got %v", taskID, list)
+	}
+	if total >= 0 && data["total"] != float64(total) {
+		t.Fatalf("want total %d, got %v", total, data["total"])
+	}
+}
